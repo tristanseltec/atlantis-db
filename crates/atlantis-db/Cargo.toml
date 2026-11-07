@@ -1,0 +1,19 @@
+[package]
+name = "atlantis-db"
+version = "0.1.0"
+description = "Atlantis DB — embedded graph + vector database for AI applications"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+atlantis-core = { workspace = true }
+atlantis-engine = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = { workspace = true }

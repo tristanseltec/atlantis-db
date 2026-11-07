@@ -1,0 +1,19 @@
+[package]
+name = "atlantis-vector"
+version = "0.1.0"
+description = "HNSW vector index for Atlantis DB"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+atlantis-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

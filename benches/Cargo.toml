@@ -1,0 +1,29 @@
+[package]
+name = "atlantis-benches"
+version = "0.1.0"
+description = "Benchmarks for Atlantis DB"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+atlantis-db = { path = "../crates/atlantis-db" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bench]]
+name = "storage_bench"
+harness = false
+
+[[bench]]
+name = "vector_bench"
+harness = false
+
+[[bench]]
+name = "query_bench"
+harness = false

@@ -1,0 +1,20 @@
+[package]
+name = "atlantis-storage"
+version = "0.1.0"
+description = "Hybrid tiered storage engine for Atlantis DB"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+atlantis-core = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
