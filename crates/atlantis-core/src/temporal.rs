@@ -137,7 +137,7 @@ impl FromStr for Datetime {
         let err = || AtlantisError::InvalidValue(format!("invalid datetime: {s}"));
         let num = |part: &str| part.parse::<u32>().map_err(|_| err());
         let b = s.as_bytes();
-        if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        if !s.is_ascii() || b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
             return Err(err());
         }
         let year: i64 = s[..4].parse().map_err(|_| err())?;
@@ -219,7 +219,11 @@ impl Duration {
             }
             let n: i64 = rest[..digits].parse().ok()?;
             rest = &rest[digits..];
-            let unit_len = rest.bytes().take_while(|c| c.is_ascii_alphabetic()).count();
+            let unit_len: usize = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic() || *c == 'µ')
+                .map(char::len_utf8)
+                .sum();
             let unit = match &rest[..unit_len] {
                 "µs" => "us",
                 u => u,
@@ -249,7 +253,11 @@ impl Duration {
                 let n: f64 = rest[..len].parse().ok()?;
                 let unit = rest[len..].chars().next()?.to_ascii_uppercase();
                 let (_, scale) = units.iter().find(|(u, _)| *u == unit)?;
-                total = total.checked_add((n * *scale as f64).round() as i64)?;
+                let nanos = (n * *scale as f64).round();
+                if !nanos.is_finite() || nanos >= i64::MAX as f64 {
+                    return None;
+                }
+                total = total.checked_add(nanos as i64)?;
                 rest = &rest[len + 1..];
             }
             Some(())
@@ -370,5 +378,14 @@ mod tests {
         let dt: Datetime = "2026-11-07T00:00:00Z".parse().unwrap();
         let later = dt.checked_add("1d".parse().unwrap()).unwrap();
         assert_eq!(later.to_string(), "2026-11-08T00:00:00Z");
+    }
+
+    #[test]
+    fn non_ascii_and_overflowing_input_is_rejected_not_panicking() {
+        for s in ["2026-11-0é", "2026-11-07T10:00:0é", "é026-11-07"] {
+            assert!(s.parse::<Datetime>().is_err(), "{s}");
+        }
+        assert!("P99999999999999999999D".parse::<Duration>().is_err());
+        assert_eq!("5µs".parse::<Duration>().unwrap().to_string(), "5us");
     }
 }

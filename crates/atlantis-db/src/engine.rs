@@ -1,5 +1,6 @@
 //! The public `Engine` type — the main entry point for Atlantis DB.
 
+use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +14,55 @@ use crate::result_set::ResultSet;
 
 /// File, inside the database directory, holding the record store checkpoint.
 pub const RECORDS_FILE: &str = "records.kv";
+/// Lock file that keeps a database directory open in one engine at a time.
+pub const LOCK_FILE: &str = "LOCK";
+
+/// On-disk state of the record store, shared by all clones of an engine.
+/// Holds the directory lock and writes a final checkpoint when the last
+/// clone is dropped.
+struct RecordsFile {
+    kv: MemStore,
+    path: PathBuf,
+    _lock: File,
+}
+
+impl RecordsFile {
+    fn open(dir: &Path) -> Result<Self, AtlantisError> {
+        fs::create_dir_all(dir)?;
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(LOCK_FILE))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(AtlantisError::Storage(format!(
+                    "database directory {} is already open in another engine",
+                    dir.display()
+                )))
+            }
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        let path = dir.join(RECORDS_FILE);
+        Ok(RecordsFile {
+            kv: MemStore::open_or_create(&path)?,
+            path,
+            _lock: lock,
+        })
+    }
+
+    fn checkpoint(&self) -> Result<(), AtlantisError> {
+        self.kv.checkpoint(&self.path)
+    }
+}
+
+impl Drop for RecordsFile {
+    fn drop(&mut self) {
+        // Best effort: there is no caller to report an error to here.
+        let _ = self.checkpoint();
+    }
+}
 
 /// The main entry point for Atlantis DB.
 ///
@@ -28,6 +78,14 @@ pub const RECORDS_FILE: &str = "records.kv";
 /// The two stores do not share data yet: Cypher queries do not see records
 /// and vice versa. `Engine` is cheaply clonable and safe to share across
 /// async tasks; clones share both stores.
+///
+/// # Durability
+///
+/// The record store is held in memory and written to `records.kv` in the
+/// database directory by [`checkpoint`](Self::checkpoint),
+/// [`shutdown`](Self::shutdown), and when the last clone of the engine is
+/// dropped. Commits made after the last checkpoint are lost if the process
+/// crashes. A database directory can be open in only one engine at a time.
 ///
 /// # Example
 ///
@@ -55,9 +113,8 @@ pub const RECORDS_FILE: &str = "records.kv";
 #[derive(Clone)]
 pub struct Engine {
     handle: EngineHandle,
-    kv: MemStore,
     records: RecordStore,
-    records_path: Option<PathBuf>,
+    records_file: Option<Arc<RecordsFile>>,
     db: DatabaseRef,
 }
 
@@ -75,21 +132,19 @@ impl Engine {
 
     /// Opens or creates a database with a custom configuration.
     pub async fn open_with_config(config: EngineConfig) -> Result<Self, AtlantisError> {
-        let records_path = config
-            .storage
-            .disk_path
-            .as_ref()
-            .map(|dir| dir.join(RECORDS_FILE));
-        let kv = match &records_path {
-            Some(path) => MemStore::open_or_create(path)?,
-            None => MemStore::new(),
+        let records_file = match &config.storage.disk_path {
+            Some(dir) => Some(Arc::new(RecordsFile::open(dir)?)),
+            None => None,
         };
+        let kv = records_file
+            .as_ref()
+            .map(|f| f.kv.clone())
+            .unwrap_or_default();
         let handle = spawn_engine(config)?;
         Ok(Engine {
             handle,
-            records: RecordStore::new(Arc::new(kv.clone())),
-            kv,
-            records_path,
+            records: RecordStore::new(Arc::new(kv)),
+            records_file,
             db: DatabaseRef::default(),
         })
     }
@@ -211,8 +266,8 @@ impl Engine {
     }
 
     fn checkpoint_records(&self) -> Result<(), AtlantisError> {
-        match &self.records_path {
-            Some(path) => self.kv.checkpoint(path),
+        match &self.records_file {
+            Some(file) => file.checkpoint(),
             None => Ok(()),
         }
     }

@@ -43,6 +43,20 @@ pub mod tag {
     pub const NUM_INT: u8 = 0x02;
 }
 
+/// The largest `f64` not greater than `i`. Integers sort after floats with
+/// the same prefix and before the next larger float, so mixed integer/float
+/// keys stay in numeric order even where `i as f64` would round up.
+fn f64_floor_of(i: i64) -> f64 {
+    let f = i as f64;
+    if (f as i128) <= i as i128 {
+        return f;
+    }
+    // `f` rounded up; step to the previous representable value. Rounding up
+    // only happens for |i| >= 2^53, so `f` is never zero here.
+    let bits = f.to_bits();
+    f64::from_bits(if f > 0.0 { bits - 1 } else { bits + 1 })
+}
+
 fn err(msg: impl Into<String>) -> AtlantisError {
     AtlantisError::Encoding(msg.into())
 }
@@ -127,7 +141,10 @@ impl KeyWriter {
                 self.u8(tag::TRUE);
             }
             Value::Integer(i) => {
-                self.u8(tag::NUMBER).f64(*i as f64).u8(tag::NUM_INT).i64(*i);
+                self.u8(tag::NUMBER)
+                    .f64(f64_floor_of(*i))
+                    .u8(tag::NUM_INT)
+                    .i64(*i);
             }
             Value::Float(f) => {
                 self.u8(tag::NUMBER).f64(*f).u8(tag::NUM_FLOAT);
@@ -483,6 +500,27 @@ mod tests {
                 let bytes = KeyWriter::new().record_key(&key).unwrap().finish();
                 prop_assert_eq!(KeyReader::new(&bytes).record_key().unwrap(), key);
             }
+        }
+    }
+
+    #[test]
+    fn huge_integers_and_floats_interleave_correctly() {
+        let two53 = 1i64 << 53;
+        let ordered = [
+            Value::Float(-(2f64.powi(63))),
+            Value::Integer(i64::MIN + 1),
+            Value::Float(two53 as f64 + 2.0),
+            Value::Integer(two53 + 3),
+            Value::Float(two53 as f64 + 4.0),
+            Value::Integer(i64::MAX),
+            Value::Float(2f64.powi(63)),
+        ];
+        for pair in ordered.windows(2) {
+            assert!(enc(&pair[0]) < enc(&pair[1]), "{} < {}", pair[0], pair[1]);
+        }
+        for i in [i64::MIN, i64::MIN + 1, -(two53 + 3), two53 + 3, i64::MAX] {
+            let bytes = enc(&Value::Integer(i));
+            assert_eq!(KeyReader::new(&bytes).value().unwrap(), Value::Integer(i));
         }
     }
 }

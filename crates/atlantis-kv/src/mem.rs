@@ -10,7 +10,8 @@ use std::fs;
 use std::io::Write;
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use atlantis_core::AtlantisError;
 
@@ -84,6 +85,8 @@ impl Inner {
 #[derive(Clone, Default)]
 pub struct MemStore {
     inner: Arc<RwLock<Inner>>,
+    /// Serializes checkpoints so concurrent calls never interleave writes.
+    checkpoint_lock: Arc<Mutex<()>>,
 }
 
 fn poisoned() -> AtlantisError {
@@ -132,6 +135,10 @@ impl MemStore {
     /// Writes the latest committed state to `path` atomically (write to a
     /// temporary file, sync, then rename). Uncommitted writes are excluded.
     pub fn checkpoint(&self, path: &Path) -> Result<(), AtlantisError> {
+        let _serialized = self
+            .checkpoint_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (version, pairs) = {
             let inner = self.read()?;
             let pairs: Vec<KvPair> = inner
@@ -151,13 +158,29 @@ impl MemStore {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("tmp");
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(CHECKPOINT_MAGIC)?;
-        file.write_all(&[CHECKPOINT_FORMAT])?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)?;
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = (|| {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(CHECKPOINT_MAGIC)?;
+            file.write_all(&[CHECKPOINT_FORMAT])?;
+            file.write_all(&body)?;
+            file.sync_all()?;
+            fs::rename(&tmp, path)
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        // Make the rename itself durable.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            fs::File::open(dir)?.sync_all()?;
+        }
         Ok(())
     }
 
@@ -189,6 +212,7 @@ impl MemStore {
                 version,
                 active: BTreeMap::new(),
             })),
+            checkpoint_lock: Arc::default(),
         })
     }
 

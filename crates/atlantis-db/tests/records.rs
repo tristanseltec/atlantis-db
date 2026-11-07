@@ -130,3 +130,29 @@ async fn cypher_engine_still_works_alongside() {
         .unwrap();
     assert_eq!(rs.row_count(), 1);
 }
+
+#[tokio::test]
+async fn dropping_the_last_handle_checkpoints_and_releases_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path()).await.unwrap();
+        let err = Engine::open(dir.path())
+            .await
+            .err()
+            .expect("directory is locked");
+        assert!(err.to_string().contains("already open"), "{err}");
+        let clone = engine.clone();
+        drop(engine);
+        clone
+            .transaction(|tx| tx.create("Note", Some(RecordKey::Integer(1)), vec![], Object::new()))
+            .await
+            .unwrap();
+        // No explicit checkpoint or shutdown: dropping the last clone persists.
+    }
+    let engine = Engine::open(dir.path()).await.unwrap();
+    assert!(engine
+        .read(|tx| tx.get(&id("Note:1")))
+        .await
+        .unwrap()
+        .is_some());
+}

@@ -491,9 +491,16 @@ impl RecordTx {
             }
         }
         for end in [from, to] {
-            if self.get_stored(end)?.is_none() {
-                return Err(Self::not_found(end));
+            let key = keys::record(&self.db, end)?;
+            let bytes = self.tx.get(&key)?.ok_or_else(|| Self::not_found(end))?;
+            if matches!(decode::<Stored>(&bytes)?, Stored::Edge(_)) {
+                return Err(AtlantisError::SchemaViolation(format!(
+                    "{end} is an edge; edges cannot be endpoints of other edges"
+                )));
             }
+            // Rewrite the endpoint unchanged so that a concurrent delete of it
+            // conflicts with this transaction instead of leaving a dangling edge.
+            self.tx.set(key, bytes)?;
         }
         if data.contains_key("in") || data.contains_key("out") {
             return Err(AtlantisError::SchemaViolation(
@@ -871,5 +878,52 @@ mod tests {
             .unwrap();
         a.commit().unwrap();
         assert!(b.commit().unwrap_err().is_retryable());
+    }
+
+    #[test]
+    fn concurrent_relate_and_delete_cannot_leave_a_dangling_edge() {
+        let s = store();
+        let mut setup = tx(&s);
+        let a = setup
+            .create_node(&["P"], obj(&[("id", "a".into())]))
+            .unwrap();
+        let b = setup
+            .create_node(&["P"], obj(&[("id", "b".into())]))
+            .unwrap();
+        setup.commit().unwrap();
+
+        let mut relate = tx(&s);
+        let mut delete = tx(&s);
+        relate.relate(&a.id, "R", &b.id, Object::new()).unwrap();
+        assert!(
+            delete.delete(&a.id, false).unwrap(),
+            "sees no edges in its snapshot"
+        );
+        relate.commit().unwrap();
+        assert!(delete.commit().unwrap_err().is_retryable());
+
+        let mut check = tx(&s);
+        assert!(check.get(&a.id).unwrap().is_some());
+        assert_eq!(
+            check.neighbors(&b.id, Direction::Incoming, None).unwrap(),
+            vec![a.id]
+        );
+    }
+
+    #[test]
+    fn edges_cannot_be_endpoints() {
+        let s = store();
+        let mut t = tx(&s);
+        let x = t.create_node(&["Q"], Object::new()).unwrap();
+        let y = t.create_node(&["Q"], Object::new()).unwrap();
+        let e = t.relate(&x.id, "S", &y.id, Object::new()).unwrap();
+        assert!(matches!(
+            t.relate(&e.id, "T", &y.id, Object::new()),
+            Err(AtlantisError::SchemaViolation(_))
+        ));
+        assert!(matches!(
+            t.relate(&y.id, "T", &e.id, Object::new()),
+            Err(AtlantisError::SchemaViolation(_))
+        ));
     }
 }

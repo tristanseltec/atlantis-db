@@ -76,7 +76,13 @@ impl FromStr for Uuid {
     type Err = AtlantisError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.is_ascii() {
+            return Err(AtlantisError::InvalidValue(format!("invalid uuid: {s}")));
+        }
         let hex: String = s.chars().filter(|c| *c != '-').collect();
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AtlantisError::InvalidValue(format!("invalid uuid: {s}")));
+        }
         let dashes_ok = s.len() == 32
             || (s.len() == 36 && [8, 13, 18, 23].iter().all(|&i| s.as_bytes()[i] == b'-'));
         if hex.len() != 32 || !dashes_ok {
@@ -209,5 +215,14 @@ mod tests {
         assert!("too-short".parse::<Ulid>().is_err());
         assert!("8ZZZZZZZZZZZZZZZZZZZZZZZZZ".parse::<Ulid>().is_err()); // overflow
         assert!("0123456789ABCDEFGHJKMNPQRU".parse::<Ulid>().is_err()); // 'U' not in alphabet
+    }
+
+    #[test]
+    fn uuid_rejects_non_ascii_and_signs_without_panicking() {
+        let tricky = format!("aé{}", "a".repeat(29));
+        assert_eq!(tricky.len(), 32);
+        assert!(tricky.parse::<Uuid>().is_err());
+        assert!("+a".repeat(16).parse::<Uuid>().is_err());
+        assert!(format!("P:u'{tricky}'").parse::<crate::RecordId>().is_err());
     }
 }
