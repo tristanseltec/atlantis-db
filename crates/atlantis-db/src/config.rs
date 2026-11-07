@@ -1,7 +1,8 @@
 //! Public configuration for Atlantis DB.
 
 pub use atlantis_core::{
-    DistanceMetricKind, EngineConfig, EngineConfigBuilder, HnswParams, StorageConfig, VectorConfig,
+    DistanceMetricKind, EngineConfig, EngineConfigBuilder, HnswParams, StorageConfig, SyncMode,
+    VectorConfig,
 };
 
 /// Public configuration type — an alias for `EngineConfig`.

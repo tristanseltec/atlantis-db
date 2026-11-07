@@ -1,17 +1,15 @@
-//! Actor-based database engine for Atlantis DB.
+//! Query execution, transactions and derived indexes for Atlantis DB.
 //!
-//! Provides a tokio actor-based runtime that owns the storage engine, vector
-//! index, and query executor. All operations are serialized through a single
-//! core actor, with background actors for tiering and checkpointing.
+//! [`Datastore`] owns the durable key-value store, the record store on top
+//! of it, and the vector indexes derived from records. Cypher statements
+//! are parsed by `atlantis-cypher` and interpreted clause by clause against
+//! a record transaction, so graph queries, documents and the Rust record
+//! API all read and write the same data.
 
-pub mod actor;
-pub mod checkpoint_actor;
-pub mod command;
-pub mod executor;
-pub mod handle;
-pub mod tiering_actor;
+pub mod datastore;
+mod exec;
+pub mod vector_index;
 
-pub use actor::{spawn_engine, CoreEngineActor};
-pub use command::Command;
-pub use executor::{QueryExecutor, Row};
-pub use handle::EngineHandle;
+pub use datastore::{Datastore, Transaction, LOCK_FILE};
+pub use exec::{Params, QueryResult};
+pub use vector_index::{VectorHit, VectorIndexes, VectorQuery};

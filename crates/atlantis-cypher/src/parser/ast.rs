@@ -60,7 +60,10 @@ pub enum Clause {
     /// `REMOVE item, item, ...`
     Remove(Vec<RemoveItem>),
     /// `[DETACH] DELETE expr, expr, ...`
-    Delete { detach: bool, exprs: Vec<Expression> },
+    Delete {
+        detach: bool,
+        exprs: Vec<Expression>,
+    },
     /// `WITH projection [WHERE expr]`
     With {
         projection: Projection,
@@ -131,7 +134,10 @@ pub enum SetItem {
     /// `n += {map}` — merge fields.
     Merge { variable: String, value: Expression },
     /// `n:Label:Other` — add secondary labels.
-    Labels { variable: String, labels: Vec<String> },
+    Labels {
+        variable: String,
+        labels: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,7 +145,10 @@ pub enum RemoveItem {
     /// `n.a.b`
     Property { variable: String, path: Vec<String> },
     /// `n:Label`
-    Labels { variable: String, labels: Vec<String> },
+    Labels {
+        variable: String,
+        labels: Vec<String>,
+    },
 }
 
 /// Comma-separated path patterns.
@@ -195,7 +204,11 @@ pub enum Expression {
     /// `expr[index]`
     Index(Box<Expression>, Box<Expression>),
     /// `expr[from..to]` with either bound optional.
-    Slice(Box<Expression>, Option<Box<Expression>>, Option<Box<Expression>>),
+    Slice(
+        Box<Expression>,
+        Option<Box<Expression>>,
+        Option<Box<Expression>>,
+    ),
     /// `expr:Label:Other` as a predicate.
     HasLabels(Box<Expression>, Vec<String>),
     List(Vec<Expression>),
@@ -268,10 +281,13 @@ impl Expression {
             Expression::Function { name, args, .. } => {
                 is_aggregate(name) || args.iter().any(Expression::contains_aggregate)
             }
-            Expression::Property(e, _) | Expression::Unary(_, e) | Expression::IsNull(e, _) | Expression::HasLabels(e, _) => {
-                e.contains_aggregate()
+            Expression::Property(e, _)
+            | Expression::Unary(_, e)
+            | Expression::IsNull(e, _)
+            | Expression::HasLabels(e, _) => e.contains_aggregate(),
+            Expression::Index(a, b) | Expression::Binary(a, _, b) => {
+                a.contains_aggregate() || b.contains_aggregate()
             }
-            Expression::Index(a, b) | Expression::Binary(a, _, b) => a.contains_aggregate() || b.contains_aggregate(),
             Expression::Slice(e, a, b) => {
                 e.contains_aggregate()
                     || a.as_ref().is_some_and(|x| x.contains_aggregate())
@@ -279,12 +295,23 @@ impl Expression {
             }
             Expression::List(items) => items.iter().any(Expression::contains_aggregate),
             Expression::Map(items) => items.iter().any(|(_, e)| e.contains_aggregate()),
-            Expression::Case { operand, whens, default } => {
+            Expression::Case {
+                operand,
+                whens,
+                default,
+            } => {
                 operand.as_ref().is_some_and(|e| e.contains_aggregate())
-                    || whens.iter().any(|(a, b)| a.contains_aggregate() || b.contains_aggregate())
+                    || whens
+                        .iter()
+                        .any(|(a, b)| a.contains_aggregate() || b.contains_aggregate())
                     || default.as_ref().is_some_and(|e| e.contains_aggregate())
             }
-            Expression::ListComprehension { list, predicate, map, .. } => {
+            Expression::ListComprehension {
+                list,
+                predicate,
+                map,
+                ..
+            } => {
                 list.contains_aggregate()
                     || predicate.as_ref().is_some_and(|e| e.contains_aggregate())
                     || map.as_ref().is_some_and(|e| e.contains_aggregate())

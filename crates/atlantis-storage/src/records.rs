@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use atlantis_core::{
-    validate_ident, validate_user_table, AtlantisError, DatabaseRef, Direction,
-    DistanceMetricKind, Edge, Object, Record, RecordId, RecordKey, Value, DEFAULT_TABLE,
+    validate_ident, validate_user_table, AtlantisError, DatabaseRef, Direction, DistanceMetricKind,
+    Edge, Object, Record, RecordId, RecordKey, Value, DEFAULT_TABLE,
 };
 use atlantis_kv::keys::{self, EdgeDir};
 use atlantis_kv::{Isolation, KvStore, KvTransaction, TxMode, Versionstamp};
@@ -138,7 +138,10 @@ impl RecordTx {
     /// Commits all writes atomically.
     pub fn commit(mut self) -> Result<CommitInfo, AtlantisError> {
         let versionstamp = self.tx.commit()?;
-        Ok(CommitInfo { versionstamp, changed: self.changed.into_values().collect() })
+        Ok(CommitInfo {
+            versionstamp,
+            changed: self.changed.into_values().collect(),
+        })
     }
 
     /// `true` if this transaction has written or deleted any record.
@@ -146,8 +149,15 @@ impl RecordTx {
         !self.changed.is_empty()
     }
 
-    fn put_record(&mut self, id: &RecordId, key: Vec<u8>, stored: &Stored) -> Result<(), AtlantisError> {
-        self.changed.entry(key.clone()).or_insert_with(|| id.clone());
+    fn put_record(
+        &mut self,
+        id: &RecordId,
+        key: Vec<u8>,
+        stored: &Stored,
+    ) -> Result<(), AtlantisError> {
+        self.changed
+            .entry(key.clone())
+            .or_insert_with(|| id.clone());
         self.tx.set(key, encode(stored)?)
     }
 
@@ -506,28 +516,40 @@ impl RecordTx {
 
     /// Adds and removes secondary labels of a record. Adding the record's
     /// own table as a label is a no-op; it cannot be removed.
-    pub fn set_labels(&mut self, id: &RecordId, add: &[String], remove: &[String]) -> Result<Record, AtlantisError> {
+    pub fn set_labels(
+        &mut self,
+        id: &RecordId,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<Record, AtlantisError> {
         let mut record = match self.get_stored(id)?.ok_or_else(|| Self::not_found(id))? {
             Stored::Record(r) => r,
             Stored::Edge(_) => {
-                return Err(AtlantisError::SchemaViolation(format!("edge {id} cannot carry labels")))
+                return Err(AtlantisError::SchemaViolation(format!(
+                    "edge {id} cannot carry labels"
+                )))
             }
         };
-        if remove.iter().any(|l| *l == id.table) {
+        if remove.contains(&id.table) {
             return Err(AtlantisError::SchemaViolation(format!(
                 "{} is the table of {id} and cannot be removed",
                 id.table
             )));
         }
         let before = record.labels.clone();
-        let mut labels: Vec<String> = before.iter().filter(|l| !remove.contains(l)).cloned().collect();
+        let mut labels: Vec<String> = before
+            .iter()
+            .filter(|l| !remove.contains(l))
+            .cloned()
+            .collect();
         labels.extend(add.iter().cloned());
         record = Record::new(record.id, labels, record.data)?;
         for gone in before.iter().filter(|l| !record.labels.contains(l)) {
             self.tx.delete(&keys::label_entry(&self.db, gone, id)?)?;
         }
         for new in record.labels.iter().filter(|l| !before.contains(l)) {
-            self.tx.set(keys::label_entry(&self.db, new, id)?, Vec::new())?;
+            self.tx
+                .set(keys::label_entry(&self.db, new, id)?, Vec::new())?;
         }
         self.write_back(Stored::Record(record))
     }
@@ -538,13 +560,19 @@ impl RecordTx {
         validate_ident("label", &def.label)?;
         validate_ident("field", &def.field)?;
         if def.dimension == 0 {
-            return Err(AtlantisError::SchemaViolation("vector index dimension must be positive".into()));
+            return Err(AtlantisError::SchemaViolation(
+                "vector index dimension must be positive".into(),
+            ));
         }
         if self.vector_index(&def.name)?.is_some() {
-            return Err(AtlantisError::SchemaViolation(format!("index {} is already defined", def.name)));
+            return Err(AtlantisError::SchemaViolation(format!(
+                "index {} is already defined",
+                def.name
+            )));
         }
         self.ensure_database()?;
-        self.tx.set(keys::index_def(&self.db, &def.name), encode(&def)?)
+        self.tx
+            .set(keys::index_def(&self.db, &def.name), encode(&def)?)
     }
 
     /// Returns a vector index definition.
@@ -556,7 +584,11 @@ impl RecordTx {
     /// Lists vector index definitions, ordered by name.
     pub fn vector_indexes(&mut self) -> Result<Vec<VectorIndexDef>, AtlantisError> {
         let range = keys::index_defs(&self.db);
-        self.tx.scan(&range, None)?.iter().map(|(_, v)| decode(v)).collect()
+        self.tx
+            .scan(&range, None)?
+            .iter()
+            .map(|(_, v)| decode(v))
+            .collect()
     }
 
     /// Drops an index definition. Returns whether it existed.
@@ -1041,12 +1073,20 @@ mod tests {
         let s = store();
         let mut t = tx(&s);
         let n = t.create_node(&["Person"], Object::new()).unwrap();
-        let n = t.set_labels(&n.id, &["Admin".into(), "Person".into()], &[]).unwrap();
+        let n = t
+            .set_labels(&n.id, &["Admin".into(), "Person".into()], &[])
+            .unwrap();
         assert_eq!(n.labels, vec!["Admin".to_string()]);
         assert_eq!(t.with_label("Admin").unwrap().len(), 1);
         t.set_labels(&n.id, &[], &["Admin".into()]).unwrap();
-        assert!(t.with_label("Admin").unwrap().is_empty(), "label index entry removed");
-        assert!(t.set_labels(&n.id, &[], &["Person".into()]).is_err(), "table label is fixed");
+        assert!(
+            t.with_label("Admin").unwrap().is_empty(),
+            "label index entry removed"
+        );
+        assert!(
+            t.set_labels(&n.id, &[], &["Person".into()]).is_err(),
+            "table label is fixed"
+        );
     }
 
     #[test]
@@ -1064,9 +1104,15 @@ mod tests {
         };
         t.define_vector_index(def.clone()).unwrap();
         assert!(t.define_vector_index(def.clone()).is_err());
-        assert_eq!(t.vector_index("chunk_embedding").unwrap(), Some(def.clone()));
+        assert_eq!(
+            t.vector_index("chunk_embedding").unwrap(),
+            Some(def.clone())
+        );
         assert_eq!(t.vector_indexes().unwrap(), vec![def]);
-        assert!(t.tables().unwrap().is_empty(), "index definitions are not tables");
+        assert!(
+            t.tables().unwrap().is_empty(),
+            "index definitions are not tables"
+        );
         assert!(t.drop_index("chunk_embedding").unwrap());
         assert!(!t.drop_index("chunk_embedding").unwrap());
     }

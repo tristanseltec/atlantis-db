@@ -365,12 +365,12 @@ mod tests {
     #[test]
     fn test_as_int() {
         assert_eq!(Value::Integer(42).as_int(), Some(42));
-        assert_eq!(Value::Float(3.14).as_int(), None);
+        assert_eq!(Value::Float(2.5).as_int(), None);
     }
 
     #[test]
     fn test_as_float_cross_type() {
-        assert_eq!(Value::Float(3.14).as_float(), Some(3.14));
+        assert_eq!(Value::Float(2.5).as_float(), Some(2.5));
         assert_eq!(Value::Integer(42).as_float(), Some(42.0));
         assert_eq!(Value::String("x".into()).as_float(), None);
     }
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(Value::from(true), Value::Bool(true));
         assert_eq!(Value::from(42i64), Value::Integer(42));
         assert_eq!(Value::from(42i32), Value::Integer(42));
-        assert_eq!(Value::from(3.14f64), Value::Float(3.14));
+        assert_eq!(Value::from(2.5f64), Value::Float(2.5));
         assert_eq!(Value::from("hi"), Value::String("hi".into()));
         assert_eq!(Value::from(vec![1.0f32]), Value::Vector(vec![1.0]));
     }
@@ -476,7 +476,7 @@ mod tests {
             Value::Null,
             Value::Bool(true),
             Value::Integer(42),
-            Value::Float(3.14),
+            Value::Float(2.5),
             Value::String("hello".into()),
             Value::Array(vec![Value::Integer(1), Value::String("two".into())]),
             Value::Vector(vec![0.1, 0.2, 0.3]),

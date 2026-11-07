@@ -22,9 +22,10 @@
 //! # }
 //! ```
 //!
-//! The original Cypher graph engine is still available through
-//! [`Engine::execute`]; it runs on its own graph store until the query
-//! engine moves onto the record store.
+//! The same data is queried with Cypher through [`Engine::execute`] or
+//! [`Transaction::execute`]: `MATCH (o:Order) RETURN o` reads the records
+//! created above, and nodes created by Cypher are records in the table named
+//! by their first label.
 
 pub mod config;
 pub mod engine;
@@ -32,12 +33,12 @@ pub mod params;
 pub mod result_set;
 
 pub use atlantis_core::{
-    AtlantisError, DatabaseRef, Datetime, Direction, Duration, Edge, Error, Geometry, Object,
-    Point, Record, RecordId, RecordKey, Ulid, Uuid, Value,
+    AtlantisError, DatabaseRef, Datetime, Direction, DistanceMetricKind, Duration, Edge, Error,
+    Geometry, Object, Point, Record, RecordId, RecordKey, SyncMode, Ulid, Uuid, Value,
 };
 pub use atlantis_kv::{Isolation, Versionstamp};
-pub use atlantis_storage::{RecordTx, TableDef, TableKind};
+pub use atlantis_storage::{CommitInfo, RecordTx, TableDef, TableKind, VectorIndexDef};
 pub use config::Config;
-pub use engine::Engine;
+pub use engine::{Engine, Transaction};
 pub use params::Params;
 pub use result_set::{ResultSet, Row};

@@ -91,7 +91,10 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
         let dist = metric.distance(&a, &b);
-        assert!(dist.abs() < 1e-6, "identical vectors should have ~0 distance, got {dist}");
+        assert!(
+            dist.abs() < 1e-6,
+            "identical vectors should have ~0 distance, got {dist}"
+        );
     }
 
     #[test]
@@ -100,7 +103,10 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![0.0, 1.0];
         let dist = metric.distance(&a, &b);
-        assert!((dist - 1.0).abs() < 1e-6, "orthogonal vectors should have distance ~1, got {dist}");
+        assert!(
+            (dist - 1.0).abs() < 1e-6,
+            "orthogonal vectors should have distance ~1, got {dist}"
+        );
     }
 
     #[test]
@@ -109,7 +115,10 @@ mod tests {
         let a = vec![1.0, 0.0];
         let b = vec![-1.0, 0.0];
         let dist = metric.distance(&a, &b);
-        assert!((dist - 2.0).abs() < 1e-6, "opposite vectors should have distance ~2, got {dist}");
+        assert!(
+            (dist - 2.0).abs() < 1e-6,
+            "opposite vectors should have distance ~2, got {dist}"
+        );
     }
 
     #[test]
@@ -118,7 +127,10 @@ mod tests {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 2.0, 3.0];
         let dist = metric.distance(&a, &b);
-        assert!((dist - 1.0).abs() < 1e-6, "zero vector should have distance 1, got {dist}");
+        assert!(
+            (dist - 1.0).abs() < 1e-6,
+            "zero vector should have distance 1, got {dist}"
+        );
     }
 
     #[test]
@@ -135,7 +147,10 @@ mod tests {
         let a = vec![0.0, 0.0];
         let b = vec![3.0, 4.0];
         let dist = metric.distance(&a, &b);
-        assert!((dist - 5.0).abs() < 1e-6, "3-4-5 triangle should give distance 5, got {dist}");
+        assert!(
+            (dist - 5.0).abs() < 1e-6,
+            "3-4-5 triangle should give distance 5, got {dist}"
+        );
     }
 
     #[test]
@@ -168,6 +183,9 @@ mod tests {
         let dist = metric.distance(&a, &b);
         // cos(45) = sqrt(2)/2 ≈ 0.707, distance = 1 - 0.707 ≈ 0.293
         let expected = 1.0 - (2.0_f32).sqrt() / 2.0;
-        assert!((dist - expected).abs() < 1e-5, "expected {expected}, got {dist}");
+        assert!(
+            (dist - expected).abs() < 1e-5,
+            "expected {expected}, got {dist}"
+        );
     }
 }

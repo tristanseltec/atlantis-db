@@ -75,12 +75,11 @@ version = "0.1.0"
 dependencies = [
  "atlantis-core",
  "atlantis-cypher",
+ "atlantis-kv",
  "atlantis-storage",
  "atlantis-vector",
+ "regex",
  "tempfile",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]

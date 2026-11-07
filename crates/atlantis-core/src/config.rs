@@ -146,7 +146,9 @@ impl EngineConfig {
 
 fn validate_positive(name: &str, value: usize) -> Result<(), AtlantisError> {
     if value == 0 {
-        return Err(AtlantisError::Config(format!("{name} must be greater than 0")));
+        return Err(AtlantisError::Config(format!(
+            "{name} must be greater than 0"
+        )));
     }
     Ok(())
 }
@@ -261,14 +263,24 @@ mod tests {
 
     #[test]
     fn validation() {
-        assert!(EngineConfig::builder().vector_dimensions(0).build().is_err());
-        let bad = HnswParams { m: 16, m0: 8, ..HnswParams::default() };
+        assert!(EngineConfig::builder()
+            .vector_dimensions(0)
+            .build()
+            .is_err());
+        let bad = HnswParams {
+            m: 16,
+            m0: 8,
+            ..HnswParams::default()
+        };
         assert!(EngineConfig::builder().hnsw_params(bad).build().is_err());
     }
 
     #[test]
     fn serde_roundtrip_and_missing_sync_defaults() {
-        let config = EngineConfig::builder().checkpoint_interval(120).build().unwrap();
+        let config = EngineConfig::builder()
+            .checkpoint_interval(120)
+            .build()
+            .unwrap();
         let bytes = bincode::serialize(&config).unwrap();
         let back: EngineConfig = bincode::deserialize(&bytes).unwrap();
         assert_eq!(back.checkpoint_interval_secs, 120);
@@ -276,8 +288,14 @@ mod tests {
 
     #[test]
     fn metric_names() {
-        assert_eq!(DistanceMetricKind::parse("COSINE").unwrap(), DistanceMetricKind::Cosine);
-        assert_eq!(DistanceMetricKind::parse("dot_product").unwrap(), DistanceMetricKind::DotProduct);
+        assert_eq!(
+            DistanceMetricKind::parse("COSINE").unwrap(),
+            DistanceMetricKind::Cosine
+        );
+        assert_eq!(
+            DistanceMetricKind::parse("dot_product").unwrap(),
+            DistanceMetricKind::DotProduct
+        );
         assert!(DistanceMetricKind::parse("manhattan").is_err());
     }
 }
