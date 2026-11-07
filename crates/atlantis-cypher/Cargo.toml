@@ -1,7 +1,7 @@
 [package]
 name = "atlantis-cypher"
 version = "0.1.0"
-description = "Cypher query language parser and planner for Atlantis DB"
+description = "Cypher query language lexer and parser for Atlantis DB"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,9 +10,6 @@ repository.workspace = true
 
 [dependencies]
 atlantis-core = { workspace = true }
-chumsky = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
