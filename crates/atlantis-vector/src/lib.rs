@@ -2,12 +2,11 @@
 //!
 //! Implements the Hierarchical Navigable Small World algorithm for
 //! approximate nearest neighbor search, with pluggable distance metrics
-//! and support for persistence.
+//! and in-memory storage. Indexes are rebuilt from records on startup.
 
 pub mod distance;
 pub mod hnsw;
 pub mod params;
-pub mod persistence;
 pub mod vector_store;
 
 pub use distance::{CosineDistance, DistanceMetric, DotProductDistance, EuclideanDistance};

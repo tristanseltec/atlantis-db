@@ -529,14 +529,15 @@ mod tests {
     fn test_insert_and_search() {
         let mut index = make_index(8);
 
-        // Insert 100 vectors
+        // Insert 100 vectors. Seeds start at 0.1: seed 0 would produce the
+        // all-zero vector, which has no direction and ties with everything.
         for i in 0..100 {
-            let vec = random_vector(8, i as f32 * 0.1);
+            let vec = random_vector(8, (i + 1) as f32 * 0.1);
             index.insert(NodeId(i), vec).unwrap();
         }
 
-        // Search for a vector similar to the first one
-        let query = random_vector(8, 0.0);
+        // Search for the first inserted vector itself
+        let query = random_vector(8, 0.1);
         let results = index.search(&query, 5, None).unwrap();
 
         assert!(!results.is_empty());
