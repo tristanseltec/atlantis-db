@@ -1,7 +1,7 @@
 # 22 — Configuration
 
 > **Status:** Partially implemented — embedded `EngineConfig` exists; storage backend, transaction, server, auth and cluster settings are Planned — Phases 1–7
-> **Crates:** `atlantis-core`, `atlantis-db`, `atlantis-kv` (planned), `atlantis-server` (planned), `atlantis-auth` (planned)
+> **Crates:** `atlantis-core`, `atlantis-db`, `atlantis-kv`, `atlantis-server` (planned), `atlantis-auth` (planned)
 
 This chapter lists every configuration setting. "Implemented today" covers the
 `EngineConfig` struct in `atlantis-core`. "Target design" covers the settings that arrive
@@ -16,10 +16,6 @@ variables used by the server binary.
 `atlantis_db::Config` is a type alias for `atlantis_core::EngineConfig`. All config types
 derive `Serialize` and `Deserialize`. The crate's own tests round-trip them through
 `bincode`.
-
-> The workspace does not compile as committed. `config.rs` uses `AtlantisError` without
-> importing it. Phase 0 fixes this; see
-> [25 — Implementation Roadmap](25-implementation-roadmap.md).
 
 ### EngineConfig
 
@@ -75,8 +71,8 @@ let config = EngineConfig::builder()
 The builder cannot set `memory_budget_bytes = None`. Set the struct field directly when
 you need that.
 
-`Config::builder()` is declared in `atlantis-db` but cannot compile, because it adds an
-inherent method to an alias of a foreign type. Use `EngineConfig::builder()`.
+`Config::builder()` resolves to `EngineConfig::builder()`, because `Config` is a type
+alias.
 
 ### Validation rules
 
@@ -103,8 +99,10 @@ pub struct StorageConfig {
   tier. `None` means unbounded.
 - **`eviction_policy`**: `Lru` is the only policy with an implementation (`LruTracker`).
   `Lfu` is declared only.
-- **`disk_path`**: the directory for `cold_tier.db` and `checkpoint.db`. `None` means
-  in-memory only, and `checkpoint()` returns `AtlantisError::Storage`.
+- **`disk_path`**: the directory for `cold_tier.db` and `checkpoint.db` (Cypher graph
+  store), `records.kv` (record store checkpoint) and the `LOCK` file that keeps a second
+  engine from opening the same directory. `None` means in-memory only, and
+  `checkpoint()` returns `AtlantisError::Storage`.
 - **`compaction_threshold`**: the number of delta edges per relationship type that
   triggers a merge into the CSR. See [04 — Storage Engine](04-storage-engine.md).
 
@@ -247,6 +245,10 @@ survive a restart. Always pass a URL in production. URL forms are shared with cl
 `disk_path` maps to `rocksdb://<disk_path>` after the migration.
 
 ### Transactions and queries (Planned — Phase 1)
+
+There is no isolation setting today. Record transactions use snapshot isolation unless
+the caller passes `Isolation::Serializable` to `Engine::transaction_with_isolation`
+([21 — API Reference](21-api-reference.md)).
 
 | Key | Env var | Default | Meaning |
 |---|---|---|---|

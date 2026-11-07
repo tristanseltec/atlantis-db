@@ -17,9 +17,8 @@ This chapter covers two things:
 
 ## Implemented Today
 
-The workspace does not compile at the moment: `crates/atlantis-core/src/config.rs` uses
-`AtlantisError` without importing it. The behaviour below was verified by reading the
-source and by running queries against a copy with that one import added.
+The behaviour below was verified by reading the source and by running queries. (It was
+first checked on a copy patched to compile; the workspace itself now builds.)
 
 ### Pipeline
 

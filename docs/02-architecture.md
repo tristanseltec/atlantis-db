@@ -1,7 +1,7 @@
 # 02 — Architecture
 
-> **Status:** Partially implemented — the six-crate embedded engine exists (with Phase 0 gaps); the layered multi-model architecture is Planned — Phases 0–7
-> **Crates:** `atlantis-core`, `atlantis-kv` (planned), `atlantis-storage`, `atlantis-index` (planned), `atlantis-vector`, `atlantis-text` (planned), `atlantis-geo` (planned), `atlantis-cypher`, `atlantis-engine`, `atlantis-auth` (planned), `atlantis-server` (planned), `atlantis-db`
+> **Status:** Partially implemented — the seven-crate embedded engine exists: the Cypher graph engine (with Phase 0 gaps) and, beside it, the record store on `atlantis-kv` (`mem` backend); the rest of the layered multi-model architecture is Planned — Phases 0–7
+> **Crates:** `atlantis-core`, `atlantis-kv`, `atlantis-storage`, `atlantis-index` (planned), `atlantis-vector`, `atlantis-text` (planned), `atlantis-geo` (planned), `atlantis-cypher`, `atlantis-engine`, `atlantis-auth` (planned), `atlantis-server` (planned), `atlantis-db`
 
 This chapter describes how Atlantis DB is layered, which crate owns which
 responsibility, how a request moves through the system, and how the same engine runs
@@ -54,9 +54,9 @@ engine and that layer.
 
 | Crate | Role | Status |
 |---|---|---|
-| `atlantis-core` | Types: `Value`, `RecordId`, `Geometry`, `Datetime`, `Duration`, errors, config | Partial (graph types today; record types Phase 2) |
-| `atlantis-kv` (planned) | `KvStore` / `Transaction` traits, key encoding, MVCC; features `kv-mem`, `kv-rocksdb`, `kv-tikv` | Phase 1 (`kv-tikv`: Phase 7) |
-| `atlantis-storage` | Record and edge stores on top of `atlantis-kv`; CSR+delta becomes an adjacency cache; tiering becomes cache management | Partial (hot/cold tier today; KV-backed Phase 1) |
+| `atlantis-core` | Types: `Value`, `RecordId`, `Geometry`, `Datetime`, `Duration`, errors, config | Partial (record and graph types implemented; `Decimal`, `Range` Phase 2) |
+| `atlantis-kv` | `KvStore` / `KvTransaction` traits, key encoding, MVCC; features `kv-mem`, `kv-rocksdb`, `kv-tikv` | Partial (traits, encoding, MVCC and the `mem` backend implemented; `rocksdb` and backend features Phase 1, `tikv` Phase 7) |
+| `atlantis-storage` | Record and edge stores on top of `atlantis-kv`; CSR+delta becomes an adjacency cache; tiering becomes cache management | Partial (record store on `atlantis-kv` implemented; Cypher still uses the hot/cold `GraphStore`; adjacency cache Phase 1) |
 | `atlantis-index` (planned) | Secondary B-tree, unique and composite indexes; index manager and background index builds | Phase 2 |
 | `atlantis-vector` | HNSW, persisted through `atlantis-kv` | Partial (in-memory HNSW today; persistence Phase 0/1) |
 | `atlantis-text` (planned) | Analyzers, inverted index, BM25 | Phase 3 |
@@ -65,7 +65,7 @@ engine and that layer.
 | `atlantis-engine` | Execution, transactions, permissions, live queries, events, change feeds | Partial (single-writer actor today) |
 | `atlantis-auth` (planned) | Users, roles, access methods, JWT, Argon2id password hashing | Phase 5 |
 | `atlantis-server` (planned) | HTTP, WebSocket RPC, optional Bolt; the `atlantis` binary | Phase 5 (Bolt: Phase 6) |
-| `atlantis-db` | Public facade; one `Engine` API for embedded and remote connections | Partial (embedded only today; remote Phase 6) |
+| `atlantis-db` | Public facade; one `Engine` API for embedded and remote connections | Partial (embedded Cypher and record transactions today; remote Phase 6) |
 
 ### Dependency Rules
 
@@ -140,6 +140,10 @@ client ── POST /query or WS {method: "query"} ──────────
 
 ### Concurrency Model (Phase 1)
 
+Today the record store already runs optimistic MVCC transactions concurrently with the
+Cypher actor, on the `mem` backend; commits are validated one at a time under a
+store-wide lock. The commit sequencer below is still planned.
+
 - **Writes**: each database has one **commit sequencer**, the evolution of today's
   single-writer actor. It orders commits and validates conflicts.
 - **Reads**: run concurrently on MVCC snapshots and never wait for the sequencer.
@@ -167,31 +171,40 @@ client ── POST /query or WS {method: "query"} ──────────
 
 ## Implemented Today
 
-The current code is an embedded graph + vector engine in six crates. There is no KV
-layer, server, authentication or schema yet.
+The current code is an embedded engine in seven crates. It has **two stores that do
+not share data yet**:
+
+- the Cypher graph + vector engine (`Engine::execute`), on the hot/cold `GraphStore`;
+- the record store (`Engine::transaction`, `Engine::read`), on `atlantis-kv` with the
+  in-memory `mem` backend and a `records.kv` checkpoint file.
+
+There is no server, authentication or schema yet.
 
 ### Crates and Dependencies
 
 ```
 atlantis-core          ← no internal dependencies
     ↑
-atlantis-storage       ← core
+atlantis-kv            ← core
 atlantis-vector        ← core
 atlantis-cypher        ← core
     ↑
+atlantis-storage       ← core, kv
+    ↑
 atlantis-engine        ← core, storage, vector, cypher
     ↑
-atlantis-db            ← core, engine (public facade)
+atlantis-db            ← core, engine, kv, storage (public facade)
 ```
 
 | Crate | Responsibility today |
 |---|---|
-| `atlantis-core` | `Value`, `Node`, `Relationship`, `Label`, `RelType`, `PropertyMap`, `Direction`, config, `AtlantisError` |
-| `atlantis-storage` | `GraphStore`: in-memory hot tier (CSR + delta adjacency), append-only on-disk cold tier, LRU tiering manager, bincode checkpoint |
+| `atlantis-core` | `Value` (with the extended types), record types (`DatabaseRef`, `RecordId`, `Record`, `Edge`), graph types (`Node`, `Relationship`, `Label`, `RelType`, `PropertyMap`), `Direction`, config, `AtlantisError` |
+| `atlantis-kv` | `KvStore` / `KvTransaction` traits, memcomparable key encoding and layout, `MemStore` MVCC backend with checkpoint file |
+| `atlantis-storage` | `RecordStore` / `RecordTx` on `atlantis-kv`; `GraphStore` for Cypher: in-memory hot tier (CSR + delta adjacency), append-only on-disk cold tier, LRU tiering manager, bincode checkpoint |
 | `atlantis-vector` | In-memory HNSW index and distance metrics; persistence is a stub |
 | `atlantis-cypher` | Hand-written lexer and recursive-descent parser, logical planner; the optimizer is a pass-through |
 | `atlantis-engine` | `CoreEngineActor` on tokio, command protocol, `EngineHandle`, query executor |
-| `atlantis-db` | `Engine`, `Config`, `Params`, `ResultSet`, `Row`, re-exported `Value` |
+| `atlantis-db` | `Engine` (Cypher and record transactions), `Config`, `Params`, `ResultSet`, `Row`, re-exported value, record and transaction types |
 
 ### Query Flow Today
 
@@ -204,9 +217,7 @@ runs:
 4. `QueryExecutor` walks the tree against `GraphStore` and the HNSW index → rows
 5. rows → `ResultSet`
 
-The workspace does not build at the moment (`atlantis-core` uses `AtlantisError` in
-`config.rs` without importing it). Once it builds, this path has these known gaps, all
-scheduled for Phase 0:
+This path has these known gaps, all scheduled for Phase 0:
 
 - `CREATE` skips relationship patterns and returns only the last node created;
   `VarLenExpand` and `CreateRelationship` execute as no-ops.
@@ -241,6 +252,9 @@ See [Query Planner & Executor](15-query-planner-executor.md).
   placeholder loops, and `checkpoint_interval_secs` is unused. `DELETE` only
   tombstones a node.
 
+Record transactions do not go through the actor. `Engine::transaction` runs its closure
+on the calling task against the record store.
+
 See [Engine Runtime](16-engine-runtime.md) for the details.
 
 ### How Today's Components Evolve
@@ -248,11 +262,12 @@ See [Engine Runtime](16-engine-runtime.md) for the details.
 | Today | Target | Phase |
 |---|---|---|
 | `CoreEngineActor` (single writer for everything) | Commit sequencer per database plus concurrent snapshot readers | 1 |
-| Append-only cold-tier file + bincode checkpoint | `atlantis-kv` with `rocksdb` backend and WAL | 1 |
+| Append-only cold-tier file + bincode checkpoint | `atlantis-kv` with `rocksdb` backend and WAL (`mem` backend done) | 1 |
 | Hot tier as the primary store | Cache management over KV | 1 |
 | CSR + delta adjacency | In-memory adjacency cache rebuilt from `g/` keys | 1 |
 | In-memory HNSW, empty on restart | HNSW persisted in `vx/` keys, cached in memory | 0–1 |
-| `NodeId` / `EdgeId` | `RecordId` | 2 |
+| `NodeId` / `EdgeId` in Cypher | `RecordId` (type and record store done) | 1–2 |
+| Two stores (Cypher graph store, record store) | One record store under Cypher | 1–2 |
 | Pass-through optimizer | Cost-based optimizer with index selection and join ordering | 2 |
 | Embedded `Engine` only | Same `Engine` API over `mem://`, `rocksdb://`, `ws://`, `http://`, `tikv://` | 1, 5–7 |
 
@@ -269,7 +284,7 @@ See [Engine Runtime](16-engine-runtime.md) for the details.
 | Parser | Hand-written recursive descent | Full control over error messages and Cypher quirks. `chumsky` is a declared dependency, but the current parser does not call it. |
 | HNSW defaults | M=16, M0=32, ef_construction=200, ef_search=50 | Values recommended by the HNSW paper; tunable. |
 | Errors | `thiserror` in libraries | Typed errors with clear messages. |
-| Serialization today | serde + bincode | Compact persistence for the current checkpoint format; replaced by KV value encoding in Phase 1. |
+| Serialization today | serde + bincode | Compact persistence for the graph checkpoint and for record values in KV (with a leading format byte so the format can evolve). Keys use the memcomparable encoding instead. |
 
 ## What's Next
 

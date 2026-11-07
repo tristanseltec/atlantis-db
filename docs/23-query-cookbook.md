@@ -291,9 +291,10 @@ COMMIT;
 ```
 
 ```rust
-engine.transaction(|tx| async move {
-    tx.execute("MATCH (a:Account {id: $from}) SET a.balance = a.balance - $amount", &p).await?;
-    tx.execute("MATCH (a:Account {id: $to}) SET a.balance = a.balance + $amount", &p).await?;
+// Synchronous closure (implemented today); tx.execute for Cypher is Phase 2.
+engine.transaction(|tx| {
+    tx.execute("MATCH (a:Account {id: $from}) SET a.balance = a.balance - $amount", &p)?;
+    tx.execute("MATCH (a:Account {id: $to}) SET a.balance = a.balance + $amount", &p)?;
     Ok(())
 }).await?;   // Err(TxConflict) may be retried
 ```

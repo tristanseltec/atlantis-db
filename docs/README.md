@@ -8,9 +8,10 @@ relational, key-value, time-series, full-text and geospatial data share one reco
 model and one query language, **Atlantis Cypher** (Cypher plus extensions). It is
 designed to run embedded, as a standalone server and as a distributed cluster.
 
-Today the code is a pre-release embedded graph + vector engine; the workspace does not
-build yet, and several Cypher features it parses are not executed correctly (listed in
-[Getting Started](01-getting-started.md)). Most of this documentation
+Today the code is a pre-release embedded engine: a record store (documents, nodes and
+edges in namespaced tables, with MVCC transactions) used from Rust, and a separate Cypher
+graph + vector engine in which several features it parses are not executed correctly
+(listed in [Getting Started](01-getting-started.md)). Most of this documentation
 describes the target design, and every chapter separates **Implemented today** from
 **Planned — Phase N**. The phases are defined in the
 [Implementation Roadmap](25-implementation-roadmap.md).
@@ -33,7 +34,7 @@ phase that delivers it.
 | # | Chapter | What it covers | Status |
 |---|---|---|---|
 | 04 | [Storage Engine](04-storage-engine.md) | Today's hot/cold tiers; transactional KV layer, key encoding, backends, adjacency cache | Partial |
-| 05 | [Transactions & Consistency](05-transactions-consistency.md) | ACID, MVCC, isolation levels, explicit transactions, durability, conflicts | Phase 1 |
+| 05 | [Transactions & Consistency](05-transactions-consistency.md) | ACID, MVCC, isolation levels, explicit transactions, durability, conflicts | Partial |
 
 ### Part III — Query Language and Schema
 

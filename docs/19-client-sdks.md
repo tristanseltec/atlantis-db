@@ -31,11 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`Engine` also offers `open_with_config`, `checkpoint` and `shutdown`. Errors are
-`atlantis_core::AtlantisError`, which `atlantis-db` does not re-export today; the target
-error type is `atlantis_db::Error`. The sample shows the API shape only: the workspace
-does not compile at the moment, and several query features it relies on are incomplete
-(see [25-implementation-roadmap.md](25-implementation-roadmap.md), Phase 0). There are no
+`Engine` also offers `open_with_config`, `checkpoint`, `shutdown`, and the record API
+(`transaction`, `transaction_with_retry`, `read`, `use_db`; see
+[21-api-reference.md](21-api-reference.md)). Errors are `atlantis_db::Error`, an alias
+of `AtlantisError`. Several query features the sample relies on are incomplete (see
+[25-implementation-roadmap.md](25-implementation-roadmap.md), Phase 0). There are no
 connection URLs, no remote connections, no authentication, and no other language SDKs.
 The full current surface is in [21-api-reference.md](21-api-reference.md).
 
@@ -115,16 +115,18 @@ while let Some(n) = live.next().await {
     println!("{:?} {:?}", n.action, n.record);
 }
 
-// Transaction: commits once, or returns Err(Error::TxConflict) without retrying
-engine.transaction(|tx| async move {
-    tx.execute("MATCH (a:Account {id: $from}) SET a.balance = a.balance - $amt", &[/* ... */]).await?;
-    tx.execute("MATCH (a:Account {id: $to})   SET a.balance = a.balance + $amt", &[/* ... */]).await?;
+// Transaction: commits once, or returns Err(Error::TxConflict) without retrying.
+// The closure is synchronous (implemented today); tx.execute for Cypher inside a
+// transaction is Phase 2 — today the closure uses RecordTx methods.
+engine.transaction(|tx| {
+    tx.execute("MATCH (a:Account {id: $from}) SET a.balance = a.balance - $amt", &[/* ... */])?;
+    tx.execute("MATCH (a:Account {id: $to})   SET a.balance = a.balance + $amt", &[/* ... */])?;
     Ok(())
 }).await?;
 
 // Same body, re-run up to 5 times on Error::TxConflict
-engine.transaction_with_retry(5, |tx| async move {
-    tx.execute("MATCH (a:Account {id: $id}) SET a.balance = a.balance + $amt", &[/* ... */]).await?;
+engine.transaction_with_retry(5, |tx| {
+    tx.execute("MATCH (a:Account {id: $id}) SET a.balance = a.balance + $amt", &[/* ... */])?;
     Ok(())
 }).await?;
 ```

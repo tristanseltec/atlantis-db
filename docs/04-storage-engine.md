@@ -1,18 +1,20 @@
 # 04 — Storage Engine
 
-> **Status:** Partially implemented — hot/cold tier implemented today; transactional KV layer Planned — Phase 1
-> **Crates:** `atlantis-storage`, `atlantis-core`, `atlantis-kv` (planned)
+> **Status:** Partially implemented — the hot/cold graph store (used by Cypher) and `atlantis-kv` with the `mem` backend, key encoding and record store are implemented; `rocksdb` and sync modes Planned — Phase 1, secondary indexes Phase 2, `tikv` Phase 7
+> **Crates:** `atlantis-storage`, `atlantis-kv`, `atlantis-core`
 
-This chapter covers how Atlantis DB stores data. It has two parts:
+This chapter covers how Atlantis DB stores data. Two stores exist side by side during the migration:
 
-- **Implemented today** describes the graph store that ships now: an in-memory hot tier with CSR + delta adjacency, an append-only cold tier, LRU tiering, and whole-store checkpoints.
-- **Target design** describes the transactional storage foundation that replaces it: the `atlantis-kv` ordered key-value layer, the memcomparable key encoding, the `mem` / `rocksdb` / `tikv` backends, and the role CSR keeps as an adjacency cache.
+- **Graph store (implemented today)** — the store that Cypher (`Engine::execute`) uses: an in-memory hot tier with CSR + delta adjacency, an append-only cold tier, LRU tiering, and whole-store checkpoints.
+- **Transactional KV layer and record store** — the target foundation: the `atlantis-kv` ordered key-value layer, the memcomparable key encoding, the `mem` / `rocksdb` / `tikv` backends, the record and edge store, and the role CSR keeps as an adjacency cache. `atlantis-kv` with the `mem` backend and the record store are implemented; the rest is planned.
+
+The two stores do not share data yet. Cypher queries read and write only the graph store, and record transactions ([21 — API Reference](21-api-reference.md)) read and write only the record store.
 
 Transactions, isolation, and durability guarantees are covered in [05 — Transactions & Consistency](05-transactions-consistency.md).
 
 ---
 
-## Implemented today
+## Graph store (implemented today)
 
 ### Overview
 
@@ -96,7 +98,7 @@ Both are Phase 0 items in [25 — Implementation Roadmap](25-implementation-road
 
 ### GraphStore facade
 
-`GraphStore` is the only storage API the engine uses. Its main operations are listed below; the source file is authoritative.
+`GraphStore` is the only storage API the Cypher engine (`atlantis-engine`) uses. Its main operations are listed below; the source file is authoritative.
 
 | Method | Purpose |
 |---|---|
@@ -135,99 +137,96 @@ Relationship creation is available through the storage API but not yet through C
 
 ---
 
-## Target design (Planned — Phase 1)
+## Transactional KV layer and record store
 
 The target storage stack separates **what** is stored (records, edges, indexes) from **where** bytes live (a pluggable transactional KV backend):
 
 ```
  atlantis-storage ── record store, edge store, CSR adjacency cache, cache management
           │
- atlantis-kv ─────── KvStore / Transaction traits, key encoding, MVCC
+ atlantis-kv ─────── KvStore / KvTransaction traits, key encoding, MVCC
           │
    backends: mem | rocksdb (default persistent) | tikv (distributed, Phase 7)
 ```
 
 Every model (graph, document, relational, key-value, time-series, vector, full-text, geospatial) is stored as ordered keys in one keyspace. Indexes, change feeds, and the catalog live in the same keyspace and are written in the same transaction as the data they describe.
 
-### `atlantis-kv` (Planned — Phase 1)
+Implemented today: `atlantis-kv` with the `mem` backend, the record, catalog, adjacency and label keys, and the record store. Planned: the `rocksdb` and `tikv` backends, the CSR adjacency cache, and the `ix/`, `ft/`, `vx/`, `cf/` and `kv/` keys.
 
-`atlantis-kv` exposes an ordered, transactional key-value API with snapshot reads:
+### `atlantis-kv` (Implemented — `mem` backend only)
+
+`atlantis-kv` ([`crates/atlantis-kv/src/kv.rs`](../crates/atlantis-kv/src/kv.rs)) exposes an ordered, transactional key-value API with snapshot reads. The traits are **synchronous**: an earlier draft of this design used `async` methods, and that is no longer the plan.
 
 | Operation | Meaning |
 |---|---|
-| `begin(read_only)` | Start a transaction on a consistent snapshot |
+| `KvStore::begin(mode, isolation)` | Start a transaction on a snapshot of the latest commit. `mode` is `TxMode::ReadOnly` or `TxMode::ReadWrite`; `isolation` is `Isolation::Snapshot` (default) or `Isolation::Serializable`. |
 | `get(key)` | Read one key as of the snapshot, including the transaction's own writes |
 | `set(key, value)` / `delete(key)` | Buffer a write in the transaction |
-| `scan(range)` | Iterate keys in byte order within a range |
-| `commit()` | Validate and atomically apply all writes |
-| `cancel()` | Discard the transaction |
+| `scan(range, limit)` | Return pairs in a half-open `KeyRange`, in byte order |
+| `commit()` | Validate and atomically apply all writes; returns a `Versionstamp` |
+| `cancel()` | Discard the transaction. Dropping an unfinished transaction also cancels it. |
 
-An illustrative shape of the traits (names and signatures are not final):
+The trait definitions in `kv.rs` are authoritative. Isolation and conflict rules are in [05 — Transactions & Consistency](05-transactions-consistency.md).
 
-```rust
-// Planned — Phase 1. Illustrative only.
-pub trait KvStore: Send + Sync {
-    type Tx: Transaction;
-    async fn begin(&self, read_only: bool) -> Result<Self::Tx, Error>;
-}
+There are no Cargo backend features yet. `kv-mem`, `kv-rocksdb`, and `kv-tikv` features and selection by connection URL are planned with the backends that need them.
 
-pub trait Transaction: Send {
-    async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
-    async fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error>;
-    async fn delete(&mut self, key: &[u8]) -> Result<(), Error>;
-    async fn scan(&mut self, range: Range<Vec<u8>>, limit: Option<usize>)
-        -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error>;
-    async fn commit(self) -> Result<(), Error>;   // may fail with Error::TxConflict
-    async fn cancel(self) -> Result<(), Error>;
-}
-```
+### Key encoding (Implemented)
 
-Backends are selected with Cargo features `kv-mem`, `kv-rocksdb`, and `kv-tikv`, and at runtime by the connection URL.
+Keys are **memcomparable**: comparing encoded keys byte-by-byte gives the same order as comparing the logical values. A range scan over a key prefix therefore returns records, adjacency entries, or index entries in logical order, on every backend. The layout is defined in [`crates/atlantis-kv/src/keys.rs`](../crates/atlantis-kv/src/keys.rs) and the encoding in [`encoding.rs`](../crates/atlantis-kv/src/encoding.rs).
 
-### Key encoding (Planned — Phase 1)
+In the table, `/ns`, `/r` and similar are literal markers, and `{…}` is an encoded component. Names are escaped strings, so a marker can never be confused with data.
 
-Keys are **memcomparable**: comparing encoded keys byte-by-byte gives the same order as comparing the logical values. A range scan over a key prefix therefore returns records, adjacency entries, or index entries in logical order, on every backend.
-
-| Prefix | Holds |
-|---|---|
-| `/ns/{ns}/db/{db}/tb/{tb}/r/{key}` | A record (node, edge, document, row, time-series point) |
-| `.../tb/{tb}/g/{from}/{dir}/{edgeTable}/{edgeKey}` | An adjacency entry; `dir` is `out` or `in` |
-| `.../tb/{tb}/ix/{index}/{encodedValues}/{key}` | A secondary index entry |
-| `.../tb/{tb}/ft/{index}/...` | Full-text postings and statistics |
-| `.../tb/{tb}/vx/{index}/...` | HNSW graph layers and vectors |
-| `.../cf/{tb}/{versionstamp}` | A change-feed entry |
-| `/ns/{ns}/db/{db}/kv/d/{key}` | A raw key-value entry (see [13 — Key-Value & Time-Series](13-key-value-time-series.md)) |
-| `/ns/{ns}/db/{db}/kv/x/{expiresAt}/{key}` | TTL expiry queue entry, scanned by the expiry worker |
-| `/sys/...` | Catalog (namespaces, databases, tables, fields, indexes), users, cluster membership |
+| Prefix | Holds | Status |
+|---|---|---|
+| `/sys/ns/{ns}` | Namespace definition | Implemented |
+| `/sys/ns/{ns}/db/{db}` | Database definition | Implemented |
+| `/sys/ns/{ns}/db/{db}/tb/{tb}` | Table definition (`TableDef`) | Implemented |
+| `/ns/{ns}/db/{db}/tb/{tb}/r/{key}` | A record (node, edge, document, row, time-series point) | Implemented |
+| `.../tb/{tb}/g/{nodeKey}/{dir}/{edgeTable}{edgeKey}` | An adjacency entry under the node's table; `dir` is `o` (outgoing) or `i` (incoming) | Implemented |
+| `/ns/{ns}/db/{db}/lb/{label}/{table}{key}` | A secondary label index entry | Implemented |
+| `.../tb/{tb}/ix/{index}/{encodedValues}/{key}` | A secondary index entry | Phase 2 |
+| `.../tb/{tb}/ft/{index}/...` | Full-text postings and statistics | Phase 3 |
+| `.../tb/{tb}/vx/{index}/...` | HNSW graph layers and vectors | Phase 3 |
+| `.../cf/{tb}/{versionstamp}` | A change-feed entry | Phase 4 |
+| `/ns/{ns}/db/{db}/kv/d/{key}` | A raw key-value entry (see [13 — Key-Value & Time-Series](13-key-value-time-series.md)) | Phase 3 |
+| `/ns/{ns}/db/{db}/kv/x/{expiresAt}/{key}` | TTL expiry queue entry, scanned by the expiry worker | Phase 3 |
+| `/sys/...` (other) | Fields, indexes, users, cluster membership | Phases 2, 5, 7 |
 
 Encoding rules for key components:
 
-- **Integers** are written big-endian with the sign bit flipped, so negative keys sort before positive ones.
+- **Strings** and bytes escape every `0x00` byte and end with a terminator, so `"ab"` sorts before `"abc"` and a component never bleeds into the next one.
+- **Record keys** are tagged by kind, so keys of different kinds sort integer < string < UUID < ULID < array, then by value.
+- **Integers** in record keys are written big-endian with the sign bit flipped, so negative keys sort before positive ones.
+- **Numbers inside values** (array key elements) share one tag and sort numerically across `Integer` and `Float`. An integer is prefixed with the largest `f64` not above it, so the order stays numeric even above 2^53. `Integer(1)` and `Float(1.0)` still encode to different bytes (see [03 — Data Model](03-data-model.md)).
 - **Floats** use the standard order-preserving bit transform.
-- **Strings** and bytes are written with an escaped terminator, so `"ab"` sorts before `"abc"` and a component never bleeds into the next one.
 - **UUID** and **ULID** keys are written as their 16 raw bytes. ULIDs are time-ordered, so the default auto-generated key gives insertion-ordered scans.
-- **Arrays** (composite keys) are encoded element by element. `Reading:['sensor-1', d'2026-11-07T00:00:00Z']` therefore sorts by sensor, then by time, which makes per-sensor time-range scans a single prefix scan ([13 — Key-Value & Time Series](13-key-value-time-series.md)).
-- **Datetime** is encoded as nanoseconds since the epoch in the integer form.
+- **Arrays** (composite keys) are encoded element by element. `Reading:['sensor-1', <datetime>]` therefore sorts by sensor, then by time, which makes a per-sensor time-range scan a single range scan ([13 — Key-Value & Time Series](13-key-value-time-series.md)).
+- **Datetime** and **Duration** are encoded as nanoseconds in the integer form.
+- `Vector` and `Geometry` values cannot be part of a key.
 
 Record keys are built from a `RecordId` (`table` + `key`); see [03 — Data Model](03-data-model.md).
 
-### Record store and edge store (Planned — Phase 1, unified record model Phase 2)
+### Record store and edge store (Implemented — unified record model Phase 2)
 
-- A **node** is a record under `r/` in the table named by its first label. Secondary labels are stored with the record and indexed as a tag set.
-- A **relationship** is a record in its edge table (for example `WORKS_AT`) with `in` / `out` RecordIds. Creating it writes three keys in one transaction: the edge record, an `out` adjacency entry under the start node, and an `in` adjacency entry under the end node. Both traversal directions are therefore prefix scans.
-- Deleting a node with `DETACH DELETE` scans its `g/` prefix to find and delete incident edges in the same transaction.
+`RecordStore` and `RecordTx` ([`crates/atlantis-storage/src/records.rs`](../crates/atlantis-storage/src/records.rs)) store records and edges on `atlantis-kv`. A `RecordTx` works in one namespace and database. Its method list is in [21 — API Reference](21-api-reference.md#record-transactions).
 
-Phase 1 migrates today's graph store onto this layout. Phase 2 generalises it to all tables with namespaces, databases, and typed fields ([07 — Schema & DDL](07-schema-ddl.md), [08 — Document & Relational](08-document-relational.md)).
+- **Tables.** A table is created implicitly, schemaless, on its first write, or explicitly with `define_table`. A table is either `Normal` or `Edge { from, to }`, where non-empty `from` / `to` lists restrict the endpoint tables. Field schemas are Phase 2 ([07 — Schema & DDL](07-schema-ddl.md)).
+- **Nodes.** A node is a record under `r/` in the table named by its first label. A node without labels goes into the reserved table `_default`. Secondary labels are stored with the record and get one `lb/` entry each, so a label lookup is a prefix scan.
+- **Relationships.** A relationship is a record in its edge table (for example `WORKS_AT`) with `in` / `out` RecordIds. Creating it writes three keys in one transaction: the edge record, an outgoing adjacency entry under the start node, and an incoming adjacency entry under the end node. Both traversal directions are therefore prefix scans. Both endpoints must exist and must not be edges. `relate` also rewrites both endpoint records unchanged, so a concurrent delete of an endpoint fails with `TxConflict` instead of leaving a dangling edge.
+- **Deletes.** Deleting a node that still has edges fails with `SchemaViolation` unless `detach` is set, in which case its `g/` entries are scanned and the edges are deleted in the same transaction.
+- **Values.** Stored values are bincode with a leading format byte, so the format can evolve.
+
+Today's Cypher graph store is not on this layout yet. Moving it, and generalising the layout to typed fields and secondary indexes, is open work ([07 — Schema & DDL](07-schema-ddl.md), [08 — Document & Relational](08-document-relational.md)).
 
 ### Backends
 
 | Backend | URL | Use | Status |
 |---|---|---|---|
-| `mem` | `mem://` | Tests, ephemeral embedded databases | Phase 1 |
+| `mem` | `mem://` (URL Phase 1) | Tests, ephemeral and small embedded databases | Implemented (`MemStore`, no URL selection yet) |
 | `rocksdb` | `rocksdb://path` | Default persistent backend, embedded and single-node server | Phase 1 |
 | `tikv` | `tikv://pd1:2379,pd2:2379` | Distributed cluster of stateless compute nodes | Phase 7 |
 
-- **`mem`** keeps an ordered in-memory map with MVCC versions. Data is lost on close.
+- **`mem`** ([`crates/atlantis-kv/src/mem.rs`](../crates/atlantis-kv/src/mem.rs)) keeps an ordered in-memory map with MVCC versions and prunes versions that no open snapshot can read. It has no write-ahead log. It can write its latest committed state to a single checkpoint file atomically (checkpoints are serialized, written to a unique temporary file, fsynced, renamed, and then the directory is fsynced) and load it back. `Engine` uses this file, `records.kv` in the database directory, on `checkpoint()`, on `shutdown()`, and when the last `Engine` clone is dropped. Commits after the last checkpoint are lost on a crash. `Engine::open(dir)` also takes an exclusive `LOCK` file, so only one engine can open a directory at a time.
 - **`rocksdb`** is an LSM-tree with a write-ahead log. Its sync mode controls the durability window ([05 — Transactions & Consistency](05-transactions-consistency.md)).
 - **`tikv`** provides Raft replication and distributed transactions; see [20 — Distributed Architecture](20-distributed-architecture.md).
 
@@ -245,8 +244,8 @@ The hot/cold tiering logic becomes **cache management**: the memory budget bound
 ### Migration path
 
 1. **Phase 0** fixes today's store: stable-ID promotion, edge cleanup on `DETACH DELETE`, and HNSW persistence ([25 — Implementation Roadmap](25-implementation-roadmap.md)).
-2. **Phase 1** introduces `atlantis-kv` with `mem` and `rocksdb`, moves nodes, edges, and adjacency onto the key layout above, and turns CSR into the adjacency cache. Today's hot/cold tier and `checkpoint.db` format remain available until the migration completes, and a one-time import reads a `checkpoint.db` (format version 1) into a `rocksdb://` database.
-3. **Phase 2** extends the layout to namespaces, databases, typed tables, and secondary indexes (`ix/`).
+2. **Phase 1** introduces `atlantis-kv` with `mem` (done) and `rocksdb`, moves Cypher's nodes, edges, and adjacency onto the key layout above (the record store already uses it), and turns CSR into the adjacency cache. Today's hot/cold tier and `checkpoint.db` format remain available until the migration completes, and a one-time import reads a `checkpoint.db` (format version 1) into a `rocksdb://` database.
+3. **Phase 2** extends the layout to typed tables and secondary indexes (`ix/`). Namespaces, databases, the table catalog and the label index are already in place.
 4. **Phase 3** adds `ft/`, `vx/`, `kv/`, and spatial index keys; **Phase 4** adds `cf/`; **Phase 7** adds the `tikv` backend.
 
 ---

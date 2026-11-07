@@ -14,9 +14,9 @@ record model is in [03 — Data Model](03-data-model.md); the storage of adjacen
 
 Verified against `crates/atlantis-cypher/src/parser/statement.rs`,
 `crates/atlantis-cypher/src/planner/mod.rs`, and
-`crates/atlantis-engine/src/executor.rs`. The workspace does not compile at the moment
-(a missing import in `atlantis-core`); behaviour was checked on a copy with that import
-added.
+`crates/atlantis-engine/src/executor.rs`. The record store already stores edges as
+records with adjacency entries on both endpoints (see
+[Storage Engine](04-storage-engine.md)), but Cypher does not use it yet.
 
 ### Storage
 

@@ -10,9 +10,10 @@ look like. Each planned part is marked with the phase that delivers it (see
 
 ## What Works Today
 
-Atlantis DB is pre-release. The workspace does not build at the moment (a missing
-import in `atlantis-core`), and fixing that is the first Phase 0 item. The table
-below describes what the code does once it builds.
+Atlantis DB is pre-release. The workspace builds, but the Cypher engine still has the
+Phase 0 gaps in the table below. The record store (documents, nodes and edges in
+namespaced tables, with transactions) works through the Rust API; Cypher cannot query
+it yet.
 
 | Capability | Status |
 |---|---|
@@ -41,7 +42,7 @@ below describes what the code does once it builds.
 
 ### Prerequisites
 
-- Rust 1.75 or newer (the workspace's `rust-version`), 2021 edition.
+- Rust 1.89 or newer (the workspace's `rust-version`), 2021 edition.
 - A tokio runtime.
 
 ### Add the dependency
@@ -55,9 +56,9 @@ atlantis-db = { path = "../atlantis-db/crates/atlantis-db" }
 tokio = { version = "1", features = ["full"] }
 ```
 
-Until the Phase 0 build fix lands, the examples in this section show the API shape but
-do not compile. The [Implementation Roadmap](25-implementation-roadmap.md) tracks the
-build status.
+The examples in this section compile; the queries they run are limited by the Phase 0
+gaps listed above. The [Implementation Roadmap](25-implementation-roadmap.md) tracks
+progress.
 
 ### Open a database
 
@@ -312,8 +313,9 @@ MATCH (b:Account {id: rid('Account', 'b')}) SET b.balance = b.balance + 100;
 COMMIT;
 ```
 
-In Rust the same unit of work is written as
-`engine.transaction(|tx| async move { ... }).await`, which does not retry on its own;
+In Rust the same unit of work is written as `engine.transaction(|tx| { ... }).await`
+with a synchronous closure (implemented today for the record API), which does not retry
+on its own;
 `engine.transaction_with_retry(max_attempts, f)` retries on `Error::TxConflict`. See
 [Transactions & Consistency](05-transactions-consistency.md).
 
