@@ -1,7 +1,7 @@
 # 07 — Schema & DDL
 
-> **Status:** Planned — Phase 2 (time-series tables, vector, full-text and point indexes: Phase 3; change feeds: Phase 4; permissions: Phase 5)
-> **Crates:** `atlantis-cypher`, `atlantis-engine`, `atlantis-index` (planned), `atlantis-kv` (planned)
+> **Status:** Partially implemented — `CREATE VECTOR INDEX` and `DROP INDEX` are implemented; the rest is Planned — Phase 2 (time-series tables, full-text and point indexes: Phase 3; change feeds: Phase 4; permissions: Phase 5)
+> **Crates:** `atlantis-cypher`, `atlantis-engine`, `atlantis-storage`, `atlantis-kv`, `atlantis-index` (planned)
 
 This chapter owns the data definition language (DDL) of Atlantis Cypher: namespaces,
 databases, tables, fields, types, constraints, indexes, analyzers, and introspection.
@@ -10,20 +10,29 @@ grammar.
 
 ## Implemented Today
 
-There is no DDL today. The lexer has no DDL keywords, so `CREATE TABLE` fails to parse
-(the parser expects `(` after `CREATE`). What exists:
+The only DDL statements today are vector index definitions:
 
-- **Schemaless graph.** Labels and relationship types appear when data is inserted.
-  Property values are not type-checked.
-- **One namespace.** A database is one `GraphStore`, opened in memory or from a path.
-  There are no namespaces, databases, or `USE`.
-- **Label index.** The hot tier keeps a label → node id index, used by
+```
+CREATE VECTOR INDEX name [IF NOT EXISTS] FOR (n:Label) ON (n.prop)
+  [OPTIONS {dimension: N, metric: 'cosine' | 'euclidean' | 'dot_product', m: M, efConstruction: E}]
+DROP INDEX name [IF EXISTS]
+```
+
+The definition is stored in the catalog under `/sys/ns/{ns}/db/{db}/ix/{name}` in the
+same transaction as any other writes; options missing from `OPTIONS` take the defaults
+from `EngineConfig.vector`. Behaviour and search are owned by
+[10 — Vector Index](10-vector-index.md). `CALL db.indexes()` lists the definitions.
+
+Everything else in this chapter is target design. What exists without DDL:
+
+- **Schemaless tables.** A node's first label names its table and a relationship type
+  names its edge table; tables are created on first write. Property values are not
+  type-checked. Unlabeled nodes go to the `_default` table.
+- **Namespaces and databases** exist in the record store and are selected from Rust
+  with `Engine::use_db(ns, db)`; there is no `CREATE NAMESPACE`, `CREATE DATABASE` or
+  `USE` statement yet.
+- **Label index.** Every label (table or secondary) has an index used by
   `MATCH (n:Label)`. There are no property indexes or constraints.
-- **One vector index**, configured through `EngineConfig` (`vector.dimensions`,
-  `vector.distance_metric`, HNSW parameters), not through DDL. See
-  [10 — Vector Index](10-vector-index.md) and [22 — Configuration](22-configuration.md).
-
-Everything below is target design.
 
 ## Grammar Conventions
 
@@ -207,13 +216,13 @@ cannot be written, and the first release does not index them.
 | `bool`, `int`, `float`, `string` | `Bool`, `Integer(i64)`, `Float(f64)`, `String` | Phase 2 (values exist today) |
 | `decimal` | 128-bit decimal | Phase 2 |
 | `bytes` | Byte string | Phase 2 |
-| `datetime`, `duration` | UTC nanosecond datetime; duration | Phase 2 |
+| `datetime`, `duration` | UTC nanosecond datetime; duration | Phase 2 (values exist today) |
 | `uuid` | UUID | Phase 2 |
 | `array<T>` | Array with typed elements; `array` alone means `array<any>` | Phase 2 (untyped arrays exist today) |
-| `object` | Nested document (ordered map) | Phase 2 |
+| `object` | Nested document (ordered map) | Phase 2 (values exist today) |
 | `vector<f32, N>` | Fixed-dimension `f32` vector | Phase 2 (vectors exist today) |
-| `record<Table>` | `RecordId` that must point into `Table`; auto-dereferenced on read | Phase 2 |
-| `point`, `geometry` | WGS84 point; any geometry. Geo functions and the spatial index are Phase 3. | Phase 2 |
+| `record<Table>` | `RecordId` that must point into `Table`; auto-dereferenced on read | Phase 2 (untyped links exist today) |
+| `point`, `geometry` | WGS84 point; any geometry. Geo functions and the spatial index are Phase 3. | Phase 2 (values exist today) |
 | `option<T>` | `T`, `null`, or absent | Phase 2 |
 
 The full `Value` definition is in [03 — Data Model](03-data-model.md).
@@ -258,7 +267,7 @@ CREATE CONSTRAINT employment_role FOR ()-[w:WORKS_AT]-() REQUIRE w.role IS NOT N
 - Creating a constraint validates existing records first and fails, with nothing
   changed, if any record violates it.
 
-## Indexes (Planned — Phase 2 and 3)
+## Indexes (Vector implemented; others Planned — Phase 2 and 3)
 
 All index kinds share the Neo4j 5 shape `CREATE <KIND> INDEX name FOR pattern ON ...`.
 This chapter lists them; the owner chapter defines options, query use, and tuning.
@@ -269,7 +278,7 @@ This chapter lists them; the owner chapter defines options, query use, and tunin
 | Composite | `CREATE INDEX person_name FOR (p:Person) ON (p.last, p.first);` | [08](08-document-relational.md) | Phase 2 |
 | Edge property | `CREATE INDEX works_since FOR ()-[w:WORKS_AT]-() ON (w.since);` | [09](09-graph-model.md) | Phase 2 |
 | Unique | Created by `REQUIRE ... IS UNIQUE` | this chapter | Phase 2 |
-| Vector (HNSW) | `CREATE VECTOR INDEX chunk_embedding FOR (c:Chunk) ON (c.embedding) OPTIONS {dimension: 1536, metric: 'cosine', m: 16, efConstruction: 200};` | [10](10-vector-index.md) | Phase 3 |
+| Vector (HNSW) | `CREATE VECTOR INDEX chunk_embedding FOR (c:Chunk) ON (c.embedding) OPTIONS {dimension: 1536, metric: 'cosine', m: 16, efConstruction: 200};` | [10](10-vector-index.md) | Implemented |
 | Full-text | `CREATE FULLTEXT INDEX doc_text FOR (d:Doc) ON EACH [d.title, d.body] OPTIONS {analyzer: 'english'};` | [11](11-full-text-search.md) | Phase 3 |
 | Point (spatial) | `CREATE POINT INDEX place_location FOR (p:Place) ON (p.location);` | [12](12-geospatial.md) | Phase 3 |
 
@@ -277,7 +286,9 @@ This chapter lists them; the owner chapter defines options, query use, and tunin
 DROP INDEX [IF EXISTS] name
 ```
 
-Index builds run in the background through `atlantis-index`. A new index is
+`DROP INDEX` is implemented for vector indexes. Vector indexes are derived in memory
+and built on first search ([10 — Vector Index](10-vector-index.md)). For the other
+kinds (planned), index builds run in the background through `atlantis-index`. A new index is
 `POPULATING` until it has read every existing record, then `ONLINE`. Queries never use
 a `POPULATING` index, so creating an index never changes query results, only speed.
 Index entries are stored under the `.../ix/{index}/...` key prefix

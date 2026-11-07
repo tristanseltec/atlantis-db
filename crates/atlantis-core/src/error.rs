@@ -1,7 +1,5 @@
 //! Error types for Atlantis DB.
 
-use crate::node::NodeId;
-
 /// The unified error type for all Atlantis DB operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AtlantisError {
@@ -13,17 +11,9 @@ pub enum AtlantisError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
-    /// A referenced node was not found.
-    #[error("node not found: {0:?}")]
-    NodeNotFound(NodeId),
-
     /// An internal storage error.
     #[error("storage error: {0}")]
     Storage(String),
-
-    /// A vector index error.
-    #[error("vector error: {0}")]
-    Vector(String),
 
     /// A vector dimension mismatch during insert or search.
     #[error("dimension mismatch: expected {expected}, got {actual}")]
@@ -40,14 +30,6 @@ pub enum AtlantisError {
     /// A configuration error.
     #[error("configuration error: {0}")]
     Config(String),
-
-    /// The engine has been shut down and cannot process requests.
-    #[error("engine shutdown")]
-    Shutdown,
-
-    /// A channel communication error (receiver dropped).
-    #[error("channel error: {0}")]
-    Channel(String),
 
     /// A value could not be parsed or is out of range.
     #[error("invalid value: {0}")]

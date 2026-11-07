@@ -1,9 +1,9 @@
 # 15 — Query Planner & Executor
 
-> **Status:** Partially implemented — planner and executor with known gaps today; cost-based optimizer Planned — Phase 2
-> **Crates:** `atlantis-cypher` (planner, optimizer), `atlantis-engine` (executor)
+> **Status:** Partially implemented — a clause-by-clause interpreter over record transactions runs every implemented Cypher feature today; the logical planner, cost-based optimizer and physical operators are Planned — Phase 2 (search operators Phase 3)
+> **Crates:** `atlantis-cypher` (parser; planner and optimizer planned), `atlantis-engine` (executor)
 
-This chapter explains how a parsed Atlantis Cypher statement becomes a logical plan and how the executor turns that plan into rows. It first documents the planner and executor as they exist in the code, including their current limitations, then describes the target optimizer and physical operators for the multi-model engine.
+This chapter explains how a parsed Atlantis Cypher statement is executed. It first documents the executor as it exists in the code, including its limits, then describes the target planner, optimizer and physical operators for the multi-model engine.
 
 The query language itself is covered in [06 — Query Language](06-query-language.md).
 
@@ -14,109 +14,70 @@ The query language itself is covered in [06 — Query Language](06-query-languag
 ### Pipeline
 
 ```
-Cypher text
-  │  atlantis_cypher::parse()      lexer + parser → Statement (AST)
+Cypher script
+  │  atlantis_cypher::parse_script()   lexer + parser → Vec<Statement> (AST)
   ▼
-  │  atlantis_cypher::plan()       AST → LogicalOperator tree
+  │  Datastore::execute()              one transaction per statement, or per BEGIN … COMMIT
   ▼
-  │  atlantis_cypher::optimize()   pass-through (returns the plan unchanged)
+  │  Exec::run()                       interprets the clauses in order against a RecordTx
   ▼
-  │  QueryExecutor::execute_plan() recursive evaluation → (columns, rows)
-  ▼
-QueryResult { columns, rows }
+QueryResult { columns, rows }          the last statement's result
 ```
 
-All four steps run inside the core engine actor for each `Query` command ([16 — Engine Runtime](16-engine-runtime.md)). Source: `crates/atlantis-cypher/src/planner/` and `crates/atlantis-engine/src/executor.rs`.
-
-### Logical operators
-
-`LogicalOperator` (`planner/logical.rs`) defines the operators below. Not every operator is produced by the planner or executed yet.
-
-| Operator | Planned from | Executed |
-|---|---|---|
-| `Empty` | Missing input | Yes, returns no rows |
-| `Sequence(ops)` | `CREATE`, `SET` | Yes, returns the last operator's result |
-| `NodeByLabelScan { var, label }` | Node pattern with labels (first label only) | Yes |
-| `AllNodesScan { var }` | Node pattern without labels | Yes |
-| `Expand { from, to, rel_type, direction }` | Relationship pattern | Partial, see limitations |
-| `VarLenExpand { min, max, .. }` | Not produced | Returns no rows |
-| `VectorSearch { label, query, k, threshold }` | `CALL db.vector.search(...)` | Yes |
-| `Filter { predicate }` | `WHERE`, `WITH ... WHERE` | Yes |
-| `Project { items }` | `RETURN`, `WITH` | Yes |
-| `Sort`, `Skip`, `Limit` | `ORDER BY`, `SKIP`, `LIMIT` on `RETURN` | Yes |
-| `CreateNode { var, labels, properties }` | Node patterns in `CREATE` | Yes |
-| `CreateRelationship` | Not produced | Returns no rows |
-| `SetProperty { target, key, value }` | `SET` | Partial, see limitations |
-| `Delete { targets, detach }` | `DELETE`, `DETACH DELETE` | Partial, see limitations |
-| `Unwind { expression, variable }` | `UNWIND` | Yes |
-
-### Planning rules
-
-`plan()` walks the clause list in order and wraps the current plan:
-
-1. **MATCH** emits, per pattern element, a label scan or all-nodes scan for node patterns and an `Expand` for relationship patterns. `Expand` reads from the last bound node variable and binds the reached node to the fixed name `_next`.
-2. **WHERE** wraps the plan in `Filter`.
-3. **CREATE** emits one `CreateNode` per node pattern in a `Sequence`. Relationship patterns in `CREATE` are skipped.
-4. **SET** emits one `SetProperty` per assignment in a `Sequence`.
-5. **DELETE** wraps the plan in `Delete`, keeping the `DETACH` flag.
-6. **CALL** supports only `db.vector.search(label, query, k[, threshold])`. The label must be a string literal and `k` an integer literal. The first two `YIELD` names become the node and score variables (defaults `node`, `score`). Any other procedure is an `InvalidQuery` error.
-7. **WITH** emits `Project`, followed by `Filter` when it has a `WHERE`.
-8. **UNWIND** wraps the plan in `Unwind`.
-9. **RETURN** emits `Project`, then `Sort`, `Skip`, and `Limit` when present.
-
-`MERGE`, `REMOVE`, and the `OPTIONAL` flag on `MATCH` are parsed but ignored by the planner.
-
-Example, for `MATCH (a:Person) WHERE a.name = 'Alice' RETURN a.age AS age`:
-
-```
-Project [a.age AS age]
-  └── Filter [a.name = 'Alice']
-       └── NodeByLabelScan { var: "a", label: Person }
-```
+There is no logical plan and no optimizer. Source: `crates/atlantis-engine/src/datastore.rs`
+(scripts and transactions) and `crates/atlantis-engine/src/exec/` (`mod.rs` clauses and
+projection, `pattern.rs` matching and creation, `eval.rs` expressions and functions).
 
 ### Execution model
 
-The executor materialises rows. `execute_plan` recursively evaluates an operator's input into a full `Vec<Row>`, then produces its own `Vec<Row>`. A row is a `HashMap<String, Value>`. After the root operator finishes, rows are converted to value vectors in column order, with `Null` for missing columns.
-
-Nodes are carried in rows as `Value::Integer(node_id)`. Property access `n.prop` evaluates `n` to an ID and reads the node through `GraphStore::get_node_hot`, so nodes evicted to the cold tier are not visible ([04 — Storage Engine](04-storage-engine.md)).
-
-Column names come from the alias, else `var` or `var.prop`, else `expr`.
-
-### Expression evaluation
-
-| Expression | Behaviour |
-|---|---|
-| Literal, parameter | Returned as is |
-| Variable | Looked up in the row, then in the parameters |
-| Property | Node property via the hot tier; `Null` if missing |
-| `=`, `<>` | `Value` equality; `Integer` and `Float` compare numerically |
-| `<`, `>`, `<=`, `>=` | `Value` ordering; incomparable types give `false` |
-| `AND`, `OR` | Non-boolean operands count as `false` |
-| `+`, `-`, `*`, `/` | Same-type `Integer` or `Float`; `+` also concatenates strings; integer division by zero and mixed types give `Null` |
-| `IN` | Membership in an `Array` |
-| `NOT`, unary `-` | Boolean negation, numeric negation |
-| List literal | `Array` of evaluated items |
-| `db.vector.similarity(a, b)` | Cosine similarity of two vectors |
-
-Map literals, `CASE`, other binary operators, and other functions evaluate to nothing, which a `Filter` treats as not matching and a `Project` returns as `Null`.
+- **Rows.** A row is a map from variable to `Value`. Each clause maps the list of rows
+  to a new list; the first clause starts from one empty row, so `RETURN 1` and a
+  leading `UNWIND` produce rows.
+- **Record ids, not copies.** Nodes and relationships are bound as `Value::RecordId`.
+  Property access loads the record inside the same transaction, so a query sees its own
+  earlier writes. A property holding a `RecordId` is followed the same way, so
+  `o.customer.name` dereferences a stored link.
+- **Matching.** Each path pattern is matched left to right from its start node. An
+  unbound node pattern pinned by `id` is a direct key lookup in its labels' tables;
+  otherwise it scans the label index of its first label (every non-edge table when it
+  has no label) and filters by the remaining labels and inline properties. Relationship
+  steps read adjacency entries in the requested direction and types. Variable-length
+  steps walk depth-first with per-path edge uniqueness. Within one `MATCH`, a
+  relationship is used at most once.
+- **Writes.** `CREATE`, `MERGE`, `SET`, `REMOVE` and `DELETE` call `RecordTx` methods
+  (`create_node`, `relate`, `update`, `merge`, `set_labels`, `delete`). `DELETE`
+  collects its targets first and removes relationships before nodes.
+- **Projection.** `RETURN` and `WITH` evaluate items per row, or group rows by the
+  non-aggregate items when any item contains an aggregate (with `*`, the star variables
+  are grouping keys too). `DISTINCT`, `ORDER BY` (on any expression, with access to the
+  input variables when not aggregating), `SKIP` and `LIMIT` follow. Values are compared
+  with Cypher null semantics.
+- **Results.** A `RETURN` item that is a bare variable or `collect(variable)` turns
+  record ids into documents with an `id` field. Columns take the alias, else the item's
+  source text.
+- **Procedures.** `CALL` evaluates arguments per input row and binds the yielded
+  columns ([06 — Query Language](06-query-language.md#procedures)).
+- **Failure.** A failing statement returns an error; its transaction is not committed,
+  so none of its writes persist ([05 — Transactions & Consistency](05-transactions-consistency.md)).
 
 ### Vector search
 
-`VectorSearch` evaluates the query to a `Value::Vector`, calls `HnswIndex::search` (or `search_with_params` when a threshold is given), and emits rows with the node ID and `score = 1.0 - distance`. The label argument is not applied as a filter, and the engine does not insert vectors into the index today ([10 — Vector Index](10-vector-index.md), [16 — Engine Runtime](16-engine-runtime.md)).
+`db.vector.search` resolves the index definition in the transaction, then searches the
+in-memory HNSW graph derived from records, building it on first use. It yields the hit's
+record id and a metric-aware score ([10 — Vector Index](10-vector-index.md)). A `WHERE`
+after `YIELD` filters the `k` hits after the search.
 
-### Current limitations
+### Current limits
 
-These are Phase 0 work in [25 — Implementation Roadmap](25-implementation-roadmap.md):
-
-- **Multi-hop patterns.** The node reached by `Expand` is bound to `_next`, and the following node pattern emits a new scan whose `input` the executor ignores. In `MATCH (a)-[:KNOWS]->(b:Person)`, `b` is therefore bound to every `Person`, not to `a`'s neighbors. Single-node patterns and scans behave correctly.
-- **Expand direction and type.** `Expand` follows outgoing edges only and ignores the declared direction. A relationship pattern without a type produces no rows.
-- **SET after MATCH.** The planner builds each `SetProperty` on an empty input instead of the matched rows, so `MATCH ... SET ...` updates nothing.
-- **DETACH DELETE.** Edges are not removed; the node is tombstoned and filtered from traversal.
-- **CREATE.** Relationships are not created, and a multi-node `CREATE` returns only the last created node.
-- **Queries without a leading MATCH or CREATE.** `UNWIND` and `RETURN` as the first clause run over an empty input and return no rows, so `RETURN 1` and `UNWIND [1, 2] AS x RETURN x` produce nothing.
-- **Not implemented.** Variable-length expansion, `MERGE`, `OPTIONAL MATCH`, aggregation functions, and `count(*)`.
-- **Sort.** A descending key returns its comparison immediately, so later sort keys are not consulted for descending sorts.
-- **Optimizer.** `optimize()` returns its input unchanged.
+- **Everything is materialised.** Every clause produces its full row list before the
+  next starts, and `LIMIT` does not stop earlier work.
+- **No row or time limits.** Unbounded variable-length patterns and large `UNWIND`s can
+  use a lot of memory and time; only `range()` is capped (10 million items).
+  `query.timeout` is planned ([22 — Configuration](22-configuration.md)).
+- **No index selection.** A property filter (`WHERE n.email = $x`) scans the label;
+  only an `id` lookup is direct. Secondary indexes arrive in Phase 2.
+- **Synchronous execution.** Queries run on the calling task
+  ([16 — Engine Runtime](16-engine-runtime.md)).
 
 ---
 
@@ -133,25 +94,15 @@ AST ─► semantic analysis (catalog, types, permissions)
     ─► streaming executor inside a transaction snapshot
 ```
 
-### Streaming executor (Planned — Phase 1)
+### Streaming executor (Planned — Phase 2)
 
-Operators become pull-based iterators over a transaction snapshot ([05 — Transactions & Consistency](05-transactions-consistency.md)). `LIMIT` stops upstream work early, large scans do not materialise in memory, and every read sees the same snapshot. Rows carry `RecordId` values instead of raw integer IDs (Phase 2, [03 — Data Model](03-data-model.md)).
+Operators become pull-based iterators over the transaction snapshot ([05 — Transactions & Consistency](05-transactions-consistency.md)). `LIMIT` stops upstream work early and large scans do not materialise in memory. Rows keep carrying `RecordId` values, as they do today.
 
-### Phase 0 operator completion
+### Aggregation and variable-length expand
 
-| Capability | Status |
-|---|---|
-| Correct multi-hop binding: `Expand` binds the pattern's own target variable and later node patterns become label filters on it | Phase 0 |
-| `Expand` honours `OUT`, `IN`, and `BOTH`, and untyped relationships | Phase 0 (`IN`/`BOTH` need `in` adjacency, Phase 1) |
-| `CreateRelationship` and `DETACH DELETE` | Phase 0 |
-| `MERGE` as match-or-create | Phase 0 |
-| `OPTIONAL MATCH` as a left outer apply | Phase 0 |
-| Aggregation: `count`, `sum`, `avg`, `min`, `max`, `collect` with implicit grouping keys | Phase 0 |
-| `VarLenExpand` | Phase 0 |
+**Aggregation (hash and streaming aggregation Phase 2).** Non-aggregated `RETURN` / `WITH` items are grouping keys, as in Neo4j and as implemented today. The target executor uses hash aggregation, and switches to streaming aggregation when input arrives sorted on the grouping keys (for example from an index scan). Relational `GROUP BY`-style patterns are expressed this way ([08 — Document & Relational](08-document-relational.md)).
 
-**Aggregation (Planned — Phase 0, hash aggregation Phase 2).** Non-aggregated `RETURN` / `WITH` items become grouping keys, as in Neo4j. The executor uses hash aggregation; when input arrives sorted on the grouping keys (for example from an index scan), it switches to streaming aggregation. Relational `GROUP BY`-style patterns are expressed this way ([08 — Document & Relational](08-document-relational.md)).
-
-**Variable-length expand (Planned — Phase 0).** `MATCH (a)-[:KNOWS*1..3]->(b)` runs a breadth-first expansion with per-path relationship uniqueness, as in Cypher. Each hop reads the adjacency cache or `g/` keys. An upper bound is required unless the query uses `shortestPath(...)` or `allShortestPaths(...)`, which use bidirectional BFS; [09 — Graph Model](09-graph-model.md) owns their semantics and phase.
+**Variable-length expand.** Today's executor walks depth-first with per-path relationship uniqueness and accepts unbounded lengths. The target operator runs a breadth-first expansion over the adjacency cache or `g/` keys, bounded by `query.timeout`. `shortestPath(...)` and `allShortestPaths(...)` use bidirectional BFS (Phase 3); [09 — Graph Model](09-graph-model.md) owns their semantics.
 
 ### Statistics (Planned — Phase 2)
 
@@ -247,11 +198,11 @@ Dispatch is described in [16 — Engine Runtime](16-engine-runtime.md) and the u
 
 ## Design Decisions
 
-**Why materialised rows today?**
-A recursive evaluator over `Vec<Row>` was the fastest way to make queries work end to end. It cannot stop early or bound memory, which is why the target executor streams.
+**Why interpret the AST directly today?**
+A clause-by-clause interpreter over record transactions made the whole Cypher subset work on the record store with little machinery. It cannot stop early, bound memory or choose indexes, which is why the target adds a planner and a streaming executor.
 
-**Why node IDs in rows?**
-Carrying a `u64` instead of a full node avoids cloning property maps. The executor fetches a node only when a property is accessed. The target keeps this idea with `RecordId` values.
+**Why record ids in rows?**
+Carrying a `RecordId` instead of a full document avoids copying records. The executor loads a record only when a property is read or the record is returned.
 
 **Why cost-based rather than rule-based optimization?**
 With B-tree, vector, full-text, and spatial indexes plus graph traversal and joins available for the same query, the right access path depends on data sizes and selectivity. Fixed rules cannot choose between, for example, pre-filtered vector search and an index seek followed by a similarity check.
@@ -262,7 +213,7 @@ Permissions expressed as predicates can use indexes and pushdown, and they apply
 ## What's Next
 
 - **[06 — Query Language](06-query-language.md)** — The Atlantis Cypher syntax these plans come from.
-- **[16 — Engine Runtime](16-engine-runtime.md)** — Where planning and execution run.
+- **[16 — Engine Runtime](16-engine-runtime.md)** — Where execution runs.
 - **[09 — Graph Model](09-graph-model.md)** — Traversal, variable-length paths, and shortest paths.
 - **[23 — Query Cookbook](23-query-cookbook.md)** — Practical queries.
-- **[25 — Implementation Roadmap](25-implementation-roadmap.md)** — Phase 0 executor work and later optimizer phases.
+- **[25 — Implementation Roadmap](25-implementation-roadmap.md)** — Optimizer and operator phases.

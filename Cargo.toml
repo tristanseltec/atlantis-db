@@ -28,8 +28,6 @@ tracing = "0.1"
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
 
-# Parser
-chumsky = "0.10"
 
 # Internal crates
 atlantis-core = { path = "crates/atlantis-core" }

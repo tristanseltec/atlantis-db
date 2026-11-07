@@ -1,6 +1,6 @@
 # 25 — Implementation Roadmap
 
-> **Status:** Partially implemented — the build fix and parts of Phases 1 and 2 are done; the rest of Phases 0–7 is planned (this chapter records current status and the phased plan)
+> **Status:** Partially implemented — Phase 0 is essentially complete, Phase 1 is mostly done (the `rocksdb` backend is open), Phase 2 is partial; Phases 3–7 are planned (this chapter records current status and the phased plan)
 > **Crates:** all workspace crates; `atlantis-index`, `atlantis-text`, `atlantis-geo`, `atlantis-auth`, `atlantis-server` (planned)
 
 This chapter has two parts. **Current status** records what the code in `crates/`
@@ -13,126 +13,85 @@ docs refers to a phase defined here.
 
 ### Progress
 
-Work has not followed the phase order strictly. The core record foundation from
-Phases 1 and 2 landed before the rest of Phase 0:
-
 | Item | State |
 |---|---|
-| Phase 0 build fix | Done. The workspace compiles, and the storage and vector test builds compile. The Phase 0 graph, Cypher and vector bugs below are unchanged. |
-| Phase 1 — transactional storage | Partial. Done: the `atlantis-kv` crate, the memcomparable key encoding, MVCC with snapshot and serializable isolation, the in-memory `mem` backend (durable only at checkpoints to `records.kv`, no write-ahead log, one engine per directory through a `LOCK` file), and record transactions on `Engine` (`transaction`, `transaction_with_isolation`, `transaction_with_retry`, `read`). Open: the `rocksdb` backend, sync modes, migrating the Cypher graph store onto KV, the commit sequencer, multi-statement scripts and `BEGIN`/`COMMIT`, `Engine::connect`, config keys, and the Phase 0 importer. |
-| Phase 2 — unified record model | Partial. Done: `RecordId`/`RecordKey`, `Record`, `Edge`, the extended `Value` types except `Decimal` and `Range`, namespaces and databases (`DatabaseRef`, `use_db`), the table catalog with implicit schemaless tables, edge tables with endpoint restrictions, the `_default` table, and a secondary label index. Open: schema DDL, fields and assertions, `atlantis-index` B-tree indexes and constraints, record links that dereference, joins, the cost-based optimizer, Cypher access to records, and engine-level record helpers. |
+| Phase 0 — graph + vector core | Essentially complete. Cypher runs on the record store; every parser and executor gap listed for Phase 0 is fixed and pinned by integration tests; vector indexes are populated and derived from records. Not done, and moved: `shortestPath`/`allShortestPaths` and `algo.*` stay in Phase 3; HNSW persistence is replaced by rebuilding indexes from records (persistence in `vx/` keys stays open, below); the Criterion baseline is not recorded. |
+| Phase 1 — transactional storage | Mostly done. Done: the `atlantis-kv` crate, memcomparable keys, MVCC with snapshot and serializable isolation, the `mem` backend with a write-ahead log (`SyncMode::Every`/`Never`), crash recovery and periodic checkpoints, one engine per directory (`LOCK`), record transactions on `Engine`, Cypher on KV (the legacy graph store is deleted), multi-statement scripts with `BEGIN`/`COMMIT`/`ROLLBACK`, and Cypher inside Rust transactions. Open: the `rocksdb` backend and backend features, the `interval` sync mode, the per-database commit sequencer, the adjacency cache, HNSW in `vx/` keys, `Engine::connect`, config keys, query workers off the async executor and `query.timeout`. The importer from legacy checkpoints is dropped: opening a legacy `checkpoint.db` fails with an error. |
+| Phase 2 — unified record model | Partial. Done: `RecordId`/`RecordKey`, `Record`, `Edge`, the extended `Value` types except `Decimal` and `Range`, namespaces and databases (`DatabaseRef`, `use_db` for Cypher and records), the table catalog with implicit schemaless tables, edge tables with endpoint restrictions, `_default`, the secondary label index, nested document access and updates, map literals as `Object`, record links that dereference, `id(n)`/`rid()`, explicit keys through Cypher `{id: ...}`. Open: schema DDL, fields and assertions, `atlantis-index` B-tree indexes and constraints, `CREATE NAMESPACE`/`CREATE DATABASE`/`USE`, the planner and cost-based optimizer, `EXPLAIN`, and engine-level record helpers. |
+| Phase 3 — search | Partial. Done: `CREATE VECTOR INDEX` / `DROP INDEX` with per-index options, `db.vector.search(indexName, ...)` with threshold and `efSearch`, `point()` and `point.distance`. Open: everything else in Phase 3. |
 
-**Two stores.** `Engine::execute` (Cypher) still runs on the original `GraphStore`,
-and record transactions run on the new record store. The two stores do not share
-data: Cypher does not see records, and record transactions do not see Cypher nodes.
-Migrating Cypher onto the record store is open Phase 1/2 work.
+**One store.** `Engine::execute` (Cypher), `Transaction::execute` and the record API
+read and write the same records. The legacy `GraphStore` (hot/cold tier, CSR + delta,
+LRU tiering, `checkpoint.db`) is deleted.
+
+**Known limitations.**
+
+- The `async` `Engine` methods do their work synchronously on the calling task: query
+  execution, the WAL fsync, and the first-search build of a vector index, which runs
+  under one mutex shared by all vector indexes. Heavy calls block a tokio worker; use
+  `tokio::task::spawn_blocking` or a dedicated runtime for large workloads. Moving the
+  work off the async executor is planned (Phase 1).
+- There are no per-query row or time limits. Unbounded variable-length patterns and
+  huge `UNWIND`s can use a lot of memory or time; `range()` is capped at 10 million
+  items. `query.timeout` remains planned (Phase 1).
+- A failed Cypher statement inside a Rust transaction poisons it; there are no
+  savepoints.
+- Not implemented and not scheduled in a phase yet: map projections, `EXISTS { }` and
+  `CALL { }` subqueries, `FOREACH`, `LOAD CSV`.
 
 ### Build and tests
 
-The workspace compiles. `cargo test --workspace` passes except for three unit tests,
-which are Phase 0 items:
-
-| Crate | Unit tests |
-|---|---|
-| `atlantis-core`, `atlantis-kv`, `atlantis-storage` | Pass. |
-| `atlantis-cypher` | Two failures: `test_parse_set` (the `SET` parser consumes `=` as a comparison) and `test_tokenize_arrows`. |
-| `atlantis-vector` | One failure: `hnsw::tests::test_insert_and_search`. |
-| `atlantis-engine` | Builds. No tests. |
-| `atlantis-db` | Pass, including the record-model integration tests in `crates/atlantis-db/tests/records.rs`. |
-
-There are no Cypher integration tests yet. `benches/benches/` holds `storage_bench.rs`,
-`vector_bench.rs` and `query_bench.rs` as Criterion scaffolding.
+The workspace compiles and `cargo test --workspace` passes. The integration tests in
+`crates/atlantis-db/tests/cypher.rs` and `records.rs` are the authoritative list of
+behaviour that works end to end. `benches/benches/` holds Criterion benchmarks for
+storage, Cypher queries and vector search; no baseline is recorded in the repository.
 
 ### Per crate
 
-**`atlantis-core`.** The property graph types used by Cypher: `Node`/`NodeId`,
-`Relationship`/`EdgeId`, `Label`/`LabelSet`, `RelType`, `PropertyMap`, `Direction`. The
-record model: `DatabaseRef`, `RecordId`/`RecordKey`, `Record`, `Edge`, `Object`, and
-identifier validation. `Value` with the extended variants (`Bytes`, `Datetime`,
-`Duration`, `Uuid`, `Object`, `Geometry`, `RecordId`), but not `Decimal` or `Range`.
-`EngineConfig` with builder and validation, and `AtlantisError` with an `Error` alias.
+**`atlantis-core`.** The record model: `DatabaseRef`, `RecordId`/`RecordKey`, `Record`,
+`Edge`, `Object`, and identifier validation. `Value` with the extended variants
+(`Bytes`, `Datetime`, `Duration`, `Uuid`, `Object`, `Geometry`, `RecordId`), but not
+`Decimal` or `Range`. `Direction`, `NodeId` (the HNSW entry id), `EngineConfig` with
+builder and validation, `SyncMode`, and `AtlantisError` with an `Error` alias. The
+legacy `Node`, `Relationship`, `Label`, `RelType` and `PropertyMap` types are removed.
 See [03 — Data Model](03-data-model.md).
 
 **`atlantis-kv`.** The `KvStore`/`KvTransaction` traits (synchronous), the memcomparable
 encoding, the key layout, and `MemStore`: MVCC, first-committer-wins conflicts,
-serializable read validation, version pruning and an atomic checkpoint file. There is
-no `rocksdb` or `tikv` backend and no Cargo backend features. See
+serializable read validation, version pruning, the write-ahead log with crash recovery,
+and atomic checkpoints. There is no `rocksdb` or `tikv` backend and no Cargo backend
+features. See [04 — Storage Engine](04-storage-engine.md).
+
+**`atlantis-storage`.** `RecordStore`/`RecordTx`: records, edges with adjacency entries
+on both endpoints, secondary labels (`set_labels`), the table catalog, vector index
+definitions in the catalog, and `CommitInfo` with the changed record ids. See
 [04 — Storage Engine](04-storage-engine.md).
 
-**`atlantis-storage`.** Two stores. `RecordStore`/`RecordTx` hold records and edges on
-`atlantis-kv` (see [04 — Storage Engine](04-storage-engine.md)). `GraphStore`, the
-original store that Cypher uses, keeps the hot tier (node and edge vectors, CSR+delta
-adjacency per relationship type, label index, LRU tracker), the append-only cold tier,
-the tiering manager and checkpoint/restore. `GraphStore` gaps:
-
-- Cold-tier promotion is a `TODO` in `GraphStore::get_node` and does not preserve node
-  ids.
-- Deleting a node only tombstones it.
-- Restoring a checkpoint gives nodes new ids while edges keep the old ones.
-- Nothing calls `maybe_evict`, so eviction never runs.
-- The cold tier has no garbage collection.
-
 **`atlantis-vector`.** HNSW insert, search, threshold search and tombstone delete;
-cosine, Euclidean and dot-product distances; a brute-force recall test. Persistence is
-a stub: `serialize_index` returns empty bytes and `deserialize_index` returns an error.
+cosine, Euclidean and dot-product distances; a brute-force recall test. The index is
+in memory; the engine rebuilds it from records.
 
-**`atlantis-cypher`.** The lexer, a recursive-descent parser and a planner. The
-optimizer passes the plan through unchanged. Parser gaps:
+**`atlantis-cypher`.** A hand-written lexer and recursive-descent parser (`parse`,
+`parse_script`) producing the AST the engine interprets. There is no planner. See
+[06 — Query Language](06-query-language.md).
 
-- `MERGE`, `REMOVE` and `SET n.p = v` fail to parse. The expression parser consumes the
-  `=` of `SET`.
-- `<>`, `IN`, `IS NULL`, `XOR`, `STARTS WITH`, `ENDS WITH`, `CONTAINS` and `count(*)`
-  fail to parse.
-- `<-`, `--` and `-[]-` patterns, and comma-separated patterns, fail to parse.
-- `*1..3` is a lexer error, because it is read as a float.
-- Dotted function names outside `CALL` fail to parse.
-- Everything the `RETURN` parser does not recognise is silently dropped, including
-  `UNION`, `CASE`, `ASC`, `n.a.b` and `SKIP` after `LIMIT`.
+**`atlantis-engine`.** `Datastore`: opens the store and checkpoint thread, runs scripts
+clause by clause against record transactions, and keeps vector indexes derived from
+records. See [15 — Query Planner & Executor](15-query-planner-executor.md) and
+[16 — Engine Runtime](16-engine-runtime.md).
 
-Planner gaps:
-
-- Inline property maps in `MATCH` are ignored.
-- Relationship elements in `CREATE` are dropped.
-- `SET` is planned on an empty input.
-- Variable-length lengths are ignored.
-- `OPTIONAL MATCH` is treated as `MATCH`.
-- With several `MATCH` clauses, only the last scan's rows are kept.
-- `DISTINCT` is ignored, and so are `ORDER BY` and `LIMIT` on `WITH`.
-
-**`atlantis-engine`.** The single-writer Tokio actor, command channel, `EngineHandle` and
-`QueryExecutor` exist, and `spawn_engine` is re-exported at the crate root. The
-checkpoint and tiering actors are empty loops that are never spawned. Executor gaps:
-
-- `VarLenExpand` and `CreateRelationship` are `TODO`s.
-- `Expand` binds the target to a placeholder, so multi-hop `MATCH` returns every node
-  of the target label. It also follows outgoing edges only and returns nothing for an
-  untyped relationship.
-- `UNWIND` or `RETURN` as the first clause returns no rows.
-- No function except `db.vector.similarity` is evaluated, and that one cannot be parsed.
-  `%` and map literals evaluate to `null`.
-- `ORDER BY` resolves only returned aliases.
-- No Cypher path creates an edge. `GraphStore::insert_edge` is internal; edges created
-  with `RecordTx::relate` live in the separate record store.
-- A descending `Sort` key returns early even on ties, so secondary keys are ignored.
-- `CREATE` returns only the last node created.
-- `DETACH DELETE` leaves edges.
-- The engine never inserts vectors into the HNSW index, so `db.vector.search` returns no
-  rows, and its label argument is ignored.
-
-**`atlantis-db`.** `Engine`, `Config`, `ResultSet`, `Row` and `Params`, plus record
-transactions and re-exports of the record types (see
-[21 — API Reference](21-api-reference.md)). Only `disk_path` and the vector settings
-from `EngineConfig` reach the Cypher engine. Record data is checkpointed to `records.kv`
-in the database directory.
+**`atlantis-db`.** `Engine`, `Transaction`, `Config`, `ResultSet`, `Row` and `Params`,
+plus re-exports of the record and transaction types (see
+[21 — API Reference](21-api-reference.md)).
 
 ### Chapter status
 
 | Chapter | Status | Completed by |
 |---|---|---|
-| [01](01-getting-started.md), [02](02-architecture.md), [03](03-data-model.md), [04](04-storage-engine.md), [06](06-query-language.md), [15](15-query-planner-executor.md), [16](16-engine-runtime.md) | Partial | Phases 0–2, then later phases for platform parts |
+| [01](01-getting-started.md), [02](02-architecture.md), [03](03-data-model.md), [04](04-storage-engine.md), [06](06-query-language.md), [15](15-query-planner-executor.md), [16](16-engine-runtime.md) | Partial | Phases 1–2, then later phases for platform parts |
 | [05](05-transactions-consistency.md) | Partial | Phase 1 (Phase 4 for change feeds) |
-| [07](07-schema-ddl.md), [08](08-document-relational.md) | Phase 2 | Phase 2 |
-| [09](09-graph-model.md), [10](10-vector-index.md) | Partial | Phase 0 (core) and Phase 3 (paths, algorithms, vector DDL) |
+| [07](07-schema-ddl.md), [08](08-document-relational.md) | Partial | Phase 2 |
+| [09](09-graph-model.md), [10](10-vector-index.md) | Partial | Phase 3 (shortest paths, algorithms, vector persistence and filtering) |
 | [11](11-full-text-search.md), [12](12-geospatial.md), [13](13-key-value-time-series.md) | Phase 3 | Phase 3 |
 | [14](14-live-queries-events.md) | Phase 4 | Phase 4 |
 | [17](17-server-protocols.md), [18](18-security-auth.md) | Phase 5 | Phase 5 |
@@ -171,78 +130,43 @@ also needs Phase 4 so that live queries can be distributed.
 
 ### Phase 0 — Complete graph + vector core
 
-**Goal.** Make today's embedded engine correct and usable before changing its
-foundations.
+**Goal.** Make the embedded engine correct and usable.
+
+**State.** Essentially complete. The work was done by moving Cypher onto the record
+store (Phase 1) instead of fixing the legacy graph store, which was deleted. Every item
+below is implemented and covered by `crates/atlantis-db/tests/cypher.rs` unless marked
+otherwise.
 
 **Deliverables.**
 
-1. A green build:
-   - Done: the compile errors are fixed (the `AtlantisError` import in
-     `atlantis-core/src/config.rs`, the removed inherent `impl Config`, the
-     `EngineConfigBuilder` and `EvictionPolicy` re-exports from `atlantis-core`, the
-     `spawn_engine` re-export, the `ResultSet::rows` item type, and the storage and
-     vector test builds).
-   - Open: the two failing Cypher tests and the failing HNSW test
-     `hnsw::tests::test_insert_and_search`.
-2. Correct graph semantics:
-   - Fix the multi-hop `MATCH` binding, and keep rows across several `MATCH` clauses.
-   - Parse `<-`, `--`, `-[]-` and comma-separated patterns. Make `Expand` honour
-     direction (incoming, both) and untyped relationships.
-   - Apply inline property maps in `MATCH`.
-   - Variable-length expand, including lexing and parsing `*min..max`.
-   - Path variables (`p = (...)`) and the functions `length`, `nodes` and
-     `relationships`.
-3. Writes:
-   - `CREATE` relationships, comma-separated patterns, and `MATCH ... CREATE`.
-   - Return every created element, not only the last node.
-   - Plan `MATCH ... SET` on its real input and fix the `SET` parser.
-   - Parse and execute `MERGE` (with `ON CREATE` / `ON MATCH`) and `REMOVE`.
-   - `DETACH DELETE` removes edges.
-   - Delete removes the node physically instead of only tombstoning it.
-4. Query features:
-   - Leading `RETURN` and `UNWIND`.
-   - A complete `RETURN`/`WITH` tail: `UNION`, `CASE`, `ASC`, nested property access
-     (`n.a.b`), `SKIP`/`LIMIT` in either order, and `ORDER BY`/`LIMIT`/`DISTINCT` on
-     `WITH`. Unknown trailing tokens become parse errors instead of being dropped.
-   - `ORDER BY` on any expression, not only returned aliases.
-   - `OPTIONAL MATCH` null rows and `DISTINCT`.
-   - Aggregation (`count`, `sum`, `avg`, `min`, `max`, `collect`) with implicit
-     grouping.
-   - The operators `<>`, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `IS NULL`,
-     `XOR` and `%`, and `count(*)`.
-   - Core scalar functions (`id`, `size`, `toUpper`, `toLower`, `trim`, `coalesce`,
-     `abs`).
-   - Dotted function names (`db.vector.similarity`).
-   - Fix `Sort` so ties on a descending key fall through to the next key.
-5. Vector:
-   - Index `Vector` properties into HNSW on create, update and delete.
-   - Honour the label argument of `db.vector.search` and accept a parameter for `k`.
-   - Yield the node rather than an internal integer id.
-   - Persist HNSW (`serialize_index`/`deserialize_index`) in the checkpoint.
-6. Storage and runtime:
-   - Preserve node ids through checkpoint restore and cold-tier promotion.
-   - Spawn the checkpoint and tiering actors, driven by `checkpoint_interval_secs` and
-     `memory_budget_bytes`.
-   - Pass the full `StorageConfig` to `GraphStore`.
+1. A green build, including the formerly failing Cypher and HNSW unit tests.
+2. Correct graph semantics: multi-hop `MATCH`, rows kept across several `MATCH`
+   clauses, `<-`, `--`, `-[]-` and comma-separated patterns, untyped and alternative
+   relationship types, inline property maps, variable-length `*min..max`, path variables
+   and `length`, `nodes`, `relationships`.
+3. Writes: `CREATE` relationships and paths, `MATCH ... CREATE`, every created row
+   returned, `SET` (including `n.a.b`, `n = map`, `n += map` and labels), `REMOVE`,
+   `MERGE` with `ON CREATE` / `ON MATCH`, `DELETE` and `DETACH DELETE` that remove
+   records and edges.
+4. Query features: leading `RETURN` and `UNWIND`; `UNION` / `UNION ALL`; `CASE`; list
+   comprehensions; `ASC`/`DESC`; `SKIP`/`LIMIT` in either order; `ORDER BY`, `LIMIT`
+   and `DISTINCT` on `WITH`; trailing text after `RETURN` is a parse error; `ORDER BY`
+   on any expression; `OPTIONAL MATCH` null rows; aggregation with implicit grouping and
+   `count(*)`; `<>`, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~`, `IS NULL`,
+   `XOR`, `%`; map literals; scalar functions; dotted function names.
+5. Vector: indexes populated from records and updated on create, update and delete;
+   `db.vector.search` by index name (or a label covered by one index), `k` as a
+   parameter, yielding the record. Moved: persistence is replaced by rebuilding from
+   records, with KV persistence in `vx/` keys left open in Phase 1.
+6. Storage and runtime: ids are stable record ids; periodic checkpoints driven by
+   `checkpoint_interval_secs`; the full `StorageConfig` reaches the store.
+   `memory_budget_bytes` and eviction were removed with the legacy store.
+
+**Not done.** `shortestPath`/`allShortestPaths` and graph algorithms stay in Phase 3.
+The Criterion baseline and the proptest round-trips are not recorded.
 
 **Crates.** `atlantis-core`, `atlantis-storage`, `atlantis-vector`, `atlantis-cypher`,
 `atlantis-engine`, `atlantis-db`.
-
-**Docs.** 01, 04, 06, 09, 10, 15, 16, 21, 22, 23, 24.
-
-**Exit criteria.** `cargo test --workspace` passes. Every "Phase 0" row in
-[23 — Query Cookbook](23-query-cookbook.md#recipes-that-do-not-work-yet) passes as an
-integration test through `Engine::execute`. A restart restores nodes, edges and the
-HNSW index with identical ids.
-
-**Testing and benchmarks.**
-
-- Add one integration test per cookbook recipe to `crates/atlantis-db/tests/`, next to
-  the existing record-model tests.
-- Add proptest round-trips for checkpoint/restore (ids and adjacency preserved) and for
-  parser → planner on generated patterns.
-- Fill the three Criterion benches and record a baseline: node insert, 1–3 hop expand,
-  HNSW insert and top-10 search with recall@10.
 
 ### Phase 1 — Transactional storage foundation
 
@@ -255,27 +179,30 @@ model shares ACID storage.
   traits (`begin`, `get`, `set`, `delete`, `scan`, `commit`, `cancel`) and the
   memcomparable key encoding from [04 — Storage Engine](04-storage-engine.md).
 - *Done:* MVCC with snapshot isolation by default and optional serializable isolation.
-- *Done:* the `mem` backend, with a checkpoint file. Open: the `rocksdb` backend and the
-  Cargo features `kv-mem` and `kv-rocksdb`.
-- Migrate the Cypher graph store onto KV. Keep CSR+delta as an adjacency cache rebuilt
-  from `g/` keys, and persist HNSW under `vx/`.
-- A commit sequencer per database (the evolution of the actor) with concurrent snapshot
-  readers.
+- *Done:* the `mem` backend with a write-ahead log, sync modes `every` and `never`,
+  crash recovery, and periodic and explicit checkpoints. Open: the `rocksdb` backend,
+  the `interval` sync mode, and the Cargo features `kv-mem` and `kv-rocksdb`.
+- *Done:* Cypher on KV; the legacy graph store is deleted. Open: an adjacency cache
+  rebuilt from `g/` keys, and HNSW persisted under `vx/`.
+- A commit sequencer per database, replacing the store-wide commit lock, and query work
+  moved off the async executor. Snapshot readers already run concurrently.
 - *Done:* `engine.transaction`, `engine.transaction_with_isolation`,
-  `engine.transaction_with_retry`, `engine.read` and `Error::TxConflict` for the record
-  store. Open: multi-statement `;` scripts, `BEGIN`/`COMMIT`/`ROLLBACK`, and Cypher
-  statements inside transactions.
+  `engine.transaction_with_retry`, `engine.read`, `Error::TxConflict`, multi-statement
+  `;` scripts, `BEGIN`/`COMMIT`/`ROLLBACK`, and Cypher inside transactions
+  (`Transaction::execute`).
 - `Engine::connect("mem://" | "rocksdb://...")`.
 - Config keys `storage.url`, `storage.sync`, `transaction.isolation`, `query.timeout`
-  and the cache sizes.
-- A one-way importer from Phase 0 checkpoints.
+  and the cache sizes. *Done:* `StorageConfig::sync` and `checkpoint_interval_secs` in
+  `EngineConfig`.
+- *Dropped:* the importer from legacy checkpoints. Opening a directory with only a
+  legacy `checkpoint.db` fails with an error.
 
 **Crates.** `atlantis-kv` (new), `atlantis-storage`, `atlantis-vector`, `atlantis-engine`,
 `atlantis-db`, `atlantis-core`.
 
 **Docs.** 04, 05, 16, 21, 22.
 
-**Exit criteria.** The Phase 0 integration suite passes unchanged on both backends.
+**Exit criteria.** The Cypher integration suite passes unchanged on both backends.
 Crash tests (kill during commit) never expose partial transactions under
 `storage.sync = every`. Concurrent conflicting writers get `TxConflict`, and no lost
 update is observable.
@@ -300,22 +227,22 @@ are open.
   `USE`.
 - *Done:* `RecordId` and the extended `Value` types, including `Geometry`. Open:
   `Decimal` and `Range`.
-- `id(n)` and `rid()`.
-- *Done:* explicit keys on record creation, with ULID as the default. Open: the same
-  through Cypher `CREATE`.
+- *Done:* `id(n)` and `rid()`.
+- *Done:* explicit keys on record creation, with ULID as the default, also through
+  Cypher `CREATE (:T {id: ...})`.
 - *Done:* edge tables with `in`/`out` and endpoint-table restrictions, and a secondary
   label index.
 - Schema DDL (`SCHEMAFULL`, fields, types, `ASSERT`, `DEFAULT`, `COMPUTED`) with
   `Error::SchemaViolation`.
 - The new crate `atlantis-index`: B-tree, unique and composite indexes, background builds
   (`index.workers`), and the Neo4j 5 `CREATE INDEX` / `CREATE CONSTRAINT` forms.
-- Nested document access and updates, map literals as `Object` values, and `record<T>`
-  links that dereference on access.
-- A cost-based optimizer with the physical operators `IndexSeek`, `IndexRangeScan` and
+- *Done:* nested document access and updates, map literals as `Object` values, and
+  stored record links that dereference on access. Open: the typed `record<T>` field.
+- A planner and cost-based optimizer with the physical operators `IndexSeek`, `IndexRangeScan` and
   `KeyRangeScan`, plus join operators.
 - Record helpers (`select`, `create`, `update`, `merge`, `delete`, `relate`),
-  `use_ns` and `set_var`/`unset_var`. `RecordTx` already offers transaction-level
-  record operations, and `use_db(ns, db)` exists.
+  `use_ns` and `set_var`/`unset_var`. `Transaction` already offers transaction-level
+  record operations and Cypher, and `use_db(ns, db)` exists.
 - *Done:* the error type `atlantis_db::Error` (an alias of `AtlantisError`).
 
 **Crates.** `atlantis-core`, `atlantis-index` (new), `atlantis-cypher`, `atlantis-engine`,
@@ -348,8 +275,9 @@ search first-class.
 - KV: `db.kv.*`, `engine.kv()` and `tx.kv()`, TTL with a background expiry worker.
 - Time-series tables (`TYPE TIMESERIES KEY ... RETENTION`), `ts.bucket` and retention
   workers.
-- Vector index DDL with per-index options.
-- `db.vector.search(indexName, ...)`, pre- and post-filtering, and quantization.
+- *Done:* vector index DDL with per-index options, and `db.vector.search(indexName, ...)`.
+  Open: pre- and post-filtering, and quantization.
+- *Done:* `point()` and `point.distance` as functions.
 - Graph paths and algorithms: `shortestPath`, `allShortestPaths`, `algo.pagerank`,
   `algo.wcc`.
 - The physical operators `VectorTopK`, `TextSearch` and `SpatialScan`.
@@ -481,18 +409,19 @@ needs an explicit justification in the phase's plan before the phase exits.
 
 - [x] Requirements and architecture design
 - [x] Core types and property graph model (`atlantis-core`)
-- [x] Hot/cold tiered storage, CSR+delta adjacency (`atlantis-storage`)
-- [x] HNSW index algorithm (`atlantis-vector`, persistence pending)
-- [x] Cypher lexer, parser and planner skeleton (`atlantis-cypher`)
-- [x] Single-writer actor runtime (`atlantis-engine`)
+- [x] HNSW index algorithm (`atlantis-vector`)
 - [x] Multi-model documentation set (this docs restructure)
 - [x] Green build (Phase 0 compile fixes)
 - [x] Record foundation: `atlantis-kv` with the `mem` backend, the record store and
   record transactions (part of Phases 1 and 2)
-- [ ] Phase 0 — Complete graph + vector core
-- [ ] Phase 1 — Transactional storage foundation (partial)
+- [x] Write-ahead log and crash recovery for the `mem` backend
+- [x] Hand-written Cypher parser and clause interpreter on the record store; legacy
+  hot/cold graph store removed
+- [x] Phase 0 — Complete graph + vector core (shortest paths and algorithms moved to
+  Phase 3)
+- [ ] Phase 1 — Transactional storage foundation (mostly done; `rocksdb` open)
 - [ ] Phase 2 — Unified record and document/relational model (partial)
-- [ ] Phase 3 — Search and specialized models
+- [ ] Phase 3 — Search and specialized models (vector index DDL done)
 - [ ] Phase 4 — Reactive
 - [ ] Phase 5 — Server and security
 - [ ] Phase 6 — SDKs
@@ -500,8 +429,9 @@ needs an explicit justification in the phase's plan before the phase exits.
 
 ## Design Decisions
 
-- **Correctness before foundations.** Phase 0 fixes today's engine first, so its
-  integration suite becomes the regression oracle for the Phase 1 storage migration.
+- **Correctness on the new foundation.** Phase 0 was delivered by moving Cypher onto
+  the record store rather than fixing the legacy graph store; its integration suite is
+  the regression oracle for the `rocksdb` backend and the planner.
 - **KV before models.** Every later model is a key layout plus an index over
   `atlantis-kv`. Building the transactional layer first avoids reworking each model for
   ACID later.

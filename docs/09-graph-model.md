@@ -1,7 +1,7 @@
 # 09 — Graph Model
 
-> **Status:** Partially implemented — single-node `MATCH`, node `CREATE`, and `DELETE` work; traversal, relationship creation, and variable-length paths are Planned — Phase 0; edge tables Phase 2; shortest paths and graph algorithms Phase 3
-> **Crates:** `atlantis-cypher`, `atlantis-engine`, `atlantis-storage`, `atlantis-kv` (planned)
+> **Status:** Partially implemented — nodes and edges as records, traversal in every direction, relationship creation, variable-length paths and path functions are implemented; edge schema DDL Phase 2; shortest paths and graph algorithms Phase 3
+> **Crates:** `atlantis-cypher`, `atlantis-engine`, `atlantis-storage`, `atlantis-kv`
 
 Atlantis DB is a property graph whose nodes and relationships are ordinary records.
 A node is a record in the table named by its first label. A relationship is a record
@@ -12,43 +12,19 @@ record model is in [03 — Data Model](03-data-model.md); the storage of adjacen
 
 ## Implemented Today
 
-Verified against `crates/atlantis-cypher/src/parser/statement.rs`,
-`crates/atlantis-cypher/src/planner/mod.rs`, and
-`crates/atlantis-engine/src/executor.rs`. The record store already stores edges as
-records with adjacency entries on both endpoints (see
-[Storage Engine](04-storage-engine.md)), but Cypher does not use it yet.
+Cypher runs on the record store. Every section below marked "Implemented" works through
+`Engine::execute`, and the integration tests in `crates/atlantis-db/tests/cypher.rs` are
+the authoritative list of working behaviour. The executor is in
+`crates/atlantis-engine/src/exec/pattern.rs`.
 
-### Storage
+- Nodes and relationships bind to their `RecordId`. Property access reads the record
+  inside the same transaction, so a query sees its own writes.
+- Edges are records with adjacency entries on both endpoints, so traversal in either
+  direction is a prefix scan ([04 — Storage Engine](04-storage-engine.md)).
+- Relationships can also be created from Rust with `tx.relate(...)`; Cypher sees them
+  immediately in the same transaction and after commit.
 
-- Nodes have a `NodeId` (`u64`), a label set, and a property map. Relationships have an
-  `EdgeId`, `from`, `to`, one `RelType`, and properties.
-- Adjacency is kept per relationship type as a CSR array plus a delta log of recent
-  inserts. When a type's delta reaches `compaction_threshold` edges (default 1000), it
-  is compacted into the CSR. Only **outgoing** adjacency exists.
-- Deleting a node tombstones it. Neighbour lookups and label scans skip tombstoned
-  nodes, but the node's edges are not removed.
-
-### What works in Cypher
-
-| Feature | Today |
-|---|---|
-| `MATCH (n)` and `MATCH (n:Label)` | Works. Scans all nodes or the first label. Extra labels are ignored. |
-| `WHERE` on node properties | Works (see [06 — Query Language](06-query-language.md) for supported operators). |
-| `CREATE (n:Label {...})` | Works for nodes. Returns only the last created node. |
-| `DELETE n` | Works (tombstone). |
-| `DETACH DELETE n` | Behaves like `DELETE`; edges stay. |
-| Relationship patterns in `MATCH` | Broken. Only `-->` and `-[...]->` parse; `<-`, `-[...]-`, and `--` are parse errors. The expand step follows outgoing edges of the given type, and an untyped relationship returns no rows. The next node pattern then rescans its label and discards the expand rows, so in `(a)-[:KNOWS]->(b:Person)` the variable `b` binds to every `Person`, not to `a`'s neighbours. |
-| Relationships in `CREATE` | Dropped by the planner (`CreateRelationship` is a TODO in the executor). The nodes are created; the edge is not. |
-| Variable-length `*min..max` | `*`, `*2`, and `*..3` parse; `*1..3` is a lexer error (read as a float). The planner ignores the length and emits a single-hop expand. `VarLenExpand` is a TODO in the executor. |
-| Path variables `p = (...)`, `shortestPath` | Not parsed. |
-
-### Creating edges today
-
-No public API creates a relationship. `Engine` (in `atlantis-db`) exposes `execute`,
-`checkpoint`, and `shutdown`, and Cypher `CREATE` drops relationships. Edges can only
-be inserted with `GraphStore::insert_edge` in `atlantis-storage`, below the engine.
-
-## Nodes as Records (Planned — Phase 2)
+## Nodes as Records (Implemented)
 
 | Graph concept | Record model |
 |---|---|
@@ -65,25 +41,28 @@ MATCH (p:Person) SET p:Manager;       // adds a secondary label
 ```
 
 A node created without a label (`CREATE ({note: 'x'})`) goes into the reserved
-schemaless table `_default`; table names starting with `_` are reserved.
+schemaless table `_default`; table names starting with `_` are reserved. An `id`
+property in `CREATE` sets the record key (`Person:alice` above); without one the key is
+a new ULID. `labels(n)` returns the table first, then the secondary labels.
 
-`SET n:Label` and `REMOVE n:Label` change secondary labels only. Removing or replacing
-the first label is an error, because it would move the record to another table; create
-a new record instead.
+`SET n:Label` and `REMOVE n:Label` change secondary labels only. The first label cannot
+be removed, because it would move the record to another table; create a new record
+instead.
 
-## Edges as Records (Planned — Phase 2)
+## Edges as Records (Implemented; edge schema DDL Phase 2)
 
 Every relationship type is an **edge table**. An edge record has:
 
 | Field | Meaning |
 |---|---|
 | `id` | The edge's `RecordId`, for example `WORKS_AT:01JC...` (ULID key by default) |
-| `out` | `RecordId` of the start node; `startNode(r)` returns it |
-| `in` | `RecordId` of the end node; `endNode(r)` returns it |
+| `in` | `RecordId` of the start node; `startNode(r)` returns it |
+| `out` | `RecordId` of the end node; `endNode(r)` returns it |
 | other fields | The relationship's properties |
 
 `type(r)` returns the edge table name. Edge tables are created implicitly, like node
-tables, the first time an edge of that type is written. Declare one to add schema:
+tables, the first time an edge of that type is written. Declaring one with schema is
+Phase 2 (today the Rust API's `define_table` can restrict endpoint tables):
 
 ```cypher
 CREATE TABLE WORKS_AT TYPE EDGE FROM Person TO Company;
@@ -102,7 +81,7 @@ Because edges are records, they can be read like any other table:
 MATCH ()-[w:WORKS_AT]->() WHERE w.since < $cutoff RETURN w.role, count(*) AS n;
 ```
 
-### Creating and deleting edges (Planned — Phase 0)
+### Creating and deleting edges (Implemented)
 
 ```cypher
 MATCH (a:Person), (c:Company)
@@ -114,10 +93,13 @@ MATCH (a:Person)-[w:WORKS_AT]->(:Company) WHERE a.name = 'Alice' DELETE w;
 MATCH (a:Person) WHERE a.name = 'Alice' DETACH DELETE a;   // deletes a and its edges
 ```
 
-`DELETE` on a node that still has edges fails; use `DETACH DELETE`. This keeps every
-`in` and `out` pointing at an existing record.
+`DELETE` on a node that still has edges fails with `SchemaViolation`; use
+`DETACH DELETE`. This keeps every `in` and `out` pointing at an existing record. A
+`DELETE` clause removes relationships before nodes, so `DELETE a, w` deletes a node and
+its only edge in either order. A created relationship needs exactly one type and a
+direction.
 
-## Traversal (Planned — Phase 0)
+## Traversal (Implemented)
 
 Traversal uses standard Cypher patterns. All directions are supported:
 
@@ -137,14 +119,15 @@ RETURN friend.name, c.name;
 
 Incoming traversal costs the same as outgoing. Each edge is stored once as a record and
 indexed twice in adjacency, under the start node with direction `out` and under the end
-node with direction `in`, using the key prefix `.../g/{from}/{dir}/{edgeTable}/{edgeKey}`
-([04 — Storage Engine](04-storage-engine.md)). An undirected pattern reads both.
+node with direction `in`, under the node's `g/` key prefix
+([04 — Storage Engine](04-storage-engine.md)). An undirected pattern reads both. Within
+one `MATCH`, a relationship is used at most once.
 
 An undirected pattern returns each matching edge once per direction it can be read in.
 For `(a:Person)-[:KNOWS]-(b:Person)` that means both `(alice, bob)` and `(bob, alice)`,
 as in Neo4j.
 
-## Variable-Length Paths (Planned — Phase 0)
+## Variable-Length Paths (Implemented)
 
 ```cypher
 MATCH (a:Person)-[:KNOWS*1..3]->(b:Person)
@@ -158,19 +141,22 @@ RETURN DISTINCT b.name;
 | `*3` | Exactly 3 |
 | `*2..4` | 2 to 4 |
 | `*..4` | 1 to 4 |
+| `*2..` | 2 or more |
 | `*0..2` | 0 to 2 (0 binds `b` to `a`) |
 
 Semantics follow Cypher: within one path, an edge is used at most once (trail
-semantics), so cycles terminate. The relationship variable in a variable-length pattern
-binds to the array of edges.
+semantics), so cycles terminate. A variable-length pattern with a variable binds it to
+the list of edges walked.
 
-An unbounded `*` is accepted but can explore the whole connected component. Give an
-upper bound in production queries; a bounded query runs within `query.timeout`
-([22 — Configuration](22-configuration.md)) far more predictably.
+An unbounded `*` is accepted but can explore the whole connected component. There are
+no per-query row or time limits yet (`query.timeout` is planned,
+[22 — Configuration](22-configuration.md)), so give an upper bound in production
+queries.
 
-## Paths and Path Functions (Planned — Phase 0)
+## Paths and Path Functions (Implemented)
 
-A path variable binds the whole matched path:
+A path variable binds the whole matched path, as the map
+`{nodes: [...], relationships: [...]}` of record ids:
 
 ```cypher
 MATCH p = (a:Person)-[:KNOWS*1..3]->(b:Person)
@@ -183,9 +169,9 @@ RETURN length(p) AS hops,
 | Function | Returns |
 |---|---|
 | `length(p)` | Number of edges |
-| `nodes(p)` | Array of node records along the path |
-| `relationships(p)` | Array of edge records along the path |
-| `startNode(r)`, `endNode(r)` | The `out` and `in` record of an edge |
+| `nodes(p)` | Record ids of the nodes along the path |
+| `relationships(p)` | Record ids of the edges along the path |
+| `startNode(r)`, `endNode(r)` | The `in` and `out` record id of an edge |
 | `type(r)` | Edge table name |
 
 ## Shortest Paths (Planned — Phase 3)
@@ -229,7 +215,7 @@ RETURN componentId, count(*) AS size ORDER BY size DESC;
 
 - Algorithms read a consistent snapshot of the database
   ([05 — Transactions & Consistency](05-transactions-consistency.md)) and run on the
-  in-memory adjacency cache.
+  planned in-memory adjacency cache.
 - They return results; they do not write. To store a score, follow the `CALL` with
   `SET node.rank = score`.
 - More algorithms (for example community detection and weighted shortest path) may be
@@ -237,9 +223,9 @@ RETURN componentId, count(*) AS size ORDER BY size DESC;
 
 ## Adjacency Cache and Performance Notes
 
-Today's CSR + delta structure ([04 — Storage Engine](04-storage-engine.md)) stays in
-the target design as an in-memory **adjacency cache**, rebuilt from the `g/` keys in
-`atlantis-kv` (Phase 1). Practical consequences:
+Traversal today reads adjacency entries from `atlantis-kv` in the transaction's
+snapshot. An in-memory **adjacency cache** rebuilt from the `g/` keys is planned
+(Phase 1, [04 — Storage Engine](04-storage-engine.md)). Practical consequences:
 
 - **Typed patterns are faster.** Adjacency is grouped by edge table, so
   `-[:KNOWS]->` reads one contiguous range; an untyped `-->` reads every edge table of
@@ -247,11 +233,9 @@ the target design as an in-memory **adjacency cache**, rebuilt from the `g/` key
 - **Hub nodes cost their degree.** Expanding a node with a million edges reads a
   million entries. Filter early with labels and edge types, and add an edge property
   index when you filter hubs' edges by a property.
-- **Start from a selective node.** Anchor patterns with an indexed lookup
-  (`WHERE a.email = $email`) or a record id, not with a label scan.
-- **Write bursts accumulate in the delta.** The delta is compacted per edge table
-  after `compaction_threshold` new edges; traversal stays correct before compaction,
-  just slightly slower.
+- **Start from a selective node.** Anchor patterns with a record id
+  (`(a:Person {id: 'alice'})` is a direct lookup) or, from Phase 2, an indexed property;
+  a label or property filter alone scans the label.
 - **Bound variable-length patterns.** Cost grows roughly with the average degree to
   the power of the hop count.
 
@@ -279,5 +263,5 @@ search procedures, and adds no grammar per algorithm.
 
 - **[08 — Document & Relational Model](08-document-relational.md)** — Links versus edges, joins, and aggregation.
 - **[10 — Vector Index](10-vector-index.md)** — Combining vector search with traversal.
-- **[15 — Query Planner & Executor](15-query-planner-executor.md)** — Expand operators and the optimizer.
+- **[15 — Query Planner & Executor](15-query-planner-executor.md)** — How patterns are matched today and the planned optimizer.
 - **[23 — Query Cookbook](23-query-cookbook.md)** — Graph recipes.

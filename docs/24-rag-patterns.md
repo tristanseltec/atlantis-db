@@ -1,7 +1,7 @@
 # 24 — RAG Patterns
 
-> **Status:** Partially implemented — the vector procedure exists today; end-to-end RAG needs Phase 0, and the patterns below are marked Phase 0–5
-> **Crates:** `atlantis-vector`, `atlantis-cypher`, `atlantis-engine`, `atlantis-text` (planned), `atlantis-index` (planned), `atlantis-auth` (planned)
+> **Status:** Partially implemented — vector + graph RAG (Patterns 1, 2 and 5, and the retrieval part of Pattern 3) works today; schema, hybrid search, agent-memory and tenancy features are marked Phase 2–5
+> **Crates:** `atlantis-vector`, `atlantis-cypher`, `atlantis-engine`, `atlantis-storage`, `atlantis-text` (planned), `atlantis-index` (planned), `atlantis-auth` (planned)
 
 Retrieval-augmented generation (RAG) and agent memory are the workloads Atlantis DB is
 built for. One engine holds content, embeddings, relationships, text indexes and access
@@ -13,21 +13,21 @@ chapter, linked inline.
 
 ## Implemented today
 
-These pieces exist in the code:
+These pieces exist in the code and work together through `Engine::execute`:
 
-- A global HNSW index configured by `VectorConfig` (dimensions, metric, parameters).
-- `CALL db.vector.search('<label>', $vec, <k>[, <threshold>]) YIELD node, score`, where
-  `score = 1 - distance`.
-- Nodes with `Vector` properties.
+- Named vector indexes: `CREATE VECTOR INDEX name FOR (n:Label) ON (n.prop) OPTIONS {...}`,
+  derived from records and kept current after every commit
+  ([10 — Vector Index](10-vector-index.md)).
+- `CALL db.vector.search(indexOrLabel, $vec, k[, threshold | {threshold, efSearch}]) YIELD node, score`,
+  where `node` is the hit's record id, so later `MATCH` clauses can start from it, and
+  `score` is higher-is-better.
+- Relationships, multi-hop and variable-length traversal, `OPTIONAL MATCH`, aggregation
+  and record links that dereference (`node.doc.title`).
 
-Pipelines cannot be built from them end-to-end yet. Nothing in the Cypher path inserts
-vectors into the HNSW index, relationships cannot be created through Cypher, traversal
-after `CALL` does not use the yielded nodes, and the index is not persisted across
-restarts. The cookbook lists each gap in
-[23 — Query Cookbook](23-query-cookbook.md#recipes-that-do-not-work-yet). Phase 0 closes
-them, and from then on Patterns 1–5 work with the label-based procedure.
+A search sees committed data only, so write the content in one statement or transaction
+and search in a later one.
 
-## Pattern 1: Document RAG (Phase 0)
+## Pattern 1: Document RAG (Works)
 
 Store the embedding on its own node and link it to the content. The vector index stays
 small and content can change without re-indexing.
@@ -38,6 +38,12 @@ small and content can change without re-indexing.
 
 ```rust
 engine.execute(
+    "CREATE VECTOR INDEX embedding_vec IF NOT EXISTS FOR (e:Embedding) ON (e.vector)
+     OPTIONS {dimension: 384, metric: 'cosine'}",
+    &[],
+).await?;
+
+engine.execute(
     "CREATE (e:Embedding {vector: $vec, model: $model})
             -[:EMBEDS]->(d:Document {title: $title, body: $body, url: $url})",
     &[("vec", embedding.into()), ("model", "all-MiniLM-L6-v2".into()),
@@ -45,7 +51,7 @@ engine.execute(
 ).await?;
 
 let hits = engine.execute(
-    "CALL db.vector.search('Embedding', $q, 10, 0.7) YIELD node, score
+    "CALL db.vector.search('embedding_vec', $q, 10, 0.7) YIELD node, score
      MATCH (node)-[:EMBEDS]->(doc:Document)
      RETURN doc.title AS title, doc.body AS body, doc.url AS url, score
      ORDER BY score DESC",
@@ -53,7 +59,7 @@ let hits = engine.execute(
 ).await?;
 ```
 
-## Pattern 2: Chunked documents (Phase 0)
+## Pattern 2: Chunked documents (Works)
 
 Split long documents into chunks and embed each chunk.
 
@@ -62,7 +68,7 @@ Split long documents into chunks and embed each chunk.
 ```
 
 ```cypher
-CALL db.vector.search('Embedding', $q, 5, 0.7) YIELD node, score
+CALL db.vector.search('embedding_vec', $q, 5, 0.7) YIELD node, score
 MATCH (node)-[:EMBEDS]->(c:Chunk)<-[:HAS_CHUNK]-(d:Document)
 RETURN d.title AS title, c.text AS text, c.index AS chunkIndex, score
 ORDER BY score DESC
@@ -71,12 +77,12 @@ ORDER BY score DESC
 Add neighbouring chunks for context with a second hop:
 `MATCH (d)-[:HAS_CHUNK]->(n:Chunk) WHERE abs(n.index - c.index) <= 1`.
 
-## Pattern 3: Schemafull chunk tables with a vector index (Phase 3)
+## Pattern 3: Chunk records with a vector index (index and retrieval work; schema Phase 2)
 
-From Phase 2 tables can be schemafull. From Phase 3 the embedding can live on the
-chunk record and be indexed by name. This replaces the separate `:Embedding` node and
-the single global index. Grammar: [07 — Schema and DDL](07-schema-ddl.md),
-[10 — Vector Index](10-vector-index.md).
+The embedding can live on the chunk record and be indexed by name, which replaces the
+separate `:Embedding` node. The vector index and the retrieval query below work today;
+the `SCHEMAFULL` tables, typed fields and `CREATE INDEX` are Phase 2. Grammar:
+[07 — Schema and DDL](07-schema-ddl.md), [10 — Vector Index](10-vector-index.md).
 
 ```cypher
 CREATE TABLE Doc SCHEMAFULL;
@@ -98,8 +104,9 @@ CREATE VECTOR INDEX chunk_embedding FOR (c:Chunk) ON (c.embedding)
 CREATE INDEX chunk_doc FOR (c:Chunk) ON (c.doc);
 ```
 
-A write with the wrong dimension or a missing `text` fails with `SchemaViolation`
-before it reaches the index. Retrieval uses the index name and the `record<Doc>` link:
+With the Phase 2 schema, a write with the wrong dimension or a missing `text` fails with
+`SchemaViolation`; today a vector of the wrong dimension is simply not indexed.
+Retrieval uses the index name and the `doc` link (store `rid('Doc', ...)` in it today):
 
 ```cypher
 CALL db.vector.search('chunk_embedding', $q, 20) YIELD node, score
@@ -109,7 +116,8 @@ ORDER BY score DESC LIMIT 5
 ```
 
 Several embedding models become several vector fields with one index each
-(`embedding_small`, `embedding_large`). Today they would share one global index.
+(`embedding_small`, `embedding_large`). A `WHERE` after `YIELD` filters the `k` hits, so
+ask for more than you return; index-aware filtering is Phase 3.
 
 ## Pattern 4: Hybrid text + vector retrieval (Phase 3)
 
@@ -133,7 +141,7 @@ ORDER BY score DESC
 Pass both the raw question (for BM25) and its embedding (for HNSW). Retrieve wider than
 you need, for example 50, then rerank outside the database if you use a cross-encoder.
 
-## Pattern 5: Knowledge-graph RAG and citations (Phase 0 traversal; Phase 3 for indexed form)
+## Pattern 5: Knowledge-graph RAG and citations (Works)
 
 Graph edges turn "similar text" into "similar text plus its provenance". Record the
 source of each chunk and the citations between documents. Return them with the answer
@@ -156,9 +164,6 @@ RETURN node.text AS passage,
 ORDER BY score DESC
 ```
 
-`OPTIONAL MATCH` and `collect()` arrive in Phase 0. Before Phase 3, use the label form
-`db.vector.search('Embedding', ...)` from Pattern 2.
-
 To expand entity neighbourhoods (GraphRAG style), extract entities into `(:Entity)`
 nodes with `(:Chunk)-[:MENTIONS]->(:Entity)`. Then add
 `MATCH (node)-[:MENTIONS]->(e:Entity)<-[:MENTIONS]-(related:Chunk)` to pull related
@@ -170,7 +175,7 @@ Agents need long-term memory (searchable), short-term scratch state (expiring) a
 reactions to new facts.
 
 ```cypher
-// Long-term memory: searchable records.                    Phase 3
+// Long-term memory: searchable records. Schema Phase 2; index and search work.
 CREATE TABLE Memory SCHEMAFULL;
 CREATE FIELD agent ON Memory TYPE record<Agent>;
 CREATE FIELD text ON Memory TYPE string;
@@ -242,17 +247,17 @@ tenant when tenants are large or when compliance needs physical separation.
 
 ### Embedding layout
 
-- Today, put vectors on a dedicated `:Embedding` node and link it with a descriptive
-  relationship (`EMBEDS`). From Phase 3, prefer a typed `vector<f32, N>` field on the
-  chunk record with a named vector index.
+- Put the vector on the chunk record with a named vector index (Pattern 3), or on a
+  dedicated `:Embedding` node linked with `EMBEDS` when several models or versions
+  coexist. From Phase 2 the field can be typed `vector<f32, N>`.
 - Store model name, chunk index and timestamps beside the vector so results can be
   filtered and audited.
 
 ### Dimensions and metric
 
-The dimension must equal the embedding model's output. Today it is
-`VectorConfig.dimensions` for the whole engine. From Phase 3 it is `dimension` in each
-vector index. Mismatches fail with `DimensionMismatch`.
+The dimension must equal the embedding model's output. Set it with `dimension` in each
+vector index (the default is `VectorConfig.dimensions`). A query vector of another
+length fails with `DimensionMismatch`; a stored vector of another length is not indexed.
 
 | Metric | Use for |
 |---|---|
@@ -262,22 +267,22 @@ vector index. Mismatches fail with `DimensionMismatch`.
 
 ### Thresholds
 
-The optional fourth argument of `db.vector.search` keeps results with
-`1 - distance >= threshold`. Start at 0.7 for cosine. Raise it for precision and lower
+The optional fourth argument of `db.vector.search` keeps results whose score is at least
+the threshold (cosine similarity for `cosine`). Start at 0.7 for cosine. Raise it for precision and lower
 it, or omit it, for recall. Thresholds are model-specific, so recalibrate when you
 change models.
 
 ### Recall tuning
 
-For RAG, recall usually matters more than latency. Raise `m`/`m0` and
-`ef_construction` at build time and `ef_search` at query time. Presets are in
+For RAG, recall usually matters more than latency. Raise `m` and `efConstruction` in
+the index options and `efSearch` at query time (`{efSearch: 200}`). Presets are in
 [22 — Configuration](22-configuration.md#tuning-presets).
 
 ## Design Decisions
 
 - **Retrieval, expansion and filtering in one query.** Keeping vectors, text and edges
-  in one engine avoids sync jobs and makes the result consistent with a single
-  snapshot (Phase 1).
+  in one engine avoids sync jobs and makes the graph part of the result consistent with
+  a single snapshot. Vector hits come from committed data.
 - **Hybrid fusion by rank, not score.** BM25 and cosine scores are not comparable. RRF
   needs no calibration, which suits a default.
 - **Permissions apply after index search.** Shared-index tenancy stays simple and

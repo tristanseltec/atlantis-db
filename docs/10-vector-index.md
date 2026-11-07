@@ -1,11 +1,11 @@
 # 10 — Vector Index
 
-> **Status:** Partially implemented — HNSW algorithm implemented; index wiring and persistence Phase 0; DDL, named indexes, KV persistence and filtering Phase 3
-> **Crates:** `atlantis-vector`, `atlantis-engine`, `atlantis-cypher`, `atlantis-kv` (planned)
+> **Status:** Partially implemented — HNSW, `CREATE VECTOR INDEX` / `DROP INDEX`, named indexes derived from records, and `db.vector.search` are implemented; KV persistence of the graph, index-aware filtering and quantization Planned — Phase 3
+> **Crates:** `atlantis-vector`, `atlantis-engine`, `atlantis-cypher`, `atlantis-storage`
 
 This chapter documents the HNSW (Hierarchical Navigable Small World) vector index:
-the algorithm as it exists today, how queries reach it, and the target design for
-named vector indexes, persistence, filtering, quantization and hybrid search.
+the algorithm, the vector index DDL and search procedure as they work today, and the
+target design for persistence, filtering, quantization and hybrid search.
 
 ## Overview
 
@@ -70,12 +70,13 @@ pairs sorted ascending. It greedy-descends to layer 1, searches layer 0 with
 then truncates to `k`.
 
 **Threshold search** — `search_with_params(query, &SearchParams)` runs `search` and, when
-`score_threshold` is set, keeps results where `1.0 - distance >= threshold`. That
-conversion is a cosine similarity; for the other metrics the threshold has no
-calibrated meaning today.
+`score_threshold` is set, keeps results where `1.0 - distance >= threshold`. The engine
+does not use it: `db.vector.search` applies its threshold to a metric-aware score
+(below).
 
 **Deletion** — `remove(node_id)` adds a tombstone. Search filters tombstones; the vector
-and its edges stay in memory. Compaction is not implemented.
+and its edges stay in memory. The engine rebuilds an index from records once its
+tombstones outnumber its live entries.
 
 ### VectorStore and SearchParams
 
@@ -96,7 +97,8 @@ let params = SearchParams::top_k(10).with_threshold(0.7).with_ef_search(200);
 ### HNSW Parameters
 
 `HnswParams` is defined in `atlantis-core` (`config.rs`) and re-exported by
-`atlantis-vector`.
+`atlantis-vector`. `EngineConfig.vector.hnsw` holds the defaults; `CREATE VECTOR INDEX`
+options override `m` (with `m0 = 2 * m`) and `efConstruction` per index.
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -113,93 +115,93 @@ The crate's recall test (`test_recall` in `hnsw.rs`) compares HNSW against brute
 on 500 random 32-dimensional vectors with `ef_search = 100` and asserts average recall
 above 80%. No larger benchmark exists in the repository.
 
-### How Queries Reach the Index
-
-The engine actor (`crates/atlantis-engine/src/actor.rs`) creates **one** engine-wide
-`HnswIndex` from `EngineConfig.vector` (`dimensions` default 128, `distance_metric`
-default cosine, `hnsw` parameters). The executor receives a read-only reference.
-
-The planner (`crates/atlantis-cypher/src/planner/mod.rs`) accepts:
-
-```cypher
-CALL db.vector.search('Embedding', $query_vec, 10, 0.7) YIELD node, score
-RETURN node, score
-```
-
-| Argument | Today |
-|---|---|
-| 1 — label string | Required literal, but **ignored** by the executor (no label filtering) |
-| 2 — query vector | Expression that must evaluate to a `Value::Vector` (usually a parameter) |
-| 3 — `k` | Required integer literal |
-| 4 — threshold | Optional float or integer literal |
-
-The first `YIELD` name receives the HNSW `NodeId` as an **integer**, not a node, and the
-second receives `1 - distance` as a float. `db.vector.similarity(a, b)` is available as
-an expression function and returns the cosine similarity of two vector values.
-
-### Known Gaps (Phase 0)
-
-- **Nothing populates the index.** The engine never calls `HnswIndex::insert`, so a
-  vector property stored on a node is not searchable through `db.vector.search` yet.
-- **Persistence is a stub.** In `persistence.rs`, `serialize_index` returns an empty
-  vector and `deserialize_index` returns `AtlantisError::Serialization`. The index is
-  in-memory only and starts empty on every open.
-- Label filtering, yielding nodes instead of IDs, and metric-aware scores are missing.
-
-Phase 0 closes these gaps: indexing vector properties on write, yielding the node, and
-serializing the layers, vectors and tombstones with the current cold tier
-(see [04 — Storage Engine](04-storage-engine.md)).
-
-## Target Design
-
-### Vector Index DDL (Planned — Phase 3)
-
-Vector indexes become named, schema-level objects. A database can hold many of them,
-each bound to one table (the node's first label) and one `vector<f32, N>` field.
+### Vector Index DDL
 
 ```cypher
 CREATE VECTOR INDEX chunk_embedding FOR (c:Chunk) ON (c.embedding)
   OPTIONS {dimension: 1536, metric: 'cosine', m: 16, efConstruction: 200};
 
-CREATE VECTOR INDEX image_clip FOR (i:Image) ON (i.clip)
+CREATE VECTOR INDEX image_clip IF NOT EXISTS FOR (i:Image) ON (i.clip)
   OPTIONS {dimension: 512, metric: 'dot_product'};
 
 DROP INDEX image_clip;
+DROP INDEX image_clip IF EXISTS;
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `dimension` | from field type `vector<f32, N>` | Required when the field type does not fix `N` |
-| `metric` | `'cosine'` | `'cosine'`, `'euclidean'`, `'dot_product'` (the `name()` values above) |
-| `m`, `m0` | 16, `2 * m` | Graph degree per layer |
-| `efConstruction` | 200 | Build-time candidate pool |
-| `efSearch` | 50 | Default query-time candidate pool |
-| `quantization` | `'none'` | See [Quantization](#quantization-planned--after-phase-3-unscheduled) |
+| `dimension` | `EngineConfig.vector.dimensions` (128) | Vector length. Records whose vector has another length are not indexed. |
+| `metric` | `EngineConfig.vector.distance_metric` (cosine) | `'cosine'`, `'euclidean'` or `'dot_product'` |
+| `m` | `EngineConfig.vector.hnsw.m` (16) | Graph degree; layer 0 uses `2 * m` |
+| `efConstruction` | `EngineConfig.vector.hnsw.ef_construction` (200) | Build-time candidate pool |
 
-Creating an index on a populated table schedules a background build in `atlantis-index`'s
-index manager (see [07 — Schema & DDL](07-schema-ddl.md)). Writes after creation are
-indexed in the same transaction as the record. A record whose field is missing or
-`null` is simply not indexed; a vector of the wrong dimension fails the write.
+An unknown option, or a non-positive integer, is an error. Creating an index that
+exists fails unless `IF NOT EXISTS` is given; dropping a missing one fails unless
+`IF EXISTS` is given. The index covers records carrying the label, as their table or as
+a secondary label, whose property holds a `Vector` or a list of numbers. The definition
+(`VectorIndexDef`) is stored in the catalog, in the same transaction as other writes;
+`CALL db.indexes()` lists the definitions. The option parser is `create_vector_index` in
+[`crates/atlantis-engine/src/exec/mod.rs`](../crates/atlantis-engine/src/exec/mod.rs).
 
-`EngineConfig.vector` remains as the default for the options above.
-
-### Search Procedure (Planned — Phase 3)
+### Search Procedure
 
 ```cypher
 CALL db.vector.search('chunk_embedding', $vec, 10) YIELD node, score
-RETURN node.text, score;
+RETURN node.text AS text, score;
 
-// optional fourth argument: a number (threshold, as today) or an options map
+// optional fourth argument: a threshold, or a map {threshold, efSearch}
 CALL db.vector.search('chunk_embedding', $vec, 10, {efSearch: 200, threshold: 0.75})
 YIELD node, score
 RETURN node, score;
 ```
 
-- The first argument names an index, not a label.
-- `node` is the indexed record, so properties and further pattern matching work.
-- `score` is a similarity where higher is better: `1 - distance` for cosine,
-  `1 / (1 + distance)` for Euclidean, and the raw dot product for `dot_product`.
-  `threshold` applies to this score.
+| Argument | Meaning |
+|---|---|
+| 1 — index name or label | An index name. A label is accepted when exactly one index covers it. |
+| 2 — query vector | A `Vector` or a list of numbers of the index's dimension (usually a parameter) |
+| 3 — `k` | A positive integer (literal or parameter) |
+| 4 — optional | A number (minimum score) or a map with `threshold` and `efSearch` |
+
+- `node` is the record id of the hit, so `node.text` reads a property, further
+  `MATCH` patterns can start from it, and `RETURN node` returns its document.
+- `score` is higher-is-better: cosine similarity for `cosine`, the dot product for
+  `dot_product`, and `1 / (1 + distance)` for `euclidean`. `threshold` applies to it.
+- Without `YIELD`, both columns are bound; a query ending in `CALL` returns them.
+- `db.vector.similarity(a, b)` (alias `vector.similarity.cosine`) is an expression
+  function that returns the cosine similarity of two vectors.
+
+### How the Index Is Maintained
+
+**File:** [`crates/atlantis-engine/src/vector_index.rs`](../crates/atlantis-engine/src/vector_index.rs)
+
+Only the definition is stored; the HNSW graph is **derived data** held in memory:
+
+- **Built on first search.** The first search of an index (after open, create or
+  redefinition) scans the records with its label and builds the graph.
+- **Updated after each commit.** A commit reports the record ids it changed, and every
+  built index of that database re-reads those records. An unchanged vector is left in
+  place; a deleted or changed one is tombstoned and the new value inserted.
+- **Committed data only.** A search sees committed records, not the uncommitted writes
+  of the transaction that runs it.
+- **Self-healing.** If updating an index after a commit fails, the index is dropped and
+  rebuilt on the next search; the commit itself is never reported as failed. An index
+  whose tombstones outnumber its live entries is also rebuilt.
+- **Restart.** Nothing but the definition survives a restart; the first search rebuilds
+  the graph from records.
+
+Builds and updates run synchronously on the calling task, under one mutex shared by all
+indexes, so the first search of a large index blocks other index work for the length of
+the build ([16 — Engine Runtime](16-engine-runtime.md)).
+
+## Target Design
+
+### Planned Extensions to DDL and Search (Phase 3)
+
+- Options `m0`, `efSearch` (a per-index default for query time) and `quantization`
+  (see [Quantization](#quantization-planned--after-phase-3-unscheduled)).
+- Taking `dimension` from a typed field (`vector<f32, N>`, Phase 2) and failing a write
+  whose vector has the wrong dimension, instead of skipping the record.
+- Index maintenance inside the writing transaction once the graph lives in KV (below).
 
 ### Filtering (Planned — Phase 3)
 
@@ -220,13 +222,14 @@ For the remaining predicates the optimizer chooses one of two strategies
 | **Pre-filter** | The predicate is selective and answerable from a secondary index or the secondary-label set | Build an allow-set of record keys first, then run HNSW traversal that only admits allowed nodes into the result heap while still walking through others for connectivity. If the allow-set is very small, skip HNSW and compute exact distances over it. |
 | **Post-filter** | The predicate is broad or not indexable | Search with an enlarged candidate pool (`k × overfetch`, growing until `k` rows survive or the index is exhausted), then evaluate `WHERE`. |
 
-Both strategies return at most `k` rows that satisfy the predicate, unlike today's
-behaviour where filtering would happen after truncation.
+Both strategies return at most `k` rows that satisfy the predicate. Today a `WHERE`
+after `YIELD` filters the `k` hits after the search, so fewer than `k` rows can remain.
 
 ### Persistence Through `atlantis-kv` (Planned — Phase 3)
 
-Once storage moves to `atlantis-kv` ([04 — Storage Engine](04-storage-engine.md)),
-each named index stores its graph under the `vx/` prefix of its table:
+Today each process rebuilds the graph from records. In the target design each named
+index stores its graph under the `vx/` prefix of its table in `atlantis-kv`
+([04 — Storage Engine](04-storage-engine.md)):
 
 ```
 /ns/{ns}/db/{db}/tb/{tb}/vx/{index}/meta              -> params, entry point, max level
@@ -266,9 +269,9 @@ Combining vector similarity with BM25 keyword relevance through Reciprocal Rank 
 
 ### Concurrency
 
-Today the HNSW index is owned by the single-writer engine actor, so it needs no internal
-locking. In the target runtime, writers go through the commit sequencer and readers
-search a consistent snapshot concurrently
+Today the built indexes sit behind one mutex in the engine: searches, builds and
+post-commit updates take it in turn. In the target runtime, writers go through the
+commit sequencer and readers search a consistent snapshot concurrently
 (see [05 — Transactions & Consistency](05-transactions-consistency.md) and
 [16 — Engine Runtime](16-engine-runtime.md)).
 
@@ -278,15 +281,20 @@ search a consistent snapshot concurrently
 at low latency, which suits continuously updated RAG and agent-memory data.
 
 **Why tombstones?** Removing a node from a multi-layer graph requires reconnecting its
-neighbors on every layer. Tombstones make deletes cheap, and compaction does the
-repair in the background.
+neighbors on every layer. Tombstones make deletes cheap; today a heavily tombstoned
+index is rebuilt from records, and the target design repairs it with a background
+compaction.
+
+**Why derive the index from records instead of storing it?** Records are the source of
+truth and are already durable, so an index can never disagree with the data after a
+crash; the cost is a rebuild on first search after open.
 
 **Why cosine by default?** Most text embedding models are trained for cosine similarity,
 and cosine is insensitive to vector magnitude.
 
-**Why one index per table field instead of one engine-wide index?** Different
+**Why one index per label and field instead of one engine-wide index?** Different
 embedding models have different dimensions and metrics, and scoping an index to one
-table makes the label filter free.
+label makes the label filter free.
 
 **Why filter with plain `WHERE` instead of a filter argument?** It keeps one query
 language and lets the optimizer choose pre- or post-filtering from statistics rather
@@ -296,6 +304,6 @@ than forcing the user to choose.
 
 - [11 — Full-Text Search](11-full-text-search.md) — BM25 and hybrid text + vector search.
 - [06 — Query Language](06-query-language.md) — `CALL ... YIELD` and procedure syntax.
-- [15 — Query Planner & Executor](15-query-planner-executor.md) — how vector search is planned.
+- [15 — Query Planner & Executor](15-query-planner-executor.md) — how vector search runs today and the planned operators.
 - [22 — Configuration](22-configuration.md) — `VectorConfig` and HNSW options.
 - [24 — RAG Patterns](24-rag-patterns.md) — vector search combined with graph traversal.

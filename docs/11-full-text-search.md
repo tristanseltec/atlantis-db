@@ -188,7 +188,7 @@ indexed field of the record being returned.
 
 ## Hybrid Search with Reciprocal Rank Fusion
 
-> Planned — Phase 3, together with vector index DDL in [10 — Vector Index](10-vector-index.md).
+> Planned — Phase 3. The vector side (`CREATE VECTOR INDEX`, `db.vector.search`) is implemented; see [10 — Vector Index](10-vector-index.md).
 
 Keyword search is precise for names, codes and rare words; vector search finds
 paraphrases. Hybrid search runs both and fuses the ranked lists.

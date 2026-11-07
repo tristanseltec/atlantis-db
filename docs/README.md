@@ -8,10 +8,11 @@ relational, key-value, time-series, full-text and geospatial data share one reco
 model and one query language, **Atlantis Cypher** (Cypher plus extensions). It is
 designed to run embedded, as a standalone server and as a distributed cluster.
 
-Today the code is a pre-release embedded engine: a record store (documents, nodes and
-edges in namespaced tables, with MVCC transactions) used from Rust, and a separate Cypher
-graph + vector engine in which several features it parses are not executed correctly
-(listed in [Getting Started](01-getting-started.md)). Most of this documentation
+Today the code is a pre-release embedded engine with one record store: documents, graph
+nodes and edges in namespaced tables, with MVCC transactions and a write-ahead log.
+Cypher and the Rust record API read and write the same records, and vector indexes are
+derived from them (what works is listed in [Getting Started](01-getting-started.md)).
+Most of this documentation
 describes the target design, and every chapter separates **Implemented today** from
 **Planned — Phase N**. The phases are defined in the
 [Implementation Roadmap](25-implementation-roadmap.md).
@@ -33,7 +34,7 @@ phase that delivers it.
 
 | # | Chapter | What it covers | Status |
 |---|---|---|---|
-| 04 | [Storage Engine](04-storage-engine.md) | Today's hot/cold tiers; transactional KV layer, key encoding, backends, adjacency cache | Partial |
+| 04 | [Storage Engine](04-storage-engine.md) | Transactional KV layer, key encoding, write-ahead log, backends, record store, adjacency cache | Partial |
 | 05 | [Transactions & Consistency](05-transactions-consistency.md) | ACID, MVCC, isolation levels, explicit transactions, durability, conflicts | Partial |
 
 ### Part III — Query Language and Schema
@@ -41,18 +42,18 @@ phase that delivers it.
 | # | Chapter | What it covers | Status |
 |---|---|---|---|
 | 06 | [Query Language](06-query-language.md) | Atlantis Cypher: today's subset and the extension catalogue | Partial |
-| 07 | [Schema & DDL](07-schema-ddl.md) | Namespaces, databases, tables, fields, types, constraints, index DDL | Phase 2 |
-| 15 | [Query Planner & Executor](15-query-planner-executor.md) | Today's planner and executor; cost-based optimizer, joins, index selection | Partial |
+| 07 | [Schema & DDL](07-schema-ddl.md) | Namespaces, databases, tables, fields, types, constraints, index DDL | Partial (vector index DDL implemented; rest Phase 2) |
+| 15 | [Query Planner & Executor](15-query-planner-executor.md) | Today's clause interpreter; planner, cost-based optimizer, joins, index selection | Partial |
 
 ### Part IV — Data Models
 
 | # | Chapter | What it covers | Status |
 |---|---|---|---|
-| 08 | [Document & Relational](08-document-relational.md) | Nested documents, record links, joins, aggregation, secondary indexes | Phase 2 |
+| 08 | [Document & Relational](08-document-relational.md) | Nested documents, record links, joins, aggregation, secondary indexes | Partial |
 | 09 | [Graph Model](09-graph-model.md) | Edges as records, traversal, paths, shortest path, graph algorithms | Partial |
-| 10 | [Vector Index](10-vector-index.md) | HNSW today; vector index DDL, persistence, filtering, quantization, hybrid search | Partial |
+| 10 | [Vector Index](10-vector-index.md) | HNSW, vector index DDL and search today; persistence, filtering, quantization, hybrid search | Partial |
 | 11 | [Full-Text Search](11-full-text-search.md) | Analyzers, BM25, full-text index DDL, highlighting, text + vector fusion | Phase 3 |
-| 12 | [Geospatial](12-geospatial.md) | Geometry types, geo functions, spatial index | Phase 3 |
+| 12 | [Geospatial](12-geospatial.md) | Geometry types, geo functions, spatial index | Partial (`point`, `point.distance`; rest Phase 3) |
 | 13 | [Key-Value & Time-Series](13-key-value-time-series.md) | KV API, TTL, range scans; time-series tables, retention, downsampling | Phase 3 |
 | 14 | [Live Queries & Events](14-live-queries-events.md) | Change feeds, `LIVE` queries, events and triggers | Phase 4 |
 
@@ -60,7 +61,7 @@ phase that delivers it.
 
 | # | Chapter | What it covers | Status |
 |---|---|---|---|
-| 16 | [Engine Runtime](16-engine-runtime.md) | Today's actor model; commit sequencer, snapshot readers, background workers | Partial |
+| 16 | [Engine Runtime](16-engine-runtime.md) | Today's datastore runtime and its limits; commit sequencer, query workers, background workers | Partial |
 | 17 | [Server & Protocols](17-server-protocols.md) | `atlantis` server and CLI, HTTP, WebSocket RPC, Bolt, import/export, backup | Phase 5 |
 | 18 | [Security & Auth](18-security-auth.md) | System users, roles, access methods, JWT, record-level permissions, audit | Phase 5 |
 | 19 | [Client SDKs](19-client-sdks.md) | Connection URLs; Rust, Python, JavaScript/WASM, Go and Java SDKs | Partial (remote SDKs: Phase 6) |

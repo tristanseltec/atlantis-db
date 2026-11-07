@@ -1,7 +1,7 @@
 # 08 — Document & Relational Model
 
-> **Status:** Planned — Phase 2 (aggregation and `MERGE`: Phase 0; flat properties, filtering, sorting, and pagination are partially implemented today)
-> **Crates:** `atlantis-core`, `atlantis-cypher`, `atlantis-engine`, `atlantis-index` (planned), `atlantis-kv` (planned)
+> **Status:** Partially implemented — nested documents, record links that dereference, joins by pattern, aggregation, `MERGE` and pagination work today; schema, typed links, secondary indexes, the join optimizer and map projections are Planned — Phase 2
+> **Crates:** `atlantis-core`, `atlantis-cypher`, `atlantis-engine`, `atlantis-storage`, `atlantis-kv`, `atlantis-index` (planned)
 
 Atlantis DB stores every record as a document: a map of fields whose values can be
 scalars, arrays, nested objects, vectors, geometries, or links to other records. The
@@ -13,26 +13,27 @@ way in Atlantis Cypher. Schema statements are defined in
 
 ## Implemented Today
 
-Today a record is a graph node with a flat `PropertyMap`. What works and what does not,
-verified against `crates/atlantis-cypher` and `crates/atlantis-engine/src/executor.rs`:
+Records are documents, and Cypher reads and writes them directly. Verified against
+`crates/atlantis-engine/src/exec/` and the integration tests in
+`crates/atlantis-db/tests/cypher.rs`:
 
 | Capability | Today |
 |---|---|
-| Property values | `Null`, `Bool`, `Integer`, `Float`, `String`, `Array`, `Vector`. There is no map value, so a map literal evaluates to `null`. |
-| Nested access `n.a.b` | Not supported. Property access is one level deep on a variable. |
-| Filtering with `WHERE` | Works for `=`, `!=`, `<`, `>`, `<=`, `>=`, `AND`, `OR`, `NOT`. `IN`, `IS NULL`, and string predicates do not parse. |
-| Inline property filters `MATCH (n:Label {k: v})` | Ignored; use `WHERE`. |
-| Sorting | `ORDER BY` works on a returned alias or variable, after projection. |
-| Pagination | `SKIP` and `LIMIT` work on `RETURN`, in that order, with literals or parameters. They are ignored on `WITH`. |
-| Updates | `SET` does not parse, and `MATCH ... SET` would change nothing. Properties can only be given at `CREATE`. |
-| Aggregation | `count(n)` and other functions parse but evaluate to `null` for each row. `count(*)` does not parse. |
-| Joins | Not possible. Comma patterns do not parse, and with several `MATCH` clauses only the last scan's rows survive. |
-| Upsert (`MERGE`) | Not parsed. |
-| Indexes | Label index only. Every property filter scans all nodes with the label. |
+| Property values | Every `Value` variant, including nested `Object` maps, arrays, `Vector`, `Datetime`, `Geometry` and `RecordId` links. |
+| Nested access `n.a.b`, `list[i]`, `map['k']` | Works. A missing step yields `null`. |
+| Nested writes | `SET n.a.b = v`, `SET n += {...}`, `SET n = {...}`, `REMOVE n.a.b` work. Writing into an array element (`n.list[0].x = v`) does not parse. |
+| Record links | A stored `RecordId` dereferences on property access (`o.customer.name`). A dangling link gives `null`. |
+| Filtering | All Cypher operators, including `IN`, `IS NULL`, string predicates and `=~`. |
+| Joins | Comma patterns and several `MATCH` clauses join by value; `OPTIONAL MATCH` gives an outer join. Every join is a nested loop over label scans. |
+| Aggregation | `count`, `count(*)`, `sum`, `avg`, `min`, `max`, `collect`, `stdev`, with `DISTINCT` and implicit grouping. |
+| Upsert | `MERGE` with `ON CREATE` / `ON MATCH`; `MERGE (c:Customer {id: 'ana'})` is a key lookup. |
+| Pagination | `ORDER BY`, `SKIP` and `LIMIT` on `RETURN` and `WITH`, in either order. |
+| Indexes | Label index and record-key lookups only. Every property filter scans the label. |
+| Not yet | Schema DDL and typed fields, `record<T>` types, secondary indexes, map projections (`p {.name}`), `percentileCont` / `percentileDisc`. |
 
-The rest of this chapter is target design.
+Sections below marked Planned are target design.
 
-## Documents (Planned — Phase 2)
+## Documents (Implemented; schema Phase 2)
 
 A record is an ordered map. Field values may be objects and arrays nested to any depth.
 
@@ -58,11 +59,12 @@ MATCH (p:Person) WHERE p.address.city = 'Hue'
 RETURN p.name, p.address.street, p.phones[0].number AS firstPhone;
 ```
 
-The standard Cypher list and map tools work on nested data:
+The standard Cypher list and map tools work on nested data (the map projection
+`p {...}` is not implemented and not scheduled yet; use a map literal):
 
 ```cypher
 MATCH (p:Person)
-RETURN p {.name, city: p.address.city} AS card,
+RETURN {name: p.name, city: p.address.city} AS card,
        [ph IN p.phones WHERE ph.kind = 'mobile' | ph.number] AS mobiles,
        size(p.tags) AS tagCount,
        keys(p.address) AS addressFields;
@@ -78,12 +80,12 @@ RETURN p {.name, city: p.address.city} AS card,
 | Remove a nested field | `REMOVE p.address.zip` | |
 | Append to an array | `SET p.tags = p.tags + ['vip']` | |
 | Remove array elements | `SET p.tags = [t IN p.tags WHERE t <> 'beta']` | |
-| Update one array element | `SET p.phones[0].number = $num` | Index out of range is an error. |
+| Update one array element | `SET p.phones[0].number = $num` | Planned — Phase 2. Today rebuild the list with a comprehension. |
 
 Nested paths in `SET` and `REMOVE` are an Atlantis extension; Neo4j only allows
 top-level properties.
 
-### Schemaless or schemafull
+### Schemaless or schemafull (Planned — Phase 2)
 
 A table is schemaless until you declare otherwise. Choose per table:
 
@@ -101,11 +103,13 @@ CREATE FIELD address ON Customer TYPE option<object>;
 CREATE FIELD address.city ON Customer TYPE option<string>;
 ```
 
-## Record Links (Planned — Phase 2)
+## Record Links (Implemented; `record<T>` types Phase 2)
 
-A field of type `record<T>` holds a `RecordId` that points at a record in table `T`.
+A field holding a `RecordId` points at another record. From Phase 2 a field of type
+`record<T>` restricts it to table `T`.
 
 ```cypher
+// Phase 2
 CREATE TABLE Order SCHEMAFULL;
 CREATE FIELD customer ON Order TYPE record<Customer>;
 CREATE FIELD items ON Order TYPE array<object>;
@@ -132,11 +136,12 @@ RETURN id(o), o.customer.name, [i IN o.items | i.product.name] AS products;
 ```
 
 - Returning the link field itself (`RETURN o.customer`) returns the `RecordId`, not the
-  record. Return `o.customer {.*}` to embed the whole target record.
+  record. Embedding the whole target with `o.customer {.*}` needs map projections (not
+  implemented); `properties(o.customer)` returns its fields today.
 - A dangling link (the target was deleted) dereferences to `null`.
-- Each dereference is a point lookup by key. The planner batches lookups for the rows
-  of one operator ([15 — Query Planner & Executor](15-query-planner-executor.md)).
-- Permissions apply to the target table as well: a link the user cannot read
+- Each dereference is a point lookup by key. Batching lookups per operator is planned
+  with the optimizer ([15 — Query Planner & Executor](15-query-planner-executor.md)).
+- Permissions (Phase 5) apply to the target table as well: a link the user cannot read
   dereferences to `null` ([18 — Security & Auth](18-security-auth.md)).
 
 `items.*.product` in the field path above declares the type of a field inside every
@@ -189,7 +194,7 @@ RETURN s.name, e.grade;
 
 Edges are covered in [09 — Graph Model](09-graph-model.md).
 
-## Joins (Planned — Phase 2)
+## Joins (Implemented as nested loops; optimizer Phase 2)
 
 A join is a pattern with several parts connected by a shared value. Cypher already
 expresses this with comma-separated patterns or several `MATCH` clauses:
@@ -206,8 +211,9 @@ MATCH (w:Warehouse) WHERE w.code = s.warehouseCode
 RETURN s.id, w.city;
 ```
 
-The cost-based optimizer chooses the join strategy from statistics and available
-indexes: index nested-loop when the inner side has an index on the join key, hash join
+Today every join is a nested loop: each part scans its label for every row of the
+previous part. In Phase 2 the cost-based optimizer chooses the join strategy from
+statistics and available indexes: index nested-loop when the inner side has an index on the join key, hash join
 for large unindexed inputs. Auto-dereference of a link is a join the planner already
 knows the shape of. Join operators and index selection are described in
 [15 — Query Planner & Executor](15-query-planner-executor.md).
@@ -220,7 +226,7 @@ OPTIONAL MATCH (o:Order) WHERE o.customer = id(c)
 RETURN c.name, count(o) AS orders;
 ```
 
-## Aggregation and Grouping (Planned — Phase 0)
+## Aggregation and Grouping (Implemented)
 
 Aggregation follows Cypher: every non-aggregated `RETURN` or `WITH` item is a grouping
 key. There is no `GROUP BY` clause.
@@ -231,7 +237,8 @@ key. There is no `GROUP BY` clause.
 | `sum(x)`, `avg(x)` | Sum and mean of numbers |
 | `min(x)`, `max(x)` | Smallest and largest value |
 | `collect(x)` | Array of non-null values |
-| `percentileCont(x, p)`, `percentileDisc(x, p)`, `stDev(x)` | Statistical aggregates |
+| `stDev(x)` | Sample standard deviation |
+| `percentileCont(x, p)`, `percentileDisc(x, p)` | Percentiles (planned — Phase 2) |
 
 ```cypher
 MATCH (o:Order)
@@ -282,15 +289,15 @@ Behaviour of indexes:
 
 ## Pagination
 
-`SKIP` and `LIMIT` work today on `RETURN` (in that order). Offset pagination reads and
-discards the skipped rows, so its cost grows with the offset:
+`SKIP` and `LIMIT` work on `RETURN` and `WITH`, in either order. Offset pagination
+reads and discards the skipped rows, so its cost grows with the offset:
 
 ```cypher
 MATCH (p:Product) RETURN p.name AS name ORDER BY name SKIP $offset LIMIT 20
 ```
 
-For deep pages, use keyset pagination on an indexed field, with the record id as a
-tiebreaker (Planned — Phase 2):
+For deep pages, use keyset pagination with the record id as a tiebreaker. The query
+works today; it becomes cheap once the field is indexed (Phase 2):
 
 ```cypher
 MATCH (p:Product)
@@ -301,7 +308,7 @@ RETURN p ORDER BY p.createdAt DESC, id(p) DESC LIMIT 20;
 
 With an index on `createdAt`, each page costs the same regardless of depth.
 
-## Upsert with MERGE (Planned — Phase 0)
+## Upsert with MERGE (Implemented; constraints Phase 2)
 
 `MERGE` matches a pattern or creates it, with Cypher's `ON CREATE` and `ON MATCH`
 actions:
@@ -313,8 +320,9 @@ ON MATCH SET c.lastSeen = time.now()
 RETURN c;
 ```
 
+- A `null` property value in the `MERGE` pattern is an error.
 - `MERGE` is only safe against concurrent duplicates when a uniqueness constraint
-  covers the merge key. Without one, two concurrent transactions can both create the
+  (Phase 2) covers the merge key. Without one, two concurrent transactions can both create the
   record. With one, the second fails with a constraint error or a conflict and can be
   retried ([05 — Transactions & Consistency](05-transactions-consistency.md)).
 - To upsert by record key, merge on `id`: `MERGE (c:Customer {id: 'ana'})`. This is a
