@@ -12,8 +12,11 @@ fn bench_query(c: &mut Criterion) {
     c.bench_function("cypher_match_by_id", |b| {
         b.iter(|| {
             i = (i + 7919) % 10_000;
-            rt.block_on(engine.execute("MATCH (p:Person {id: $id}) RETURN p.name", &[("id", Value::Integer(i))]))
-                .unwrap()
+            rt.block_on(engine.execute(
+                "MATCH (p:Person {id: $id}) RETURN p.name",
+                &[("id", Value::Integer(i))],
+            ))
+            .unwrap()
         })
     });
 

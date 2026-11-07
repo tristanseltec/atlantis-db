@@ -84,17 +84,62 @@ pub(crate) fn group_key(values: &[Value]) -> String {
             Value::Array(items) => {
                 format!("[{}]", items.iter().map(norm).collect::<Vec<_>>().join(","))
             }
+            Value::Object(obj) => format!(
+                "{{{}}}",
+                obj.iter()
+                    .map(|(k, v)| format!("{k:?}:{}", norm(v)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
             other => format!("{other:?}"),
         }
     }
     values.iter().map(norm).collect::<Vec<_>>().join("\u{1f}")
 }
 
-fn cypher_eq(a: &Value, b: &Value) -> Value {
-    if a.is_null() || b.is_null() {
-        return Value::Null;
+/// Cypher equality: `null` if either side is (or, inside lists and maps,
+/// if the result depends on) a `null`; otherwise `true`/`false`.
+pub(crate) fn cypher_eq(a: &Value, b: &Value) -> Value {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => Value::Null,
+        (Value::Array(x), Value::Array(y)) => {
+            if x.len() != y.len() {
+                return Value::Bool(false);
+            }
+            let mut unknown = false;
+            for (p, q) in x.iter().zip(y) {
+                match cypher_eq(p, q) {
+                    Value::Bool(false) => return Value::Bool(false),
+                    Value::Null => unknown = true,
+                    _ => {}
+                }
+            }
+            if unknown {
+                Value::Null
+            } else {
+                Value::Bool(true)
+            }
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            if x.len() != y.len() || x.keys().ne(y.keys()) {
+                return Value::Bool(false);
+            }
+            let mut unknown = false;
+            for (p, q) in x.values().zip(y.values()) {
+                match cypher_eq(p, q) {
+                    Value::Bool(false) => return Value::Bool(false),
+                    Value::Null => unknown = true,
+                    _ => {}
+                }
+            }
+            if unknown {
+                Value::Null
+            } else {
+                Value::Bool(true)
+            }
+        }
+        _ => Value::Bool(a == b),
     }
-    Value::Bool(a == b)
 }
 
 fn compare(a: &Value, b: &Value, op: BinaryOp) -> Value {
@@ -563,9 +608,12 @@ impl Exec<'_> {
             },
             BinaryOp::RegexMatch => match (&a, &b) {
                 (Value::String(x), Value::String(pattern)) => {
-                    let re = regex::Regex::new(&format!("^(?:{pattern})$"))
-                        .map_err(|e| invalid(format!("invalid regular expression: {e}")))?;
-                    Value::Bool(re.is_match(x))
+                    if !self.regexes.contains_key(pattern) {
+                        let re = regex::Regex::new(&format!("^(?:{pattern})$"))
+                            .map_err(|e| invalid(format!("invalid regular expression: {e}")))?;
+                        self.regexes.insert(pattern.clone(), re);
+                    }
+                    Value::Bool(self.regexes[pattern].is_match(x))
                 }
                 _ => Value::Null,
             },
@@ -804,7 +852,10 @@ impl Exec<'_> {
                     if out.len() > 10_000_000 {
                         return Err(invalid("range() result is too large"));
                     }
-                    i += step;
+                    i = match i.checked_add(step) {
+                        Some(next) => next,
+                        None => break,
+                    };
                 }
                 Value::Array(out)
             }

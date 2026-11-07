@@ -1,5 +1,6 @@
 //! The datastore: storage, transactions, Cypher execution and indexes.
 
+use std::collections::HashMap;
 use std::fs::{self, File, TryLockError};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -143,6 +144,7 @@ impl Datastore {
             rtx: self.inner.records.begin(db, mode, isolation)?,
             store: self.clone(),
             index_changes: Vec::new(),
+            failed: false,
         })
     }
 
@@ -233,9 +235,14 @@ fn spawn_checkpointer(
                     continue;
                 }
                 last = Instant::now();
-                let Some(inner) = store.upgrade() else { return };
+                // Hold the datastore only long enough to clone the store
+                // handle, so dropping the last engine never waits on (or
+                // runs its shutdown on) this thread.
+                let Some(kv) = store.upgrade().map(|inner| inner.kv.clone()) else {
+                    return;
+                };
                 // Errors surface on the next explicit checkpoint or commit.
-                let _ = inner.kv.checkpoint_durable();
+                let _ = kv.checkpoint_durable();
             }
         })
         .expect("spawn checkpoint thread")
@@ -247,6 +254,9 @@ pub struct Transaction {
     rtx: RecordTx,
     store: Datastore,
     index_changes: Vec<String>,
+    /// Set when a Cypher statement failed part-way; such a transaction can
+    /// only be rolled back, because the statement's partial writes are in it.
+    failed: bool,
 }
 
 impl Transaction {
@@ -264,9 +274,13 @@ impl Transaction {
             vectors: &inner.vectors,
             vector_defaults: &inner.config.vector,
             index_changes: Vec::new(),
+            regexes: HashMap::new(),
         };
         let result = exec.run(statement);
         self.index_changes.append(&mut exec.index_changes);
+        if result.is_err() {
+            self.failed = true;
+        }
         result
     }
 
@@ -290,18 +304,27 @@ impl Transaction {
 
     /// Commits, then brings derived vector indexes up to date.
     pub fn commit(self) -> Result<CommitInfo, AtlantisError> {
+        if self.failed {
+            return Err(AtlantisError::InvalidQuery(
+                "a statement in this transaction failed; it was rolled back".into(),
+            ));
+        }
         let db = self.rtx.database().clone();
         let Transaction {
             rtx,
             store,
             index_changes,
+            ..
         } = self;
         let info = rtx.commit()?;
         let inner = &store.inner;
         for name in &index_changes {
             inner.vectors.invalidate(&db, name);
         }
-        inner.vectors.apply(&inner.records, &db, &info.changed)?;
+        // The data is committed; a failure to update derived indexes must not
+        // be reported as a failed commit. `apply` drops the affected indexes
+        // on error so the next search rebuilds them from records.
+        let _ = inner.vectors.apply(&inner.records, &db, &info.changed);
         Ok(info)
     }
 }

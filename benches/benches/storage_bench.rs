@@ -31,7 +31,9 @@ fn bench_storage(c: &mut Criterion) {
         b.iter(|| {
             i = (i + 7919) % 10_000;
             let id = format!("Person:{i}").parse().unwrap();
-            rt.block_on(engine.read(|tx| tx.get(&id))).unwrap().expect("exists")
+            rt.block_on(engine.read(|tx| tx.get(&id)))
+                .unwrap()
+                .expect("exists")
         })
     });
 
@@ -39,7 +41,8 @@ fn bench_storage(c: &mut Criterion) {
         b.iter(|| {
             i = (i + 7919) % 10_000;
             let id = format!("Person:{i}").parse().unwrap();
-            rt.block_on(engine.read(|tx| tx.neighbors(&id, Direction::Outgoing, Some("KNOWS")))).unwrap()
+            rt.block_on(engine.read(|tx| tx.neighbors(&id, Direction::Outgoing, Some("KNOWS"))))
+                .unwrap()
         })
     });
 }

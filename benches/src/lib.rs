@@ -5,7 +5,10 @@ use tokio::runtime::Runtime;
 
 /// A single-threaded runtime for driving the async API from criterion.
 pub fn runtime() -> Runtime {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime")
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
 }
 
 /// An in-memory engine with `people` Person nodes in a ring of KNOWS edges

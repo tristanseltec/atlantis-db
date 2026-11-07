@@ -60,6 +60,9 @@ impl Exec<'_> {
         np: &NodePattern,
         props: &[(String, Value)],
     ) -> Result<bool, AtlantisError> {
+        if self.tx.table(&id.table)?.is_some_and(|t| t.is_edge()) {
+            return Ok(false); // relationships are not nodes
+        }
         let Some(record) = self.load(id)? else {
             return Ok(false);
         };
@@ -86,21 +89,32 @@ impl Exec<'_> {
     ) -> Result<Vec<RecordId>, AtlantisError> {
         // Direct lookup by id when the pattern pins it.
         if let Some((_, v)) = props.iter().find(|(k, _)| k == "id") {
-            let id = match v {
-                Value::RecordId(id) => Some(id.clone()),
-                other => match np.labels.first() {
-                    Some(table) => RecordKey::from_value(other)
-                        .ok()
-                        .and_then(|k| RecordId::new(table.clone(), k).ok()),
-                    None => None,
+            // Candidate ids: the id itself, or the key in each pattern label
+            // that names a node table (a label may also be secondary).
+            let ids: Option<Vec<RecordId>> = match v {
+                Value::RecordId(id) => Some(vec![id.clone()]),
+                other => match RecordKey::from_value(other) {
+                    Ok(key) => {
+                        let mut ids = Vec::new();
+                        for label in &np.labels {
+                            if self.tx.table(label)?.is_some_and(|t| !t.is_edge()) {
+                                ids.extend(RecordId::new(label.clone(), key.clone()).ok());
+                            }
+                        }
+                        // No label is a node table: fall back to scanning.
+                        (!ids.is_empty()).then_some(ids)
+                    }
+                    Err(_) => Some(Vec::new()),
                 },
             };
-            if let Some(id) = id {
-                return Ok(if self.node_fits(&id, np, props)? {
-                    vec![id]
-                } else {
-                    Vec::new()
-                });
+            if let Some(ids) = ids {
+                let mut out = Vec::new();
+                for id in ids {
+                    if self.node_fits(&id, np, props)? {
+                        out.push(id);
+                    }
+                }
+                return Ok(out);
             }
         }
         let records = match np.labels.first() {

@@ -539,3 +539,144 @@ async fn data_and_vector_index_survive_reopen() {
         "the vector index is rebuilt from records"
     );
 }
+
+#[tokio::test]
+async fn delete_node_and_its_relationships_in_one_clause() {
+    let e = engine().await;
+    run(&e, "CREATE (a:A)-[:R]->(:B), (a)-[:R]->(:B)").await;
+    run(&e, "MATCH (a:A)-[r:R]->() DELETE a, r").await;
+    let rs = run(&e, "MATCH (a:A) RETURN count(*) AS n").await;
+    assert_eq!(col(&rs, "n"), vec![i(0)]);
+    // Order of operands does not matter either.
+    run(&e, "CREATE (a:A)-[:R]->(:B), (a)-[:R]->(:B)").await;
+    run(&e, "MATCH (a:A)-[r:R]->() DELETE r, a").await;
+    let rs = run(&e, "MATCH ()-[r:R]->() RETURN count(r) AS n").await;
+    assert_eq!(col(&rs, "n"), vec![i(0)]);
+}
+
+#[tokio::test]
+async fn range_near_integer_limits_does_not_overflow() {
+    let e = engine().await;
+    let rs = run(
+        &e,
+        "RETURN range(9223372036854775800, 9223372036854775807, 5) AS r",
+    )
+    .await;
+    assert_eq!(
+        col(&rs, "r"),
+        vec![Value::Array(vec![
+            i(9223372036854775800),
+            i(9223372036854775805)
+        ])]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_statement_poisons_its_transaction() {
+    let e = engine().await;
+    let result = e
+        .transaction(|tx| {
+            let _ignored = tx.execute("UNWIND [1, 2, 0] AS x CREATE (:N {v: 10 / x})", &[]);
+            Ok(())
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "commit must refuse a transaction with a failed statement"
+    );
+    let rs = run(&e, "MATCH (n:N) RETURN count(*) AS n").await;
+    assert_eq!(
+        col(&rs, "n"),
+        vec![i(0)],
+        "partial writes of the failed statement are discarded"
+    );
+}
+
+#[tokio::test]
+async fn return_star_with_aggregate_groups_by_variables() {
+    let e = engine().await;
+    run(&e, "CREATE (:P {x: 1}), (:P {x: 2}), (:P {x: 2})").await;
+    let rs = run(
+        &e,
+        "MATCH (n:P) WITH n.x AS x RETURN *, count(*) AS c ORDER BY x",
+    )
+    .await;
+    assert_eq!(rows(&rs), vec![vec![i(1), i(1)], vec![i(2), i(2)]]);
+}
+
+#[tokio::test]
+async fn id_lookup_works_through_secondary_labels_and_skips_edges() {
+    let e = engine().await;
+    run(
+        &e,
+        "CREATE (:Person:Admin {id: 5})-[:KNOWS {id: 1}]->(:Person {id: 6})",
+    )
+    .await;
+    for q in [
+        "MATCH (n:Admin {id: 5}) RETURN count(*) AS n",
+        "MATCH (n:Admin:Person {id: 5}) RETURN count(*) AS n",
+        "MATCH (n:Person {id: 5}) RETURN count(*) AS n",
+    ] {
+        assert_eq!(col(&run(&e, q).await, "n"), vec![i(1)], "{q}");
+    }
+    let rs = run(&e, "MATCH (n:KNOWS {id: 1}) RETURN count(*) AS n").await;
+    assert_eq!(
+        col(&rs, "n"),
+        vec![i(0)],
+        "relationships are not matched as nodes"
+    );
+}
+
+#[tokio::test]
+async fn vector_index_keeps_recall_under_unrelated_writes() {
+    let e = engine().await;
+    run(
+        &e,
+        "CREATE VECTOR INDEX c FOR (c:C) ON (c.v) OPTIONS {dimension: 2}",
+    )
+    .await;
+    run(
+        &e,
+        "UNWIND range(1, 200) AS i CREATE (:C {i: i, v: [toFloat(i), 1.0]})",
+    )
+    .await;
+    let query = [("q", Value::Vector(vec![1.0, 1.0]))];
+    let search = "CALL db.vector.search('c', $q, 100) YIELD node RETURN count(*) AS n";
+    assert_eq!(
+        col(&e.execute(search, &query).await.unwrap(), "n"),
+        vec![i(100)]
+    );
+    for _ in 0..5 {
+        run(&e, "MATCH (c:C) SET c.touched = true").await;
+    }
+    assert_eq!(
+        col(&e.execute(search, &query).await.unwrap(), "n"),
+        vec![i(100)]
+    );
+}
+
+#[tokio::test]
+async fn merge_rejects_null_properties() {
+    let e = engine().await;
+    let err = e
+        .execute("MERGE (n:Q {name: null})", &[])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("null"), "{err}");
+}
+
+#[tokio::test]
+async fn null_semantics_in_nested_equality_and_distinct() {
+    let e = engine().await;
+    let rs = run(
+        &e,
+        "RETURN [1, null] = [1, null] AS a, [1, 2] = [1, 3] AS b, {a: 1} = {a: 1} AS c",
+    )
+    .await;
+    assert_eq!(
+        rows(&rs),
+        vec![vec![Value::Null, Value::Bool(false), Value::Bool(true)]]
+    );
+    let rs = run(&e, "UNWIND [{a: 1}, {a: 1.0}] AS m RETURN DISTINCT m").await;
+    assert_eq!(rs.row_count(), 1);
+}

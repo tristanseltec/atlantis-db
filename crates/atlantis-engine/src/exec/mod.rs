@@ -44,6 +44,8 @@ pub(crate) struct Exec<'a> {
     pub(crate) vector_defaults: &'a atlantis_core::VectorConfig,
     /// Index definitions created or dropped, to invalidate after commit.
     pub(crate) index_changes: Vec<String>,
+    /// Compiled `=~` patterns, reused across rows.
+    pub(crate) regexes: HashMap<String, regex::Regex>,
 }
 
 /// Output of a projection: column names and rows (as bindings, in order).
@@ -186,6 +188,7 @@ impl<'a> Exec<'a> {
                 } => {
                     let mut out = Vec::new();
                     for row in &rows {
+                        self.check_merge_properties(path, row)?;
                         let found = self.match_path(path, row, &[])?;
                         if found.is_empty() {
                             let mut r = row.clone();
@@ -214,11 +217,25 @@ impl<'a> Exec<'a> {
                     rows
                 }
                 Clause::Delete { detach, exprs } => {
+                    // Collect every target first, delete relationships, then
+                    // nodes: `DELETE n, r` must not fail on edges that the
+                    // same clause deletes.
+                    let mut targets = Vec::new();
                     for row in &rows {
                         for expr in exprs {
-                            let target = self.eval(expr, row)?;
-                            self.delete_value(&target, *detach)?;
+                            collect_delete_targets(self.eval(expr, row)?, &mut targets)?;
                         }
+                    }
+                    let mut nodes = Vec::new();
+                    for id in targets {
+                        if self.tx.table(&id.table)?.is_some_and(|t| t.is_edge()) {
+                            self.tx.delete_edge(&id)?;
+                        } else {
+                            nodes.push(id);
+                        }
+                    }
+                    for id in nodes {
+                        self.tx.delete(&id, *detach)?;
                     }
                     rows
                 }
@@ -464,6 +481,30 @@ impl<'a> Exec<'a> {
         Ok(())
     }
 
+    /// `MERGE` cannot match on `null`, so a null property is an error
+    /// instead of silently creating a duplicate every time.
+    fn check_merge_properties(
+        &mut self,
+        path: &atlantis_cypher::ast::PathPattern,
+        row: &Row,
+    ) -> Result<(), AtlantisError> {
+        let props = std::iter::once(&path.start.properties).chain(
+            path.steps
+                .iter()
+                .flat_map(|(r, n)| [&r.properties, &n.properties]),
+        );
+        for list in props {
+            for (key, expr) in list {
+                if self.eval(expr, row)?.is_null() {
+                    return Err(invalid(format!(
+                        "MERGE cannot use a null value for property {key}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Edge documents expose `in`/`out`, which are not writable fields.
     fn strip_edge_fields(&mut self, id: &RecordId, data: &mut Object) -> Result<(), AtlantisError> {
         if self.tx.table(&id.table)?.is_some_and(|t| t.is_edge()) {
@@ -471,25 +512,6 @@ impl<'a> Exec<'a> {
             data.remove("out");
         }
         Ok(())
-    }
-
-    fn delete_value(&mut self, target: &Value, detach: bool) -> Result<(), AtlantisError> {
-        match target {
-            Value::Null => Ok(()),
-            Value::RecordId(id) => self.tx.delete(id, detach).map(|_| ()),
-            Value::Array(items) => items.iter().try_for_each(|v| self.delete_value(v, detach)),
-            // A path value: delete its relationships, then its nodes.
-            Value::Object(path) if path.contains_key("relationships") => {
-                if let Some(rels) = path.get("relationships") {
-                    self.delete_value(rels, detach)?;
-                }
-                match path.get("nodes") {
-                    Some(nodes) => self.delete_value(nodes, detach),
-                    None => Ok(()),
-                }
-            }
-            other => Err(invalid(format!("cannot delete a {}", other.type_name()))),
-        }
     }
 
     // ---- projection --------------------------------------------------------
@@ -515,13 +537,15 @@ impl<'a> Exec<'a> {
         rows: Vec<Row>,
     ) -> Result<Projected, AtlantisError> {
         let mut columns: Vec<String> = Vec::new();
+        // Variables kept by `*`; with aggregates they are grouping keys.
+        let mut star_vars: Vec<String> = Vec::new();
         if projection.star {
-            let mut vars: Vec<String> = rows
+            star_vars = rows
                 .first()
                 .map(|r| r.keys().cloned().collect())
                 .unwrap_or_default();
-            vars.sort();
-            columns.extend(vars);
+            star_vars.sort();
+            columns.extend(star_vars.iter().cloned());
         }
         for item in &projection.items {
             columns.push(item.name().to_string());
@@ -538,10 +562,15 @@ impl<'a> Exec<'a> {
             let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
             let mut index: HashMap<String, usize> = HashMap::new();
             for row in rows {
-                let key_values: Vec<Value> = keys
+                let mut key_values: Vec<Value> = keys
                     .iter()
                     .map(|i| self.eval(&projection.items[*i].expr, &row))
                     .collect::<Result<_, _>>()?;
+                key_values.extend(
+                    star_vars
+                        .iter()
+                        .map(|v| row.get(v).cloned().unwrap_or(Value::Null)),
+                );
                 let k = group_key(&key_values);
                 match index.get(&k) {
                     Some(&g) => groups[g].1.push(row),
@@ -551,12 +580,15 @@ impl<'a> Exec<'a> {
                     }
                 }
             }
-            if groups.is_empty() && keys.is_empty() {
+            if groups.is_empty() && keys.is_empty() && star_vars.is_empty() {
                 groups.push((Vec::new(), Vec::new()));
             }
             for (_, group) in groups {
                 let first = group.first().cloned().unwrap_or_default();
                 let mut projected = Row::new();
+                for var in &star_vars {
+                    projected.insert(var.clone(), first.get(var).cloned().unwrap_or(Value::Null));
+                }
                 for item in &projection.items {
                     let value = if item.expr.contains_aggregate() {
                         let substituted = self.substitute_aggregates(&item.expr, &group)?;
@@ -916,6 +948,30 @@ impl<'a> Exec<'a> {
             }
             other => Err(invalid(format!("unknown procedure {other}"))),
         }
+    }
+}
+
+/// Flattens a `DELETE` operand into record ids (lists and paths expand).
+fn collect_delete_targets(target: Value, out: &mut Vec<RecordId>) -> Result<(), AtlantisError> {
+    match target {
+        Value::Null => Ok(()),
+        Value::RecordId(id) => {
+            out.push(id);
+            Ok(())
+        }
+        Value::Array(items) => items
+            .into_iter()
+            .try_for_each(|v| collect_delete_targets(v, out)),
+        Value::Object(mut path) if path.contains_key("relationships") => {
+            if let Some(rels) = path.remove("relationships") {
+                collect_delete_targets(rels, out)?;
+            }
+            match path.remove("nodes") {
+                Some(nodes) => collect_delete_targets(nodes, out),
+                None => Ok(()),
+            }
+        }
+        other => Err(invalid(format!("cannot delete a {}", other.type_name()))),
     }
 }
 

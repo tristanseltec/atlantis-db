@@ -43,6 +43,8 @@ struct Built {
     /// Record id text → internal id of its current vector.
     slots: HashMap<String, u64>,
     next: u64,
+    /// Removed entries still present as HNSW tombstones.
+    deleted: usize,
 }
 
 impl Built {
@@ -60,6 +62,7 @@ impl Built {
             records: HashMap::new(),
             slots: HashMap::new(),
             next: 0,
+            deleted: 0,
         }
     }
 
@@ -79,19 +82,26 @@ impl Built {
         if let Some(slot) = self.slots.remove(&id.to_string()) {
             self.hnsw.remove(NodeId(slot));
             self.records.remove(&slot);
+            self.deleted += 1;
         }
     }
 
-    /// Re-reads one record and updates its entry.
+    /// Re-reads one record and updates its entry. An unchanged vector is
+    /// left in place, so writes to other fields do not churn the graph.
     fn refresh(&mut self, tx: &mut RecordTx, id: &RecordId) -> Result<(), AtlantisError> {
-        self.remove(id);
-        let Some(record) = tx.get(id)? else {
-            return Ok(());
+        let vector = match tx.get(id)? {
+            Some(record) if record.has_label(&self.def.label) => {
+                self.vector_of(record.get(&self.def.field))
+            }
+            _ => None,
         };
-        if !record.has_label(&self.def.label) {
-            return Ok(());
+        if let (Some(v), Some(slot)) = (&vector, self.slots.get(&id.to_string())) {
+            if self.hnsw.get_vector(NodeId(*slot)) == Some(v.as_slice()) {
+                return Ok(());
+            }
         }
-        if let Some(vector) = self.vector_of(record.get(&self.def.field)) {
+        self.remove(id);
+        if let Some(vector) = vector {
             let slot = self.next;
             self.next += 1;
             self.hnsw.insert(NodeId(slot), vector)?;
@@ -99,6 +109,12 @@ impl Built {
             self.slots.insert(id.to_string(), slot);
         }
         Ok(())
+    }
+
+    /// `true` once tombstones outnumber live entries; searching such a
+    /// graph loses recall, so it is rebuilt.
+    fn needs_rebuild(&self) -> bool {
+        self.deleted > 1024.max(self.slots.len())
     }
 
     fn score(&self, distance: f32) -> f64 {
@@ -196,16 +212,24 @@ impl VectorIndexes {
         if !built.keys().any(|(d, _)| d == db) {
             return Ok(());
         }
-        let mut tx = store.begin(db.clone(), TxMode::ReadOnly, Isolation::Snapshot)?;
-        for ((d, _), index) in built.iter_mut() {
-            if d != db {
-                continue;
+        let result = (|| {
+            let mut tx = store.begin(db.clone(), TxMode::ReadOnly, Isolation::Snapshot)?;
+            for ((d, _), index) in built.iter_mut() {
+                if d != db {
+                    continue;
+                }
+                for id in changed {
+                    index.refresh(&mut tx, id)?;
+                }
             }
-            for id in changed {
-                index.refresh(&mut tx, id)?;
-            }
+            Ok::<(), AtlantisError>(())
+        })();
+        // Stale or degraded indexes are dropped and rebuilt on next search.
+        match result {
+            Ok(()) => built.retain(|(d, _), index| d != db || !index.needs_rebuild()),
+            Err(_) => built.retain(|(d, _), _| d != db),
         }
-        Ok(())
+        result
     }
 
     /// Forgets a built index (after it was dropped or redefined).
