@@ -1,391 +1,482 @@
-//! Cypher tokenizer.
-//!
-//! Converts a Cypher query string into a stream of spanned tokens.
+//! Cypher tokenizer: turns source text into spanned tokens.
 
 use atlantis_core::AtlantisError;
 
-use super::token::{SpannedToken, Token};
+use super::token::{line_col, SpannedToken, Token};
 
-/// The set of Cypher keywords (case-insensitive).
-const KEYWORDS: &[&str] = &[
-    "MATCH", "OPTIONAL", "WHERE", "RETURN", "CREATE", "MERGE", "DELETE", "DETACH", "SET", "REMOVE",
-    "WITH", "ORDER", "BY", "LIMIT", "SKIP", "AND", "OR", "NOT", "XOR", "CALL", "YIELD", "DISTINCT",
-    "AS", "ON", "UNION", "ALL", "UNWIND", "IN", "IS", "NULL", "TRUE", "FALSE", "STARTS", "ENDS",
-    "CONTAINS",
-];
+/// Largest integer literal magnitude: `2^63`, the magnitude of `i64::MIN`.
+const MAX_INT_MAGNITUDE: u64 = 1 << 63;
 
-/// Tokenizes a Cypher query string.
+/// Tokenizes a Cypher query. The returned vector always ends with
+/// [`Token::Eof`].
 pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, AtlantisError> {
-    let mut tokens = Vec::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut pos = 0;
+    Lexer { src: input, pos: 0 }.run()
+}
 
-    while pos < chars.len() {
-        // Skip whitespace
-        if chars[pos].is_whitespace() {
-            pos += 1;
-            continue;
+struct Lexer<'a> {
+    src: &'a str,
+    /// Current byte offset.
+    pos: usize,
+}
+
+impl Lexer<'_> {
+    fn run(mut self) -> Result<Vec<SpannedToken>, AtlantisError> {
+        let mut tokens = Vec::new();
+        loop {
+            self.skip_trivia()?;
+            let start = self.pos;
+            let Some(c) = self.peek() else {
+                tokens.push(SpannedToken {
+                    token: Token::Eof,
+                    span: start..start,
+                });
+                return Ok(tokens);
+            };
+            let token = self.token(c, start)?;
+            tokens.push(SpannedToken {
+                token,
+                span: start..self.pos,
+            });
         }
+    }
 
-        // Skip line comments (//)
-        if pos + 1 < chars.len() && chars[pos] == '/' && chars[pos + 1] == '/' {
-            while pos < chars.len() && chars[pos] != '\n' {
-                pos += 1;
-            }
-            continue;
-        }
+    fn peek(&self) -> Option<char> {
+        self.src[self.pos..].chars().next()
+    }
 
-        // Skip block comments (/* */)
-        if pos + 1 < chars.len() && chars[pos] == '/' && chars[pos + 1] == '*' {
-            pos += 2;
-            while pos + 1 < chars.len() && !(chars[pos] == '*' && chars[pos + 1] == '/') {
-                pos += 1;
-            }
-            pos += 2;
-            continue;
-        }
+    fn peek_nth(&self, n: usize) -> Option<char> {
+        self.src[self.pos..].chars().nth(n)
+    }
 
-        let start = pos;
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += c.len_utf8();
+        Some(c)
+    }
 
-        // Strings (single or double quotes)
-        if chars[pos] == '\'' || chars[pos] == '"' {
-            let quote = chars[pos];
-            pos += 1;
-            let mut s = String::new();
-            while pos < chars.len() && chars[pos] != quote {
-                if chars[pos] == '\\' && pos + 1 < chars.len() {
-                    pos += 1;
-                    match chars[pos] {
-                        'n' => s.push('\n'),
-                        't' => s.push('\t'),
-                        'r' => s.push('\r'),
-                        '\\' => s.push('\\'),
-                        '\'' => s.push('\''),
-                        '"' => s.push('"'),
-                        c => s.push(c),
+    fn error(&self, offset: usize, msg: &str) -> AtlantisError {
+        let (line, col) = line_col(self.src, offset);
+        AtlantisError::Parse(format!("{line}:{col}: {msg}"))
+    }
+
+    /// Skips whitespace, `// line` and `/* block */` comments.
+    fn skip_trivia(&mut self) -> Result<(), AtlantisError> {
+        loop {
+            match (self.peek(), self.peek_nth(1)) {
+                (Some(c), _) if c.is_whitespace() => {
+                    self.bump();
+                }
+                (Some('/'), Some('/')) => {
+                    while let Some(c) = self.bump() {
+                        if c == '\n' {
+                            break;
+                        }
                     }
-                    pos += 1;
-                } else {
-                    s.push(chars[pos]);
-                    pos += 1;
                 }
+                (Some('/'), Some('*')) => {
+                    let start = self.pos;
+                    match self.src[self.pos + 2..].find("*/") {
+                        Some(end) => self.pos += 2 + end + 2,
+                        None => return Err(self.error(start, "unterminated block comment")),
+                    }
+                }
+                _ => return Ok(()),
             }
-            if pos >= chars.len() {
-                return Err(AtlantisError::Parse("unterminated string literal".into()));
-            }
-            pos += 1; // consume closing quote
-            let byte_start = char_span_start(input, start);
-            let byte_end = char_span_start(input, pos);
-            tokens.push(SpannedToken {
-                token: Token::String(s),
-                span: byte_start..byte_end,
-            });
-            continue;
         }
+    }
 
-        // Numbers (integer or float)
-        if chars[pos].is_ascii_digit()
-            || (chars[pos] == '-' && pos + 1 < chars.len() && chars[pos + 1].is_ascii_digit())
+    fn token(&mut self, c: char, start: usize) -> Result<Token, AtlantisError> {
+        if c.is_ascii_digit() || (c == '.' && self.peek_nth(1).is_some_and(|d| d.is_ascii_digit()))
         {
-            let mut num_str = String::new();
-            if chars[pos] == '-' {
-                num_str.push('-');
-                pos += 1;
-            }
-            let mut is_float = false;
-            while pos < chars.len() && (chars[pos].is_ascii_digit() || chars[pos] == '.') {
-                if chars[pos] == '.' {
-                    is_float = true;
+            return self.number(start);
+        }
+        if is_ident_start(c) {
+            return Ok(Token::Ident(self.word()));
+        }
+        self.bump();
+        let next = self.peek();
+        let two = |lexer: &mut Self, tok: Token| {
+            lexer.bump();
+            Ok(tok)
+        };
+        match (c, next) {
+            ('\'' | '"', _) => self.string(c, start),
+            ('`', _) => self.quoted_ident(start).map(Token::QuotedIdent),
+            ('$', _) => self.param(start),
+            ('.', Some('.')) => two(self, Token::DotDot),
+            ('+', Some('=')) => two(self, Token::PlusEq),
+            ('=', Some('~')) => two(self, Token::RegexMatch),
+            ('<', Some('>')) | ('!', Some('=')) => two(self, Token::NotEq),
+            ('<', Some('=')) => two(self, Token::LtEq),
+            ('>', Some('=')) => two(self, Token::GtEq),
+            ('(', _) => Ok(Token::LParen),
+            (')', _) => Ok(Token::RParen),
+            ('[', _) => Ok(Token::LBracket),
+            (']', _) => Ok(Token::RBracket),
+            ('{', _) => Ok(Token::LBrace),
+            ('}', _) => Ok(Token::RBrace),
+            (',', _) => Ok(Token::Comma),
+            ('.', _) => Ok(Token::Dot),
+            (':', _) => Ok(Token::Colon),
+            (';', _) => Ok(Token::Semicolon),
+            ('|', _) => Ok(Token::Pipe),
+            ('+', _) => Ok(Token::Plus),
+            ('-', _) => Ok(Token::Minus),
+            ('*', _) => Ok(Token::Star),
+            ('/', _) => Ok(Token::Slash),
+            ('%', _) => Ok(Token::Percent),
+            ('^', _) => Ok(Token::Caret),
+            ('=', _) => Ok(Token::Eq),
+            ('<', _) => Ok(Token::Lt),
+            ('>', _) => Ok(Token::Gt),
+            _ => Err(self.error(start, &format!("unexpected character {c:?}"))),
+        }
+    }
+
+    fn word(&mut self) -> String {
+        let start = self.pos;
+        while self.peek().is_some_and(is_ident_continue) {
+            self.bump();
+        }
+        self.src[start..self.pos].to_string()
+    }
+
+    fn eat_digits(&mut self) {
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.bump();
+        }
+    }
+
+    /// Integer or float. A `.` only continues the number when a digit
+    /// follows, so `1..3` lexes as `1`, `..`, `3`.
+    fn number(&mut self, start: usize) -> Result<Token, AtlantisError> {
+        self.eat_digits();
+        let mut is_float = false;
+        if self.peek() == Some('.') && self.peek_nth(1).is_some_and(|c| c.is_ascii_digit()) {
+            is_float = true;
+            self.bump();
+            self.eat_digits();
+        }
+        if matches!(self.peek(), Some('e' | 'E')) {
+            let digit_at = if matches!(self.peek_nth(1), Some('+' | '-')) {
+                2
+            } else {
+                1
+            };
+            if self.peek_nth(digit_at).is_some_and(|c| c.is_ascii_digit()) {
+                is_float = true;
+                for _ in 0..digit_at {
+                    self.bump();
                 }
-                num_str.push(chars[pos]);
-                pos += 1;
+                self.eat_digits();
             }
-            let byte_start = char_span_start(input, start);
-            let byte_end = char_span_start(input, pos);
-            if is_float {
-                let f: f64 = num_str
-                    .parse()
-                    .map_err(|_| AtlantisError::Parse(format!("invalid float: {num_str}")))?;
-                tokens.push(SpannedToken {
-                    token: Token::Float(f),
-                    span: byte_start..byte_end,
-                });
-            } else {
-                let i: i64 = num_str
-                    .parse()
-                    .map_err(|_| AtlantisError::Parse(format!("invalid integer: {num_str}")))?;
-                tokens.push(SpannedToken {
-                    token: Token::Integer(i),
-                    span: byte_start..byte_end,
-                });
-            }
-            continue;
         }
-
-        // Parameters ($name)
-        if chars[pos] == '$' {
-            pos += 1;
-            let mut name = String::new();
-            while pos < chars.len() && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
-                name.push(chars[pos]);
-                pos += 1;
-            }
-            let byte_start = char_span_start(input, start);
-            let byte_end = char_span_start(input, pos);
-            tokens.push(SpannedToken {
-                token: Token::Parameter(name),
-                span: byte_start..byte_end,
-            });
-            continue;
+        if self.peek().is_some_and(is_ident_continue) {
+            return Err(self.error(start, "invalid number literal"));
         }
-
-        // Identifiers and keywords
-        if chars[pos].is_alphabetic() || chars[pos] == '_' {
-            let mut ident = String::new();
-            while pos < chars.len() && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
-                ident.push(chars[pos]);
-                pos += 1;
-            }
-            let byte_start = char_span_start(input, start);
-            let byte_end = char_span_start(input, pos);
-
-            let upper = ident.to_uppercase();
-            if KEYWORDS.contains(&upper.as_str()) {
-                tokens.push(SpannedToken {
-                    token: keyword_from_str(&upper),
-                    span: byte_start..byte_end,
-                });
-            } else {
-                tokens.push(SpannedToken {
-                    token: Token::Identifier(ident),
-                    span: byte_start..byte_end,
-                });
-            }
-            continue;
+        let text = &self.src[start..self.pos];
+        if is_float {
+            return text
+                .parse::<f64>()
+                .ok()
+                .filter(|x| x.is_finite())
+                .map(Token::Float)
+                .ok_or_else(|| self.error(start, &format!("float literal out of range: {text}")));
         }
-
-        // Punctuation
-        let token = tokenize_punctuation(&chars, &mut pos, input)?;
-        if let Some(tok) = token {
-            let byte_start = char_span_start(input, start);
-            let byte_end = char_span_start(input, pos);
-            tokens.push(SpannedToken {
-                token: tok,
-                span: byte_start..byte_end,
-            });
+        match text.parse::<u64>() {
+            Ok(n) if n <= MAX_INT_MAGNITUDE => Ok(Token::Integer(n)),
+            _ => Err(self.error(start, &format!("integer literal out of range: {text}"))),
         }
     }
 
-    tokens.push(SpannedToken {
-        token: Token::Eof,
-        span: input.len()..input.len(),
-    });
-
-    Ok(tokens)
-}
-
-fn tokenize_punctuation(
-    chars: &[char],
-    pos: &mut usize,
-    input: &str,
-) -> Result<Option<Token>, AtlantisError> {
-    let c = chars[*pos];
-    *pos += 1;
-
-    let token = match c {
-        '(' => Token::LParen,
-        ')' => Token::RParen,
-        '{' => Token::LBrace,
-        '}' => Token::RBrace,
-        '[' => Token::LBracket,
-        ']' => Token::RBracket,
-        ':' => Token::Colon,
-        ',' => Token::Comma,
-        '.' => Token::Dot,
-        '|' => Token::Pipe,
-        '=' => Token::Equals,
-        '+' => Token::Plus,
-        '*' => Token::Star,
-        '/' => Token::Slash,
-        '%' => Token::Percent,
-        '<' => {
-            if *pos < chars.len() && chars[*pos] == '=' {
-                *pos += 1;
-                Token::LtEq
-            } else if *pos + 1 < chars.len() && chars[*pos] == '-' && chars[*pos + 1] == '>' {
-                *pos += 2;
-                Token::ArrowBoth
-            } else {
-                Token::Lt
+    /// String body after the opening quote.
+    fn string(&mut self, quote: char, start: usize) -> Result<Token, AtlantisError> {
+        let mut out = String::new();
+        loop {
+            let Some(c) = self.bump() else {
+                return Err(self.error(start, "unterminated string literal"));
+            };
+            match c {
+                c if c == quote => return Ok(Token::Str(out)),
+                '\\' => {
+                    let esc_at = self.pos - 1;
+                    let Some(e) = self.bump() else {
+                        return Err(self.error(start, "unterminated string literal"));
+                    };
+                    out.push(match e {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        'b' => '\u{8}',
+                        'f' => '\u{c}',
+                        '0' => '\0',
+                        '\\' | '\'' | '"' => e,
+                        'u' => self.unicode_escape(esc_at)?,
+                        _ => {
+                            return Err(
+                                self.error(esc_at, &format!("invalid escape sequence \\{e}"))
+                            )
+                        }
+                    });
+                }
+                c => out.push(c),
             }
         }
-        '>' => {
-            if *pos < chars.len() && chars[*pos] == '=' {
-                *pos += 1;
-                Token::GtEq
-            } else {
-                Token::Gt
-            }
-        }
-        '-' => {
-            if *pos < chars.len() && chars[*pos] == '>' {
-                *pos += 1;
-                Token::ArrowRight
-            } else {
-                Token::Minus
-            }
-        }
-        '!' => {
-            if *pos < chars.len() && chars[*pos] == '=' {
-                *pos += 1;
-                Token::NotEquals
-            } else {
-                return Err(AtlantisError::Parse(format!("unexpected character: '!' at position {pos}")));
-            }
-        }
-        _ => {
-            return Err(AtlantisError::Parse(format!(
-                "unexpected character: '{c}' at position {}",
-                *pos - 1
-            )))
-        }
-    };
+    }
 
-    let _ = input;
-    Ok(Some(token))
-}
+    /// The four hex digits of `\uXXXX`.
+    fn unicode_escape(&mut self, esc_at: usize) -> Result<char, AtlantisError> {
+        let hex = self
+            .src
+            .get(self.pos..self.pos + 4)
+            .filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()));
+        let ch = hex
+            .and_then(|h| u32::from_str_radix(h, 16).ok())
+            .and_then(char::from_u32);
+        match ch {
+            Some(ch) => {
+                self.pos += 4;
+                Ok(ch)
+            }
+            None => Err(self.error(esc_at, "invalid unicode escape; expected \\uXXXX")),
+        }
+    }
 
-fn keyword_from_str(s: &str) -> Token {
-    match s {
-        "MATCH" => Token::Match,
-        "OPTIONAL" => Token::Optional,
-        "WHERE" => Token::Where,
-        "RETURN" => Token::Return,
-        "CREATE" => Token::Create,
-        "MERGE" => Token::Merge,
-        "DELETE" => Token::Delete,
-        "DETACH" => Token::Detach,
-        "SET" => Token::Set,
-        "REMOVE" => Token::Remove,
-        "WITH" => Token::With,
-        "ORDER" => Token::Order,
-        "BY" => Token::By,
-        "LIMIT" => Token::Limit,
-        "SKIP" => Token::Skip,
-        "AND" => Token::And,
-        "OR" => Token::Or,
-        "NOT" => Token::Not,
-        "XOR" => Token::Xor,
-        "CALL" => Token::Call,
-        "YIELD" => Token::Yield,
-        "DISTINCT" => Token::Distinct,
-        "AS" => Token::As,
-        "ON" => Token::On,
-        "UNION" => Token::Union,
-        "ALL" => Token::All,
-        "UNWIND" => Token::Unwind,
-        "IN" => Token::In,
-        "IS" => Token::Is,
-        "NULL" => Token::Null,
-        "TRUE" => Token::True,
-        "FALSE" => Token::False,
-        "STARTS" => Token::Starts,
-        "ENDS" => Token::Ends,
-        "CONTAINS" => Token::Contains,
-        _ => Token::Identifier(s.to_lowercase()),
+    /// Identifier body after the opening backtick; `` `` `` escapes a backtick.
+    fn quoted_ident(&mut self, start: usize) -> Result<String, AtlantisError> {
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                None => return Err(self.error(start, "unterminated quoted identifier")),
+                Some('`') if self.peek() == Some('`') => {
+                    self.bump();
+                    out.push('`');
+                }
+                Some('`') if out.is_empty() => {
+                    return Err(self.error(start, "empty quoted identifier"))
+                }
+                Some('`') => return Ok(out),
+                Some(c) => out.push(c),
+            }
+        }
+    }
+
+    fn param(&mut self, start: usize) -> Result<Token, AtlantisError> {
+        match self.peek() {
+            Some('`') => {
+                self.bump();
+                self.quoted_ident(start + 1).map(Token::Param)
+            }
+            Some(c) if is_ident_continue(c) => Ok(Token::Param(self.word())),
+            _ => Err(self.error(start, "expected a parameter name after '$'")),
+        }
     }
 }
 
-/// Converts a character index to a byte offset in the original string.
-fn char_span_start(input: &str, char_index: usize) -> usize {
-    input.char_indices().nth(char_index).map(|(b, _)| b).unwrap_or(input.len())
+fn is_ident_start(c: char) -> bool {
+    c == '_' || c.is_alphabetic()
+}
+
+fn is_ident_continue(c: char) -> bool {
+    c == '_' || c.is_alphanumeric()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    fn token_types(tokens: &[SpannedToken]) -> Vec<&Token> {
-        tokens.iter().map(|st| &st.token).collect()
+    fn toks(src: &str) -> Vec<Token> {
+        tokenize(src)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.token)
+            .collect()
+    }
+
+    fn err(src: &str) -> String {
+        tokenize(src).unwrap_err().to_string()
+    }
+
+    fn id(s: &str) -> Token {
+        Token::Ident(s.into())
     }
 
     #[test]
-    fn test_tokenize_simple_match() {
-        let tokens = tokenize("MATCH (n:Person) RETURN n").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::Match));
-        assert!(token_types(&tokens).contains(&&Token::Return));
-        assert!(token_types(&tokens).contains(&&Token::Identifier("n".into())));
+    fn arrows_tokenize() {
+        use Token::*;
+        assert_eq!(
+            toks("(a)-->(b)<--(c)--(d)"),
+            vec![
+                LParen,
+                id("a"),
+                RParen,
+                Minus,
+                Minus,
+                Gt,
+                LParen,
+                id("b"),
+                RParen,
+                Lt,
+                Minus,
+                Minus,
+                LParen,
+                id("c"),
+                RParen,
+                Minus,
+                Minus,
+                LParen,
+                id("d"),
+                RParen,
+                Eof
+            ]
+        );
+        assert_eq!(
+            toks("-[r]->"),
+            vec![Minus, LBracket, id("r"), RBracket, Minus, Gt, Eof]
+        );
+        assert_eq!(
+            toks("<-[]-"),
+            vec![Lt, Minus, LBracket, RBracket, Minus, Eof]
+        );
     }
 
     #[test]
-    fn test_tokenize_keywords_case_insensitive() {
-        let tokens = tokenize("match RETURN where").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::Match));
-        assert!(token_types(&tokens).contains(&&Token::Return));
-        assert!(token_types(&tokens).contains(&&Token::Where));
+    fn operators() {
+        use Token::*;
+        assert_eq!(
+            toks("= =~ <> != < <= > >= + += - * / % ^ . .. : ; | , ( ) [ ] { }"),
+            vec![
+                Eq, RegexMatch, NotEq, NotEq, Lt, LtEq, Gt, GtEq, Plus, PlusEq, Minus, Star, Slash,
+                Percent, Caret, Dot, DotDot, Colon, Semicolon, Pipe, Comma, LParen, RParen,
+                LBracket, RBracket, LBrace, RBrace, Eof
+            ]
+        );
     }
 
     #[test]
-    fn test_tokenize_numbers() {
-        let tokens = tokenize("42 3.14 -5").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::Integer(42)));
-        assert!(token_types(&tokens).contains(&&Token::Float(3.14)));
+    fn numbers() {
+        use Token::*;
+        assert_eq!(
+            toks("42 3.5 1e3 2.5E-2 .5 7e+1"),
+            vec![
+                Integer(42),
+                Float(3.5),
+                Float(1000.0),
+                Float(0.025),
+                Float(0.5),
+                Float(70.0),
+                Eof
+            ]
+        );
+        assert_eq!(
+            toks("*1..3"),
+            vec![Star, Integer(1), DotDot, Integer(3), Eof]
+        );
+        assert_eq!(toks("*..3"), vec![Star, DotDot, Integer(3), Eof]);
+        assert_eq!(
+            toks("[2..]"),
+            vec![LBracket, Integer(2), DotDot, RBracket, Eof]
+        );
+        assert_eq!(toks("9223372036854775808"), vec![Integer(1 << 63), Eof]);
     }
 
     #[test]
-    fn test_tokenize_strings() {
-        let tokens = tokenize("'hello' \"world\"").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::String("hello".into())));
-        assert!(token_types(&tokens).contains(&&Token::String("world".into())));
+    fn number_errors() {
+        assert!(err("9223372036854775809").contains("integer literal out of range"));
+        assert!(err("99999999999999999999999").contains("out of range"));
+        assert!(err("1e999").contains("float literal out of range"));
+        assert!(err("12abc").contains("invalid number literal"));
     }
 
     #[test]
-    fn test_tokenize_parameters() {
-        let tokens = tokenize("$name $age").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::Parameter("name".into())));
-        assert!(token_types(&tokens).contains(&&Token::Parameter("age".into())));
+    fn strings_and_escapes() {
+        assert_eq!(
+            toks(r#"'a\nb' "q\"x" 'it\'s' '\\' 'é\t'"#),
+            vec![
+                Token::Str("a\nb".into()),
+                Token::Str("q\"x".into()),
+                Token::Str("it's".into()),
+                Token::Str("\\".into()),
+                Token::Str("\u{e9}\t".into()),
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            toks(r#"'say "hi"'"#),
+            vec![Token::Str("say \"hi\"".into()), Token::Eof]
+        );
     }
 
     #[test]
-    fn test_tokenize_arrows() {
-        let tokens = tokenize("--> <-- <-->").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::ArrowRight));
-        assert!(token_types(&tokens).contains(&&Token::ArrowLeft));
-        assert!(token_types(&tokens).contains(&&Token::ArrowBoth));
+    fn string_errors() {
+        let e = err("RETURN 'abc");
+        assert!(
+            e.contains("1:8") && e.contains("unterminated string"),
+            "{e}"
+        );
+        assert!(err(r"'\q'").contains("invalid escape"));
+        assert!(err(r"'\u12'").contains("invalid unicode escape"));
+        assert!(err(r"'\uD800'").contains("invalid unicode escape"));
     }
 
     #[test]
-    fn test_tokenize_comments() {
-        let tokens = tokenize("// this is a comment\nMATCH (n)").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::Match));
+    fn identifiers_params_and_comments() {
+        use Token::*;
+        assert_eq!(
+            toks("MATCH `weird name` $p $`odd p` $0 // c\n n /* block\n */ x_1"),
+            vec![
+                id("MATCH"),
+                QuotedIdent("weird name".into()),
+                Param("p".into()),
+                Param("odd p".into()),
+                Param("0".into()),
+                id("n"),
+                id("x_1"),
+                Eof
+            ]
+        );
+        assert_eq!(toks("`a``b`"), vec![QuotedIdent("a`b".into()), Eof]);
     }
 
     #[test]
-    fn test_tokenize_block_comments() {
-        let tokens = tokenize("/* block comment */MATCH (n)").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::Match));
+    fn lexical_errors_report_position() {
+        let e = err("MATCH (n)\nRETURN n # x");
+        assert!(e.contains("2:10") && e.contains("'#'"), "{e}");
+        assert!(err("/* open").contains("unterminated block comment"));
+        assert!(err("`open").contains("unterminated quoted identifier"));
+        assert!(err("$ x").contains("parameter name"));
+        assert!(err("a ! b").contains("'!'"));
     }
 
     #[test]
-    fn test_unterminated_string() {
-        let result = tokenize("'unterminated");
-        assert!(matches!(result, Err(AtlantisError::Parse(_))));
+    fn spans_cover_source() {
+        let t = tokenize("RETURN  n.name").unwrap();
+        assert_eq!(t[0].span, 0..6);
+        assert_eq!(t[1].span, 8..9);
+        assert_eq!(t[3].span, 10..14);
+        assert_eq!(t[4].span, 14..14);
     }
 
-    #[test]
-    fn test_tokenize_punctuation() {
-        let tokens = tokenize("(){}[]:,.=<>!=+-*/%").unwrap();
-        assert!(token_types(&tokens).contains(&&Token::LParen));
-        assert!(token_types(&tokens).contains(&&Token::RParen));
-        assert!(token_types(&tokens).contains(&&Token::LBrace));
-        assert!(token_types(&tokens).contains(&&Token::RBrace));
-    }
+    proptest! {
+        #[test]
+        fn integer_round_trip(n in 0u64..=(1u64 << 63)) {
+            prop_assert_eq!(toks(&n.to_string()), vec![Token::Integer(n), Token::Eof]);
+        }
 
-    #[test]
-    fn test_tokenize_full_query() {
-        let query = "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = 'Alice' RETURN b.name";
-        let tokens = tokenize(query).unwrap();
-        assert!(tokens.len() > 10);
-        assert_eq!(tokens.last().unwrap().token, Token::Eof);
+        #[test]
+        fn string_round_trip(s in any::<String>()) {
+            let mut quoted = String::from("'");
+            for c in s.chars() {
+                match c {
+                    '\'' => quoted.push_str("\\'"),
+                    '\\' => quoted.push_str("\\\\"),
+                    '\n' => quoted.push_str("\\n"),
+                    c => quoted.push(c),
+                }
+            }
+            quoted.push('\'');
+            prop_assert_eq!(toks(&quoted), vec![Token::Str(s), Token::Eof]);
+        }
     }
 }
