@@ -13,7 +13,10 @@ pub mod rel_type;
 pub mod relationship;
 pub mod value;
 
-pub use config::{DistanceMetricKind, EngineConfig, HnswParams, StorageConfig, VectorConfig};
+pub use config::{
+    DistanceMetricKind, EngineConfig, EngineConfigBuilder, EvictionPolicy, HnswParams,
+    StorageConfig, VectorConfig,
+};
 pub use error::AtlantisError;
 pub use label::{Label, LabelSet};
 pub use node::{Node, NodeId};

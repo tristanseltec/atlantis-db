@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::AtlantisError;
+
 /// The distance metric used by the HNSW vector index.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
 pub enum DistanceMetricKind {

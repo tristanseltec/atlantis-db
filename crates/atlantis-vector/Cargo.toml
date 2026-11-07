@@ -16,4 +16,5 @@ tracing = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+bincode = { workspace = true }
 proptest = { workspace = true }

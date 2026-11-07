@@ -33,7 +33,7 @@ impl ResultSet {
     }
 
     /// Returns an iterator over the rows.
-    pub fn rows(&self) -> impl Iterator<Item = &Row> {
+    pub fn rows(&self) -> impl Iterator<Item = Row<'_>> {
         self.rows.iter().map(|vals| Row {
             columns: &self.columns,
             values: vals,

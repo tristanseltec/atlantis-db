@@ -117,6 +117,7 @@ name = "atlantis-vector"
 version = "0.1.0"
 dependencies = [
  "atlantis-core",
+ "bincode",
  "proptest",
  "rand 0.8.8",
  "serde",

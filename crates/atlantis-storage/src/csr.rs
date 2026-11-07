@@ -263,7 +263,7 @@ mod tests {
             (NodeId(1), NodeId(2), EdgeId(2)),
         ];
         let csr = CsrAdjacency::build(&edges);
-        let collected: Vec<_> = csr.iter_edges().collect();
+        let collected: Vec<_> = csr.iter_edges();
         assert_eq!(collected.len(), 3);
         assert!(collected.contains(&(NodeId(0), NodeId(1), EdgeId(0))));
         assert!(collected.contains(&(NodeId(0), NodeId(2), EdgeId(1))));

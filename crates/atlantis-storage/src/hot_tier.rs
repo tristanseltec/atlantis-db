@@ -488,7 +488,7 @@ mod tests {
         let mut tier = HotTier::new(1000);
         let id = tier.insert_node(LabelSet::new(), PropertyMap::new());
 
-        tier.set_property(id, "score", 42i64);
+        tier.set_property(id, "score", Value::from(42i64));
         assert_eq!(tier.get_node(id).unwrap().get_property("score"), Some(&Value::Integer(42)));
 
         tier.remove_property(id, "score");

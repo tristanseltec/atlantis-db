@@ -11,7 +11,7 @@ pub mod executor;
 pub mod handle;
 pub mod tiering_actor;
 
-pub use actor::CoreEngineActor;
+pub use actor::{spawn_engine, CoreEngineActor};
 pub use command::Command;
 pub use executor::{QueryExecutor, Row};
 pub use handle::EngineHandle;
