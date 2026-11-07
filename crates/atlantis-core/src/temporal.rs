@@ -264,7 +264,7 @@ impl Duration {
                 &[('H', UNITS[2].1), ('M', UNITS[3].1), ('S', UNITS[4].1)],
             )?;
         }
-        (body.len() > 0).then_some(total)
+        (!body.is_empty()).then_some(total)
     }
 }
 

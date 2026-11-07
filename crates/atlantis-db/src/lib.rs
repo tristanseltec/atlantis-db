@@ -1,40 +1,42 @@
-//! Atlantis DB — embedded graph + vector database for AI applications.
+//! Atlantis DB — an embedded multi-model database for AI applications.
 //!
-//! A high-performance embedded database engine that unifies graph traversal
-//! and vector similarity search into a single query layer with a
-//! Cypher-compatible query language.
-//!
-//! # Quick Start
+//! Data lives in a **namespace → database → table → record** hierarchy.
+//! A record is a nested document identified by a [`RecordId`]
+//! (`table:key`). Graph nodes are records whose table is their first label,
+//! and relationships are [`Edge`] records stored in edge tables. Records are
+//! read and written in ACID transactions:
 //!
 //! ```no_run
-//! use atlantis_db::{Engine, Value};
+//! use atlantis_db::{Engine, Object, Value};
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn example() -> Result<(), atlantis_db::Error> {
 //! let engine = Engine::open("./my_db").await?;
-//!
-//! engine.execute(
-//!     "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
-//!     &[],
-//! ).await?;
-//!
-//! let result = engine.execute(
-//!     "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.name = $name RETURN b.name AS friend",
-//!     &[("name", Value::String("Alice".into()))],
-//! ).await?;
-//!
-//! for row in result.rows() {
-//!     println!("Friend: {}", row.get_string("friend").unwrap_or(""));
-//! }
+//! let order = engine.transaction(|tx| {
+//!     let mut doc = Object::new();
+//!     doc.insert("total".into(), Value::Float(99.5));
+//!     tx.create("Order", None, vec![], doc) // key: a generated ULID
+//! }).await?;
+//! println!("created {}", order.id);
+//! engine.checkpoint().await?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! The original Cypher graph engine is still available through
+//! [`Engine::execute`]; it runs on its own graph store until the query
+//! engine moves onto the record store.
 
 pub mod config;
 pub mod engine;
 pub mod params;
 pub mod result_set;
 
-pub use atlantis_core::Value;
+pub use atlantis_core::{
+    AtlantisError, DatabaseRef, Datetime, Direction, Duration, Edge, Error, Geometry, Object,
+    Point, Record, RecordId, RecordKey, Ulid, Uuid, Value,
+};
+pub use atlantis_kv::{Isolation, Versionstamp};
+pub use atlantis_storage::{RecordTx, TableDef, TableKind};
 pub use config::Config;
 pub use engine::Engine;
 pub use params::Params;

@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 atlantis-core = { workspace = true }
 atlantis-engine = { workspace = true }
+atlantis-kv = { workspace = true }
+atlantis-storage = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 
