@@ -1,54 +1,41 @@
 # 23 — Query Cookbook
 
-> **Status:** Partially implemented — a small graph + vector subset works today; most recipes are Planned — Phases 0–5
+> **Status:** Partially implemented — graph, document, link, aggregation, vector and transaction recipes work today; schema, search, key-value, time-series, reactive and security recipes are Planned — Phases 2–5
 > **Crates:** `atlantis-cypher`, `atlantis-engine`, `atlantis-db`
 
 Short, copyable Atlantis Cypher recipes grouped by data model. Each recipe carries a
 status:
 
-- **Works** — produced the expected result when run against the current executor.
+- **Works** — produced the expected result when run through `Engine::execute`.
 - **Phase N** — the syntax is the canonical target. It parses or runs correctly only
   after that phase.
+
+The integration tests in `crates/atlantis-db/tests/cypher.rs` are the authoritative list
+of working behaviour.
 
 The grammar for each construct is owned by its chapter. This cookbook links to it
 instead of repeating it.
 
-## Implemented today
-
-The "Works" results below come from running each query through
-`atlantis_engine::QueryExecutor` on an in-memory `GraphStore`. The workspace needs the
-Phase 0 build fixes first (see [21 — API Reference](21-api-reference.md#known-build-defects-phase-0)),
-so these recipes cannot yet run through `Engine::execute`.
-
-### Recipes that work
+## Basics (Works)
 
 ```cypher
-// Create one node (literal or parameter properties). RETURN n gives its integer id.
-CREATE (n:Person {name: 'Alice', age: 30}) RETURN n
-CREATE (n:Person {name: $name, age: $age}) RETURN n
+// Create nodes. `id` sets the record key (Person:alice); RETURN n gives the document.
+CREATE (n:Person {id: 'alice', name: 'Alice', age: 30}) RETURN n
+CREATE (n:Person {name: $name, age: $age}) RETURN n.id AS id
 
-// Scan all nodes, or nodes with a label.
-MATCH (n) RETURN n
-MATCH (n:Person) RETURN n.name, n.age
-
-// Filter with =, <, >, <=, >=, AND, OR, NOT. (`<>` does not parse yet; `!=` does.)
-MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name, n.age
-MATCH (n:Person) WHERE n.age >= 18 AND n.age <= 35 RETURN n.name AS name ORDER BY name DESC
-MATCH (n:Person) WHERE n.name = $name AND n.age > $minAge RETURN n.name
-
-// Order, skip, limit. ORDER BY must name a returned alias. SKIP must come before
-// LIMIT; both take an integer literal or parameter.
+// Scan, filter, page.
+MATCH (n:Person) WHERE n.age >= 18 AND n.name <> 'Bob' RETURN n.name AS name ORDER BY name DESC
 MATCH (n:Person) RETURN n.name AS name ORDER BY name SKIP 20 LIMIT $pageSize
 
-// WITH projection and a trailing WHERE.
-MATCH (n:Person) WITH n.name AS name RETURN name
-MATCH (n:Person) WITH n WHERE n.age > 26 RETURN n.name
+// Leading UNWIND / RETURN, list comprehension, CASE.
+UNWIND [1, 2, 3] AS x RETURN x, CASE WHEN x % 2 = 0 THEN 'even' ELSE 'odd' END AS kind
+RETURN [x IN range(1, 10) WHERE x % 3 = 0 | x * x] AS squares
 
-// Arithmetic on matching types and string concatenation.
-MATCH (n:Person) RETURN n.age + 1 AS nextAge, n.name + '!' AS shout
+// Several statements; each commits on its own.
+CREATE (:Tag {name: 'a'}); CREATE (:Tag {name: 'b'});
 
-// Delete filtered nodes. The node is tombstoned, not physically removed.
-MATCH (n:Person) WHERE n.name = 'Alice' DELETE n
+// Introspection.
+CALL db.labels() YIELD label RETURN label
 ```
 
 ```rust
@@ -58,66 +45,25 @@ let rows = engine.execute(
 ).await?;
 ```
 
-### Vector search (does not work today)
+Not implemented and not scheduled yet: map projections (`n {.name}`), `EXISTS { }` and
+`CALL { }` subqueries, `FOREACH`, `LOAD CSV`
+([06 — Query Language](06-query-language.md)).
 
-```cypher
-CALL db.vector.search('Embedding', $queryVec, 10) YIELD node, score RETURN node, score
-CALL db.vector.search('Embedding', $queryVec, 10, 0.7) YIELD node, score RETURN node, score
-```
-
-The procedure parses and runs, but returns no rows through the engine:
-
-- The first argument is a label, and the executor ignores it. There is one global HNSW
-  index. From Phase 3 the first argument is a vector index name
-  ([10 — Vector Index](10-vector-index.md)).
-- The engine never populates the HNSW index. Creating a node with a `Vector` property
-  does not index it, so the search always returns no rows. Phase 0 wires indexing.
-- `k` and the optional threshold must be literals. `$k` raises `InvalidQuery`.
-  `score` is `1 - distance`, and the first `YIELD` column holds an internal integer id,
-  not a node.
-
-### Recipes that do not work yet
-
-| Recipe | Today | Fixed in |
-|---|---|---|
-| `CALL db.vector.search(...)` and every vector + graph recipe | Returns no rows: the HNSW index is never populated. | Phase 0 |
-| `CREATE (a)-[:KNOWS]->(b)` | Creates both nodes, drops the relationship, and returns only the last node. | Phase 0 |
-| `MATCH (a)-[:KNOWS]->(b) RETURN a.name, b.name` | Multi-hop binding is broken: returns every `b` with `a` unbound. | Phase 0 |
-| `MATCH (a)<-[:KNOWS]-(b)`, `(a)--(b)`, `(a)-[]-(b)` | Parse errors. `Expand` also follows outgoing edges only, and an untyped relationship returns no rows. | Phase 0 |
-| `MATCH (a:A) MATCH (b:B)` | Only the last scan's rows are kept. | Phase 0 |
-| `MATCH (n:Person {name: 'Alice'})` | The inline property map is ignored, so every `:Person` matches. Never combine it with `DELETE` today. Use `WHERE`. | Phase 0 |
-| `MATCH ... SET n.age = 31` | Parse error (`expected Equals`), and the planner would build `SetProperty` on an empty input, so nothing is updated. | Phase 0 |
-| `CREATE (a:X), (b:Y)` | Parse error on the comma. Use two statements. | Phase 0 |
-| `UNWIND [1, 2, 3] AS x RETURN x`, `RETURN 1` | Returns no rows when `UNWIND` or `RETURN` is the first clause. | Phase 0 |
-| `MATCH ... CREATE ...` | `CREATE` ignores the matched rows. | Phase 0 |
-| `DETACH DELETE n` | Deletes the node and leaves its edges. | Phase 0 |
-| `-[:KNOWS*1..3]->` | Parse error (`invalid float: 1..3`). | Phase 0 |
-| `MERGE`, `REMOVE` | Not executed: rejected by the parser today and ignored by the planner. | Phase 0 |
-| `count()`, `collect()`, `id()` and other functions | Evaluate to `null`. | Phase 0 |
-| `RETURN DISTINCT`, `WITH ... ORDER BY / LIMIT` | Parsed, then ignored. | Phase 0 |
-| `ORDER BY n.name` when only an alias is returned, `ORDER BY ... ASC`, `LIMIT` before `SKIP`, `CASE`, `n.a.b` | Everything the `RETURN` parser does not recognise is silently dropped, and `ORDER BY` only resolves returned aliases. | Phase 0 |
-| `OPTIONAL MATCH` | Behaves as `MATCH`, with no null row. | Phase 0 |
-| `... UNION ...` | Everything after the first `RETURN` is ignored. | Phase 0 |
-| `<>`, `IN`, `IS NULL`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `XOR`, `count(*)` | Parse error. | Phase 0 |
-| `%` | Evaluates to `null`. | Phase 0 |
-| Map literal `{a: 1}` in an expression | Evaluates to `null`. | Phase 2 (`Object`) |
-| `db.vector.similarity(a, b)` in `WHERE` | Parse error: dotted function names only parse after `CALL`. | Phase 0 |
-
-## Graph (Phase 0 for core; Phase 3 for paths and algorithms)
+## Graph (Works; shortest paths and algorithms Phase 3)
 
 Grammar: [09 — Graph Model](09-graph-model.md).
 
 ```cypher
-// Create a relationship between existing nodes.            Phase 0
+// Create a relationship between existing nodes.            Works
 MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
 CREATE (a)-[:KNOWS {since: 2020}]->(b)
 
-// Upsert.                                                   Phase 0
+// Upsert.                                                   Works
 MERGE (p:Person {email: $email})
   ON CREATE SET p.created = time.now()
   ON MATCH SET p.seen = time.now()
 
-// Friends of friends, 1–3 hops, deduplicated.               Phase 0
+// Friends of friends, 1–3 hops, deduplicated.               Works
 MATCH (me:Person {name: $name})-[:KNOWS*1..3]->(f:Person)
 WHERE f <> me
 RETURN DISTINCT f.name
@@ -126,16 +72,19 @@ RETURN DISTINCT f.name
 MATCH p = shortestPath((a:Person {name: 'Alice'})-[:KNOWS*]-(b:Person {name: 'Eve'}))
 RETURN length(p), [n IN nodes(p) | n.name] AS hops
 
-// Degree with aggregation.                                  Phase 0
+// Degree with aggregation.                                  Works
 MATCH (p:Person)-[:KNOWS]->(f)
 RETURN p.name, count(f) AS degree ORDER BY degree DESC LIMIT 10
+
+// Remove a node and its relationships.                      Works
+MATCH (p:Person {name: $name}) DETACH DELETE p
 
 // Graph algorithms.                                         Phase 3
 CALL algo.pagerank({label: 'Page', relationship: 'LINKS'}) YIELD node, score
 RETURN node.url, score ORDER BY score DESC LIMIT 20
 ```
 
-## Document (Phase 2)
+## Document (Works)
 
 Grammar: [08 — Document and Relational](08-document-relational.md).
 
@@ -153,9 +102,10 @@ MATCH (p:Person) WHERE 'vip' IN p.tags RETURN p.name
 MATCH (p:Person) WHERE id(p) = rid('Person', 'an') RETURN p
 ```
 
-## Relational: links, joins and aggregation (Phase 2)
+## Relational: links, joins and aggregation (queries work; schema Phase 2)
 
-Schema first ([07 — Schema and DDL](07-schema-ddl.md)):
+Schema first ([07 — Schema and DDL](07-schema-ddl.md)), Phase 2. The queries below
+already work on schemaless tables, with `rid('Customer', 'c1')` stored as the link:
 
 ```cypher
 CREATE TABLE Customer SCHEMAFULL;
@@ -179,7 +129,7 @@ ORDER BY revenue DESC LIMIT 10
 MATCH (o:Order), (c:Customer) WHERE o.customerEmail = c.email
 RETURN c.name, collect(o.total) AS totals
 
-// Unique constraint.
+// Unique constraint.                                       Phase 2
 CREATE CONSTRAINT customer_email_unique FOR (c:Customer) REQUIRE c.email IS UNIQUE;
 ```
 
@@ -196,7 +146,7 @@ CALL db.text.search('doc_text', 'graph database', 10) YIELD node, score
 RETURN node.title, text.highlight(node.body, 'graph database') AS snippet, score
 ```
 
-## Vector and hybrid search (Phase 3)
+## Vector and hybrid search (vector works; hybrid Phase 3)
 
 Grammar: [10 — Vector Index](10-vector-index.md), [11 — Full-Text Search](11-full-text-search.md).
 
@@ -204,32 +154,32 @@ Grammar: [10 — Vector Index](10-vector-index.md), [11 — Full-Text Search](11
 CREATE VECTOR INDEX chunk_embedding FOR (c:Chunk) ON (c.embedding)
   OPTIONS {dimension: 1536, metric: 'cosine', m: 16, efConstruction: 200};
 
-// Vector search, then filter and traverse.
+// Vector search, then filter and traverse.                 Works
 CALL db.vector.search('chunk_embedding', $vec, 20) YIELD node, score
 WHERE node.lang = 'en'
 MATCH (node)<-[:HAS_CHUNK]-(d:Doc)
 RETURN d.title, node.text, score ORDER BY score DESC LIMIT 5
 
-// Hybrid text + vector with reciprocal rank fusion.
+// Hybrid text + vector with reciprocal rank fusion.        Phase 3
 CALL db.search.hybrid({text: 'doc_text', vector: 'chunk_embedding'},
                       'graph database', $vec, 10) YIELD node, score
 RETURN node.title, score
 ```
 
-## Geospatial (Phase 3)
+## Geospatial (distance works; index and predicates Phase 3)
 
 Grammar: [12 — Geospatial](12-geospatial.md).
 
 ```cypher
-CREATE POINT INDEX place_location FOR (p:Place) ON (p.location);
+CREATE POINT INDEX place_location FOR (p:Place) ON (p.location);    // Phase 3
 CREATE (:Place {name: 'Imperial City', location: point({longitude: 107.578, latitude: 16.469})})
 
-// Places within 2 km, nearest first.
+// Places within 2 km, nearest first. Works today as a scan.
 WITH point({longitude: 107.59, latitude: 16.46}) AS here
 MATCH (p:Place) WHERE point.distance(p.location, here) < 2000
 RETURN p.name, point.distance(p.location, here) AS metres ORDER BY metres
 
-// Inside a polygon.
+// Inside a polygon.                                         Phase 3
 MATCH (p:Place) WHERE geo.within(p.location, geo.polygon($ring)) RETURN p.name
 ```
 
@@ -279,7 +229,7 @@ CREATE EVENT order_shipped ON Order
   THEN { CREATE (:Notification {order: $after.id, at: time.now()}) };
 ```
 
-## Transactions (Phase 1)
+## Transactions (Works)
 
 Semantics: [05 — Transactions and Consistency](05-transactions-consistency.md).
 
@@ -291,13 +241,16 @@ COMMIT;
 ```
 
 ```rust
-// Synchronous closure (implemented today); tx.execute for Cypher is Phase 2.
+let p = [("from", Value::from("a")), ("to", Value::from("b")), ("amount", Value::from(100))];
 engine.transaction(|tx| {
     tx.execute("MATCH (a:Account {id: $from}) SET a.balance = a.balance - $amount", &p)?;
     tx.execute("MATCH (a:Account {id: $to}) SET a.balance = a.balance + $amount", &p)?;
     Ok(())
 }).await?;   // Err(TxConflict) may be retried
 ```
+
+A failed statement inside the closure rolls the whole transaction back, even if the
+closure handles the error.
 
 ## Tenancy and permissions (Phase 2 for tenancy; Phase 5 for security)
 
@@ -321,8 +274,7 @@ MATCH (p:Post) RETURN p.title
 ## Design Decisions
 
 - **Status per recipe, not per chapter.** A reader can tell at a glance which line runs
-  today. Each "Works" claim was produced by running the query against the current
-  executor.
+  today. Each "Works" claim was produced by running the query through the engine.
 - **Canonical syntax only.** Planned recipes use the forms other chapters define, so
   copying a recipe never teaches a second dialect.
 

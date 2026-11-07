@@ -1,6 +1,6 @@
 # 22 — Configuration
 
-> **Status:** Partially implemented — embedded `EngineConfig` exists; storage backend, transaction, server, auth and cluster settings are Planned — Phases 1–7
+> **Status:** Partially implemented — embedded `EngineConfig` (directory, sync mode, checkpoint interval, vector defaults) exists; storage backend URL, transaction, server, auth and cluster settings are Planned — Phases 1–7
 > **Crates:** `atlantis-core`, `atlantis-db`, `atlantis-kv`, `atlantis-server` (planned), `atlantis-auth` (planned)
 
 This chapter lists every configuration setting. "Implemented today" covers the
@@ -27,16 +27,18 @@ pub struct EngineConfig {
 }
 ```
 
-| Field | Default | Used at runtime? |
+| Field | Default | Effect |
 |---|---|---|
-| `storage.memory_budget_bytes` | `Some(1 GiB)` | No (see below) |
-| `storage.eviction_policy` | `Lru` | No |
-| `storage.disk_path` | `None` (`Engine::open(path)` sets it) | Yes |
-| `storage.compaction_threshold` | `1000` | No |
-| `vector.dimensions` | `128` | Yes |
-| `vector.distance_metric` | `Cosine` | Yes |
-| `vector.hnsw` | see [HnswParams](#hnswparams) | Yes |
-| `checkpoint_interval_secs` | `300` | No |
+| `storage.disk_path` | `None` (`Engine::open(path)` sets it) | Database directory; `None` is in-memory only |
+| `storage.sync` | `SyncMode::Every` | When commits are forced to disk |
+| `vector.dimensions` | `128` | Default `dimension` of a vector index |
+| `vector.distance_metric` | `Cosine` | Default `metric` of a vector index |
+| `vector.hnsw` | see [HnswParams](#hnswparams) | Default HNSW parameters of a vector index |
+| `checkpoint_interval_secs` | `300` | Period of automatic checkpoints; `0` disables them |
+
+Every field is used at runtime. The settings `memory_budget_bytes`, `eviction_policy`
+and `compaction_threshold`, and their builder methods, were removed with the legacy
+graph store.
 
 ### Builder
 
@@ -44,11 +46,11 @@ pub struct EngineConfig {
 and returns `Result<EngineConfig, AtlantisError>`.
 
 ```rust
-use atlantis_core::{DistanceMetricKind, EngineConfig, HnswParams};
+use atlantis_core::{DistanceMetricKind, EngineConfig, HnswParams, SyncMode};
 
 let config = EngineConfig::builder()
-    .memory_budget(512 * 1024 * 1024)
     .disk_path("./my_db")
+    .sync_mode(SyncMode::Every)
     .vector_dimensions(384)
     .distance_metric(DistanceMetricKind::Cosine)
     .hnsw_params(HnswParams { m: 24, m0: 48, ef_construction: 300, ef_search: 100, max_level: 16 })
@@ -58,18 +60,13 @@ let config = EngineConfig::builder()
 
 | Method | Parameter | Sets |
 |---|---|---|
-| `memory_budget(bytes)` | `usize` | `storage.memory_budget_bytes = Some(bytes)` |
 | `disk_path(path)` | `impl Into<PathBuf>` | `storage.disk_path` |
-| `eviction_policy(policy)` | `EvictionPolicy` | `storage.eviction_policy` |
-| `compaction_threshold(n)` | `usize` | `storage.compaction_threshold` |
+| `sync_mode(sync)` | `SyncMode` | `storage.sync` |
 | `vector_dimensions(dims)` | `usize` | `vector.dimensions` |
 | `distance_metric(metric)` | `DistanceMetricKind` | `vector.distance_metric` |
 | `hnsw_params(params)` | `HnswParams` | `vector.hnsw` |
 | `checkpoint_interval(secs)` | `u64` | `checkpoint_interval_secs` |
 | `build()` | — | Validates, then returns the config |
-
-The builder cannot set `memory_budget_bytes = None`. Set the struct field directly when
-you need that.
 
 `Config::builder()` resolves to `EngineConfig::builder()`, because `Config` is a type
 alias.
@@ -78,8 +75,6 @@ alias.
 
 `EngineConfig::validate()` returns `AtlantisError::Config` when any rule fails:
 
-- `memory_budget_bytes`, if set, is greater than 0.
-- `compaction_threshold` is greater than 0.
 - `vector.dimensions` is greater than 0.
 - `m`, `m0`, `ef_construction`, `ef_search` and `max_level` are each greater than 0.
 - `m0 >= m`.
@@ -88,23 +83,23 @@ alias.
 
 ```rust
 pub struct StorageConfig {
-    pub memory_budget_bytes: Option<usize>,
-    pub eviction_policy: EvictionPolicy,   // Lru (default) | Lfu
     pub disk_path: Option<PathBuf>,
-    pub compaction_threshold: usize,
+    pub sync: SyncMode,                    // Every (default) | Never
 }
 ```
 
-- **`memory_budget_bytes`**: the intended hot-tier ceiling before eviction to the cold
-  tier. `None` means unbounded.
-- **`eviction_policy`**: `Lru` is the only policy with an implementation (`LruTracker`).
-  `Lfu` is declared only.
-- **`disk_path`**: the directory for `cold_tier.db` and `checkpoint.db` (Cypher graph
-  store), `records.kv` (record store checkpoint) and the `LOCK` file that keeps a second
-  engine from opening the same directory. `None` means in-memory only, and
-  `checkpoint()` returns `AtlantisError::Storage`.
-- **`compaction_threshold`**: the number of delta edges per relationship type that
-  triggers a merge into the CSR. See [04 — Storage Engine](04-storage-engine.md).
+- **`disk_path`**: the directory holding `records.kv` (checkpoint), `records.wal` (and,
+  during a checkpoint, `records.wal.old`) and the `LOCK` file that keeps a second engine
+  from opening the same directory. `None` means in-memory only; `checkpoint()` is then a
+  no-op. See [04 — Storage Engine](04-storage-engine.md).
+- **`sync`**: `SyncMode::Every` fsyncs the write-ahead log before each commit returns;
+  `SyncMode::Never` leaves flushing to the OS, so a machine crash (not a process crash)
+  can lose recent commits. A missing `sync` in serialized config deserializes as
+  `Every`. See [05 — Transactions & Consistency](05-transactions-consistency.md).
+
+`checkpoint_interval_secs` sets how often a background thread folds the log into
+`records.kv`. Checkpoints bound the log size and recovery time; durability does not
+depend on them.
 
 ### VectorConfig
 
@@ -116,10 +111,11 @@ pub struct VectorConfig {
 }
 ```
 
-The engine builds one HNSW index from this config. Every vector in it must have
-`dimensions` elements, or the index returns `DimensionMismatch`. Match the value to your
-embedding model, for example 384 for all-MiniLM-L6-v2 or 1536 for
-text-embedding-3-small. Metric details are in [10 — Vector Index](10-vector-index.md).
+These are the defaults for `CREATE VECTOR INDEX` options that a statement leaves out
+(`dimension`, `metric`, `m`, `efConstruction`); `ef_search` is the default search pool.
+Set `dimensions` to your embedding model, for example 384 for all-MiniLM-L6-v2 or 1536
+for text-embedding-3-small, or give `dimension` per index. Metric details are in
+[10 — Vector Index](10-vector-index.md).
 
 ### HnswParams
 
@@ -128,7 +124,7 @@ text-embedding-3-small. Metric details are in [10 — Vector Index](10-vector-in
 | `m` | `16` | Links per node on layers above 0. Higher improves recall and costs memory. |
 | `m0` | `32` | Maximum links on layer 0. Conventionally `2 * m`, and must be `>= m`. |
 | `ef_construction` | `200` | Candidate pool during insert. Higher gives a better graph and slower ingest. |
-| `ef_search` | `50` | Default candidate pool during search. `SearchParams::with_ef_search` overrides it per call in the Rust API. |
+| `ef_search` | `50` | Default candidate pool during search. `db.vector.search(..., {efSearch: n})` overrides it per call. |
 | `max_level` | `16` | Hard cap on layers. Rarely changed. |
 
 ### Tuning presets
@@ -138,16 +134,6 @@ text-embedding-3-small. Metric details are in [10 — Vector Index](10-vector-in
 | High recall (RAG) | 32 / 64 | 400 | 200 |
 | Fast ingestion | 12 / 24 | 100 | 50 |
 | Low memory | 8 / 16 | 100 | 50 |
-
-### What is not wired yet
-
-These settings are stored and validated, but no runtime code reads them:
-
-| Setting | Why it has no effect | Fixed in |
-|---|---|---|
-| `memory_budget_bytes`, `eviction_policy`, `compaction_threshold` | The engine actor opens storage with `GraphStore::open(path)` or `GraphStore::new_in_memory()`, and both use `StorageConfig::default()`. Nothing calls `GraphStore::maybe_evict`. | Phase 0 |
-| `checkpoint_interval_secs` | The checkpoint actor is an empty loop and is never spawned. Checkpoints happen on `engine.checkpoint()` and on shutdown only. | Phase 0 |
-| `EvictionPolicy::Lfu` | No LFU tracker exists. | Phase 1 (replaced by cache settings) |
 
 ## Target design
 
@@ -230,25 +216,26 @@ level = "info"
 audit = "/var/log/atlantis/audit.log"
 ```
 
-### Storage (Planned — Phase 1, `tikv` in Phase 7)
+### Storage (Partially implemented — `sync` modes `every`/`never`; the rest Phase 1, `tikv` in Phase 7)
 
 | Key | Env var | Default | Meaning |
 |---|---|---|---|
 | `storage.url` | `ATLANTIS_STORAGE_URL` | `mem://` | Selects the `atlantis-kv` backend. `mem` needs feature `kv-mem`, `rocksdb` needs `kv-rocksdb`, `tikv` needs `kv-tikv`. The positional `<url>` of `atlantis start` sets it. |
-| `storage.sync` | `ATLANTIS_STORAGE_SYNC` | `every` | `every` fsyncs the WAL on each commit. `interval` fsyncs every `sync_interval`, so a crash can lose that window. `never` leaves fsync to the OS. Ignored by `mem`. |
+| `storage.sync` | `ATLANTIS_STORAGE_SYNC` | `every` | `every` fsyncs the WAL on each commit. `interval` fsyncs every `sync_interval`, so a crash can lose that window. `never` leaves fsync to the OS. `every` and `never` exist today as `StorageConfig::sync`. |
 | `storage.sync_interval` | `ATLANTIS_STORAGE_SYNC_INTERVAL` | `200ms` | Flush period for `sync = "interval"`. |
 
 The server falls back to `mem://` when no storage URL is given, so data does not
 survive a restart. Always pass a URL in production. URL forms are shared with clients
 ([19 — Client SDKs](19-client-sdks.md)). Durability trade-offs are explained in
 [05 — Transactions and Consistency](05-transactions-consistency.md). Today's
-`disk_path` maps to `rocksdb://<disk_path>` after the migration.
+`disk_path` maps to `rocksdb://<disk_path>` once the `rocksdb` backend lands.
 
 ### Transactions and queries (Planned — Phase 1)
 
-There is no isolation setting today. Record transactions use snapshot isolation unless
-the caller passes `Isolation::Serializable` to `Engine::transaction_with_isolation`
-([21 — API Reference](21-api-reference.md)).
+There is no isolation or timeout setting today. Transactions use snapshot isolation
+unless the caller passes `Isolation::Serializable` to
+`Engine::transaction_with_isolation` ([21 — API Reference](21-api-reference.md)), and
+queries have no row or time limit.
 
 | Key | Env var | Default | Meaning |
 |---|---|---|---|
@@ -259,14 +246,13 @@ the caller passes `Isolation::Serializable` to `Engine::transaction_with_isolati
 
 | Key | Default | Meaning |
 |---|---|---|
-| `cache.record_cache_size` | `1GiB` | Decoded records kept in memory. Replaces `memory_budget_bytes`. |
-| `cache.adjacency_cache_size` | `512MiB` | CSR+delta adjacency cache rebuilt from `g/` keys. |
+| `cache.record_cache_size` | `1GiB` | Decoded records kept in memory. |
+| `cache.adjacency_cache_size` | `512MiB` | Adjacency cache rebuilt from `g/` keys. |
 | `cache.vector_cache_size` | `1GiB` | In-memory HNSW graphs loaded from `vx/` keys. |
 
-`compaction_threshold` keeps its meaning for the adjacency cache. Per-index HNSW
-settings move from `VectorConfig` into `CREATE VECTOR INDEX ... OPTIONS {...}`
-([10 — Vector Index](10-vector-index.md)). `VectorConfig` stays as the default for
-indexes that omit options.
+Per-index HNSW settings already live in `CREATE VECTOR INDEX ... OPTIONS {...}`
+([10 — Vector Index](10-vector-index.md)); `VectorConfig` is the default for indexes
+that omit options.
 
 ### Index workers (Planned — Phase 2)
 
@@ -344,7 +330,7 @@ environment lookup:
 
 ```rust
 let config = EngineConfig::builder()
-    .sync_mode(SyncMode::Interval(Duration::from_millis(200))) // Phase 1
+    .sync_mode(SyncMode::Every)                                // implemented (Every | Never); Interval is Phase 1
     .isolation(Isolation::Snapshot)                            // Phase 1
     .query_timeout(Duration::from_secs(30))                    // Phase 1
     .adjacency_cache_size(512 << 20)                           // Phase 1

@@ -1,17 +1,22 @@
 # 12 — Geospatial
 
-> **Status:** Planned — Phase 3 (the `Geometry` value type arrives in Phase 2)
-> **Crates:** `atlantis-geo` (planned), `atlantis-core`, `atlantis-kv` (planned), `atlantis-cypher`
+> **Status:** Partially implemented — the `Geometry` value type, `point()`, point accessors and `point.distance` work today; geometry DDL types Phase 2; other geo functions and the point index Planned — Phase 3
+> **Crates:** `atlantis-core`, `atlantis-engine`, `atlantis-cypher`, `atlantis-kv`, `atlantis-geo` (planned)
 
 Geospatial support stores locations and shapes as values, answers questions such as
 "which places are within 5 km" or "which parcels intersect this polygon", and indexes
-points for fast spatial lookups. There is no geospatial code today: `Value` in
-`crates/atlantis-core/src/value.rs` has no geometry variant. Everything below is
-target design.
+points for fast spatial lookups.
 
-## Geometry Types (Planned — Phase 2)
+Implemented today: the `Geometry` variant of `Value` with WGS84 validation
+(`crates/atlantis-core/src/geometry.rs`); in Cypher, `point({longitude, latitude})`
+(or `{x, y}`), the accessors `p.longitude`/`p.latitude` (`p.x`/`p.y`), and
+`point.distance(a, b)` (alias `distance`), evaluated in
+`crates/atlantis-engine/src/exec/eval.rs`. A distance filter scans the label. Sections
+marked Planned are target design.
 
-`Geometry` is a variant of the target `Value` type (see [03 — Data Model](03-data-model.md)).
+## Geometry Types (Implemented; DDL field types Phase 2)
+
+`Geometry` is a variant of `Value` (see [03 — Data Model](03-data-model.md)).
 All coordinates are **WGS84** longitude/latitude in degrees, the coordinate system of
 GPS and GeoJSON.
 
@@ -25,7 +30,7 @@ GPS and GeoJSON.
 | `MultiPolygon` | Set of polygons | `MultiPolygon` |
 | `Collection` | Mixed set of geometries | `GeometryCollection` |
 
-Field types in DDL ([07 — Schema & DDL](07-schema-ddl.md)):
+Field types in DDL ([07 — Schema & DDL](07-schema-ddl.md), Phase 2):
 
 ```cypher
 CREATE TABLE Place SCHEMAFULL;
@@ -41,17 +46,17 @@ polygon rings must be closed and have at least four positions, and an outer ring
 not self-intersect. Invalid input fails the write with a validation error.
 Altitude and Cartesian (planar x/y) coordinates are not supported.
 
-## Constructing Geometries (Planned — Phase 3)
+## Constructing Geometries (points implemented; the rest Planned — Phase 3)
 
 ```cypher
-// Points: Neo4j-compatible map form
+// Points: Neo4j-compatible map form (implemented)
 RETURN point({longitude: 107.5909, latitude: 16.4637}) AS hue;
 
-// Polygons from rings of [longitude, latitude] pairs
+// Polygons from rings of [longitude, latitude] pairs (Phase 3)
 RETURN geo.polygon([[107.55, 16.44], [107.62, 16.44], [107.62, 16.49],
                     [107.55, 16.49], [107.55, 16.44]]) AS old_city;
 
-// Accessors
+// Accessors (implemented)
 WITH point({longitude: 107.5909, latitude: 16.4637}) AS p
 RETURN p.longitude, p.latitude;
 ```
@@ -80,18 +85,18 @@ MATCH (p:Place) RETURN p.name, geo.toGeoJSON(p.footprint) AS geojson;
 GeoJSON. Server and SDK responses encode geometry values as GeoJSON maps
 (see [17 — Server & Protocols](17-server-protocols.md)).
 
-## Spatial Functions (Planned — Phase 3)
+## Spatial Functions
 
-| Function | Returns | Description |
-|---|---|---|
-| `point({longitude, latitude})` | point | Construct a WGS84 point |
-| `point.distance(a, b)` | float | Geodesic distance in metres between two points |
-| `point.withinBBox(p, lowerLeft, upperRight)` | bool | Point inside a longitude/latitude box (Neo4j 5 form) |
-| `geo.polygon(rings)` | geometry | Construct a polygon |
-| `geo.within(a, b)` | bool | `a` lies entirely inside `b` |
-| `geo.intersects(a, b)` | bool | `a` and `b` share at least one point |
-| `geo.fromGeoJSON(map)` | geometry | Parse a GeoJSON geometry object |
-| `geo.toGeoJSON(geometry)` | map | Encode as GeoJSON |
+| Function | Returns | Description | Status |
+|---|---|---|---|
+| `point({longitude, latitude})` | point | Construct a WGS84 point | Implemented |
+| `point.distance(a, b)` | float | Geodesic distance in metres between two points | Implemented |
+| `point.withinBBox(p, lowerLeft, upperRight)` | bool | Point inside a longitude/latitude box (Neo4j 5 form) | Phase 3 |
+| `geo.polygon(rings)` | geometry | Construct a polygon | Phase 3 |
+| `geo.within(a, b)` | bool | `a` lies entirely inside `b` | Phase 3 |
+| `geo.intersects(a, b)` | bool | `a` and `b` share at least one point | Phase 3 |
+| `geo.fromGeoJSON(map)` | geometry | Parse a GeoJSON geometry object | Phase 3 |
+| `geo.toGeoJSON(geometry)` | map | Encode as GeoJSON | Phase 3 |
 
 Notes:
 
@@ -103,9 +108,10 @@ Notes:
 - Polygons that cross the antimeridian (180° longitude) must be split into a
   `MultiPolygon`.
 
-## Query Examples (Planned — Phase 3)
+## Query Examples (distance queries work as scans; the rest Planned — Phase 3)
 
-Places within 2 km of a point, nearest first:
+Places within 2 km of a point, nearest first (works today; the point index makes it
+fast in Phase 3):
 
 ```cypher
 WITH point({longitude: 107.5909, latitude: 16.4637}) AS here
@@ -116,7 +122,7 @@ ORDER BY metres
 LIMIT 10;
 ```
 
-Points inside a drawn area:
+Points inside a drawn area (Phase 3):
 
 ```cypher
 MATCH (s:Store)
@@ -124,7 +130,7 @@ WHERE geo.within(s.location, $area)      // $area: a polygon parameter
 RETURN s;
 ```
 
-Shapes overlapping another shape, combined with a graph hop:
+Shapes overlapping another shape, combined with a graph hop (Phase 3):
 
 ```cypher
 MATCH (z:FloodZone {level: 'high'})
@@ -133,7 +139,7 @@ WHERE geo.intersects(p.footprint, z.area)
 RETURN o.name, collect(p.id) AS parcels;
 ```
 
-Combined with vector search:
+Combined with vector search (works today):
 
 ```cypher
 CALL db.vector.search('review_embedding', $vec, 50) YIELD node AS r, score

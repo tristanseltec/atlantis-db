@@ -10,6 +10,7 @@
 //! | `/sys/ns {ns}` | namespace definition |
 //! | `/sys/ns {ns} /db {db}` | database definition |
 //! | `/sys/ns {ns} /db {db} /tb {tb}` | table definition |
+//! | `/sys/ns {ns} /db {db} /ix {name}` | index definition |
 //! | `/ns {ns} /db {db} /tb {tb} /r {key}` | record or edge |
 //! | `/ns {ns} /db {db} /tb {tb} /g {key} {dir} {edgeTable} {edgeKey}` | adjacency entry |
 //! | `/ns {ns} /db {db} /lb {label} {table} {key}` | secondary label index entry |
@@ -27,6 +28,7 @@ const TB: &[u8] = b"/tb";
 const REC: &[u8] = b"/r";
 const GRAPH: &[u8] = b"/g";
 const LABEL: &[u8] = b"/lb";
+const IX: &[u8] = b"/ix";
 
 /// Direction of an adjacency entry, relative to the node that owns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +111,18 @@ pub fn table_def(db: &DatabaseRef, table: &str) -> Vec<u8> {
 pub fn table_defs(db: &DatabaseRef) -> KeyRange {
     let mut w = KeyWriter::from_prefix(&database_def(db));
     KeyRange::prefix(w.raw(TB).finish())
+}
+
+/// Catalog key of an index definition.
+pub fn index_def(db: &DatabaseRef, name: &str) -> Vec<u8> {
+    let mut w = KeyWriter::from_prefix(&database_def(db));
+    w.raw(IX).str(name).finish()
+}
+
+/// All index definitions in a database.
+pub fn index_defs(db: &DatabaseRef) -> KeyRange {
+    let mut w = KeyWriter::from_prefix(&database_def(db));
+    KeyRange::prefix(w.raw(IX).finish())
 }
 
 /// Key of a record (or edge record).

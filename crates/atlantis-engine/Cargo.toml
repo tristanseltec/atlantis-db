@@ -1,7 +1,7 @@
 [package]
 name = "atlantis-engine"
 version = "0.1.0"
-description = "Actor-based database engine for Atlantis DB"
+description = "Query execution, transactions and indexes for Atlantis DB"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,13 +10,11 @@ repository.workspace = true
 
 [dependencies]
 atlantis-core = { workspace = true }
+atlantis-kv = { workspace = true }
 atlantis-storage = { workspace = true }
 atlantis-vector = { workspace = true }
 atlantis-cypher = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-thiserror = { workspace = true }
+regex = "1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }

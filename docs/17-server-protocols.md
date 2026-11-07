@@ -12,7 +12,8 @@ database and authentication state.
 
 Nothing in this chapter is implemented. Atlantis DB is an embedded library today: an
 application opens a database with `Engine::open(path)` or `Engine::open_in_memory()`
-and runs Cypher through `Engine::execute(cypher, params)` in the same process (see
+and runs Cypher through `Engine::execute(script, params)` or record transactions in the
+same process (see
 `crates/atlantis-db/src/engine.rs` and [21-api-reference.md](21-api-reference.md)).
 There is no network listener, no binary, and no authentication.
 

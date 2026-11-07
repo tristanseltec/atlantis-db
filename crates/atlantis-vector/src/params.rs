@@ -65,7 +65,9 @@ mod tests {
 
     #[test]
     fn test_search_params() {
-        let sp = SearchParams::top_k(5).with_threshold(0.8).with_ef_search(100);
+        let sp = SearchParams::top_k(5)
+            .with_threshold(0.8)
+            .with_ef_search(100);
         assert_eq!(sp.k, 5);
         assert_eq!(sp.score_threshold, Some(0.8));
         assert_eq!(sp.ef_search, Some(100));

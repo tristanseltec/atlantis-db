@@ -9,10 +9,11 @@ This chapter covers two models built directly on the ordered, transactional KV l
 - **time-series tables** whose records are keyed by series and time, so range queries
   and retention are cheap.
 
-Neither exists today. The current public API (`crates/atlantis-db/src/engine.rs`) offers
-`open`, `open_in_memory`, `open_with_config`, `execute`, `checkpoint` and `shutdown`;
-there is no KV access and no datetime type. Both models depend on `atlantis-kv`
-(Phase 1) and the extended `Value` types such as `Datetime` and `Duration` (Phase 2).
+Neither exists today. The public API (`crates/atlantis-db/src/engine.rs`) has no
+key-value access and no time-series table type. The foundations are in place:
+`atlantis-kv` with composite array keys and `RecordTx::scan_range` for key windows,
+and the `Datetime` and `Duration` values with `datetime()`, `duration()` and
+`time.now()` in Cypher.
 
 ## Key-Value API (Planned — Phase 3)
 

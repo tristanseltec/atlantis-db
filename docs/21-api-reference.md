@@ -1,6 +1,6 @@
 # 21 — API Reference
 
-> **Status:** Partially implemented — the embedded Rust facade, record transactions and record types exist; the rest of the multi-model API surface is Planned — Phases 1–7
+> **Status:** Partially implemented — the embedded Rust facade, Cypher and record transactions on one store, and the record types exist; the rest of the multi-model API surface is Planned — Phases 1–7
 > **Crates:** `atlantis-db`, `atlantis-core`, `atlantis-storage`, `atlantis-kv`, `atlantis-engine`, `atlantis-auth` (planned), `atlantis-server` (planned)
 
 This chapter is the reference for the public Rust API. The first half documents the
@@ -18,51 +18,44 @@ authoritative list. Configuration types are re-exported from
 [`crates/atlantis-db/src/config.rs`](../crates/atlantis-db/src/config.rs) and from the
 root of `atlantis-core`.
 
-`Engine` gives access to **two stores that do not share data yet**:
-
-- the **Cypher graph store**, used by `execute`;
-- the **record store**, used by `transaction`, `transaction_with_isolation`,
-  `transaction_with_retry` and `read`.
-
-A node created with Cypher `CREATE` is not visible to record transactions, and a record
-is not visible to Cypher. Moving Cypher onto the record store is open Phase 1/2 work
-([25 — Implementation Roadmap](25-implementation-roadmap.md)).
-
-### Known build defects (Phase 0)
-
-None remain: the workspace compiles. The failing unit tests that Phase 0 still has to
-fix are listed in [25 — Implementation Roadmap](25-implementation-roadmap.md#build-and-tests).
+`Engine` gives access to **one store**: Cypher (`execute`, `Transaction::execute`) and
+the record API (`transaction`, `transaction_with_isolation`, `transaction_with_retry`,
+`read`) read and write the same records. A node created with Cypher `CREATE` is a
+record in the table named by its first label, and a record created in Rust is visible
+to `MATCH`.
 
 ### Engine
 
 **File:** [`crates/atlantis-db/src/engine.rs`](../crates/atlantis-db/src/engine.rs)
 
-`Engine` wraps a clonable handle to the single-writer Cypher actor (see
-[16 — Engine Runtime](16-engine-runtime.md)) and a handle to the record store. Clones
-share both stores and are safe to move across tasks. The open, query and transaction
-methods are `async` and need a Tokio runtime. Record transactions run their closure on
-the calling task, not on the actor.
+`Engine` wraps a clonable handle to the datastore (see
+[16 — Engine Runtime](16-engine-runtime.md)) plus its own namespace/database selection.
+Clones share the database and are safe to move across tasks. The open, query and
+transaction methods are `async`, but they do their work synchronously on the calling
+task, including the WAL fsync of each commit and the first-search build of a vector
+index. A heavy call blocks its tokio worker thread; for large workloads call the engine
+from `tokio::task::spawn_blocking` or a dedicated runtime. There are no per-query row or
+time limits yet.
 
 | Method | Signature | Behaviour |
 |---|---|---|
 | `open` | `async fn open(path: impl AsRef<Path>) -> Result<Engine, AtlantisError>` | Builds a default config with `disk_path` set to `path`, then calls `open_with_config`. |
-| `open_with_config` | `async fn open_with_config(config: EngineConfig) -> Result<Engine, AtlantisError>` | With a `disk_path`: takes an exclusive `LOCK` file in the directory (a second engine on it fails with `Storage`, "already open in another engine"), loads `records.kv` when it exists, and spawns the Cypher actor, which restores `checkpoint.db` when it exists. |
-| `open_in_memory` | `async fn open_in_memory() -> Result<Engine, AtlantisError>` | Uses `EngineConfig::default()` (no disk path). Data is lost on drop or shutdown. |
-| `database` | `fn database(&self) -> &DatabaseRef` | The namespace and database used by record transactions. Defaults to `atlantis` / `default`. |
-| `use_db` | `fn use_db(&mut self, ns: &str, db: &str) -> Result<(), AtlantisError>` | Selects the namespace and database for record transactions on this handle. Other clones keep their own selection. Validates both names. Does not affect Cypher. |
-| `transaction` | `async fn transaction<T, F>(&self, f: F) -> Result<T, AtlantisError>` where `F: FnOnce(&mut RecordTx) -> Result<T, AtlantisError>` | Runs `f` in a read-write, snapshot-isolated record transaction. `Ok` commits; `Err` discards all writes. Never retries. |
+| `open_with_config` | `async fn open_with_config(config: EngineConfig) -> Result<Engine, AtlantisError>` | With a `disk_path`: takes an exclusive `LOCK` file in the directory (a second engine on it fails with `Storage`, "already open in another engine"), recovers `records.kv` and the write-ahead log, and starts the periodic checkpoint thread. A directory holding only a legacy `checkpoint.db` fails with `Storage`. |
+| `open_in_memory` | `async fn open_in_memory() -> Result<Engine, AtlantisError>` | Uses `EngineConfig::default()` (no disk path). Data is lost when the last clone is dropped. |
+| `database` | `fn database(&self) -> &DatabaseRef` | The namespace and database this handle works in. Defaults to `atlantis` / `default`. |
+| `use_db` | `fn use_db(&mut self, ns: &str, db: &str) -> Result<(), AtlantisError>` | Selects the namespace and database for Cypher and record transactions on this handle. Other clones keep their own selection. Validates both names. |
+| `transaction` | `async fn transaction<T, F>(&self, f: F) -> Result<T, AtlantisError>` where `F: FnOnce(&mut Transaction) -> Result<T, AtlantisError>` | Runs `f` in a read-write, snapshot-isolated transaction. `Ok` commits; `Err` discards all writes. Never retries. |
 | `transaction_with_isolation` | `async fn transaction_with_isolation<T, F>(&self, isolation: Isolation, f: F) -> Result<T, AtlantisError>` (same `F` bound) | As `transaction`, with an explicit `Isolation`. |
-| `transaction_with_retry` | `async fn transaction_with_retry<T, F>(&self, max_attempts: u32, f: F) -> Result<T, AtlantisError>` where `F: FnMut(&mut RecordTx) -> Result<T, AtlantisError>` | As `transaction`, re-running `f` while the error is retryable (`TxConflict`), up to `max_attempts` attempts in total. No backoff. |
-| `read` | `async fn read<T, F>(&self, f: F) -> Result<T, AtlantisError>` (same `F` bound as `transaction`) | Runs `f` in a read-only transaction on one snapshot. Writes fail with `TxReadOnly`. |
-| `execute` | `async fn execute(&self, cypher: &str, params: &[(&str, Value)]) -> Result<ResultSet, AtlantisError>` | Parses, plans and executes one Cypher statement against the graph store. `params` binds `$name` references. |
-| `checkpoint` | `async fn checkpoint(&self) -> Result<(), AtlantisError>` | Writes the record store to `records.kv`, then the graph store's hot tier and cold-tier page index to `checkpoint.db`. Without a disk path the record step is a no-op and the graph step returns `Storage`. |
-| `shutdown` | `async fn shutdown(&self) -> Result<(), AtlantisError>` | Writes `records.kv` and checkpoints the graph store when a disk path is configured, then stops the actor. Later Cypher calls return `Shutdown`. |
+| `transaction_with_retry` | `async fn transaction_with_retry<T, F>(&self, max_attempts: u32, f: F) -> Result<T, AtlantisError>` where `F: FnMut(&mut Transaction) -> Result<T, AtlantisError>` | As `transaction`, re-running `f` while the error is retryable (`TxConflict`), up to `max_attempts` attempts in total. No backoff. |
+| `read` | `async fn read<T, F>(&self, f: F) -> Result<T, AtlantisError>` (same `F` bound as `transaction`) | Runs `f` in a read-only transaction on one snapshot. Writes, including Cypher writes through `tx.execute`, fail with `TxReadOnly`. |
+| `execute` | `async fn execute(&self, cypher: &str, params: &[(&str, Value)]) -> Result<ResultSet, AtlantisError>` | Runs a `;`-separated Cypher script in this handle's database and returns the last statement's result. Each statement commits on its own unless grouped in `BEGIN; ... COMMIT;`. `params` binds `$name` references. |
+| `checkpoint` | `async fn checkpoint(&self) -> Result<(), AtlantisError>` | Folds the write-ahead log into `records.kv`. Commits are durable without it; it bounds log size and recovery time. A no-op without a disk path. |
+| `shutdown` | `async fn shutdown(&self) -> Result<(), AtlantisError>` | Checkpoints. The engine keeps working; the database closes when the last clone is dropped, which also checkpoints and releases the `LOCK` file. |
 
-**Record durability.** The record store is in memory. It is written to `records.kv` by
-`checkpoint()`, by `shutdown()`, and automatically (best effort) when the last `Engine`
-clone is dropped, which also releases the `LOCK` file. Each write is atomic. There is no
-write-ahead log yet, so commits made after the last checkpoint are lost on a crash; a
-successful `transaction` does not mean the data is on disk.
+**Durability.** With a disk path, every commit is appended to `records.wal` (and, with
+the default `SyncMode::Every`, fsynced) before it returns, so a successful `execute` or
+`transaction` survives a crash. Details are in
+[05 — Transactions & Consistency](05-transactions-consistency.md).
 
 ```rust
 use atlantis_db::{Engine, Value};
@@ -77,22 +70,41 @@ let result = engine
 engine.shutdown().await?;
 ```
 
-Two behaviours matter when you read Cypher results today:
+`RETURN n` for a node or relationship variable returns its document as
+`Value::Object`, with an `id` field holding the `RecordId`; `n.id` and `id(n)` return
+the `RecordId` ([06 — Query Language](06-query-language.md#results)).
 
-- `RETURN n` for a node variable returns the internal node id as `Value::Integer`, not a
-  node map. Return properties (`n.name`) to get data.
-- Only `disk_path` and the vector settings from `EngineConfig` reach the Cypher engine.
-  The actor opens storage with `GraphStore::open(path)` or `GraphStore::new_in_memory()`,
-  both of which use default `StorageConfig` values. See
-  [22 — Configuration](22-configuration.md#what-is-not-wired-yet).
+### Transactions
+
+**Files:** [`crates/atlantis-db/src/engine.rs`](../crates/atlantis-db/src/engine.rs),
+[`crates/atlantis-storage/src/records.rs`](../crates/atlantis-storage/src/records.rs)
+
+The closure passed to `transaction`, `transaction_with_retry` or `read` receives a
+`&mut Transaction` scoped to the handle's current database. `Transaction` dereferences
+to `RecordTx`, so every record method below is available on it, and adds:
+
+| Method | Purpose |
+|---|---|
+| `execute(cypher, params)` | Runs Cypher (one statement or a `;`-separated script) inside this transaction and returns a `ResultSet`. It sees the transaction's uncommitted writes. `BEGIN`, `COMMIT` and `ROLLBACK` are rejected. |
+
+A Cypher statement that fails inside `execute` **poisons** the transaction, because its
+partial writes are already in it: the commit then fails with `InvalidQuery` ("a statement
+in this transaction failed; it was rolled back") and nothing is written, even if the
+closure handles the error and returns `Ok`. There are no savepoints yet.
+
+The closure runs against one snapshot. Returning `Ok` commits and returning `Err`
+rolls back. `transaction` never retries: a conflict at commit returns
+`Error::TxConflict`. `transaction_with_retry` re-runs the closure on `TxConflict` only,
+so the closure must be safe to run more than once. Isolation levels and durability are
+covered in [05 — Transactions & Consistency](05-transactions-consistency.md), which also
+has a retry example.
 
 ### Record transactions
 
 **File:** [`crates/atlantis-storage/src/records.rs`](../crates/atlantis-storage/src/records.rs)
 
-The closure passed to `transaction`, `transaction_with_retry` or `read` receives a
-`&mut RecordTx` scoped to the engine's current database. Every method is synchronous
-and returns `Result<_, AtlantisError>`. The storage layout behind these methods is in
+The `RecordTx` methods, reached through `Transaction`, are synchronous and return
+`Result<_, AtlantisError>`. The storage layout behind these methods is in
 [04 — Storage Engine](04-storage-engine.md).
 
 | Method | Purpose |
@@ -114,7 +126,9 @@ and returns `Result<_, AtlantisError>`. The storage layout behind these methods 
 | `delete_edge(id)` | Deletes an edge and its adjacency entries. |
 | `edges(node, direction, rel_type)` | Edges attached to `node`, by `Direction` and optional type. |
 | `neighbors(node, direction, rel_type)` | `RecordId`s of the nodes at the other end of those edges. |
-| `commit()`, `cancel()` | Used by `Engine` internally; a closure does not call them. |
+| `set_labels(id, add, remove)` | Adds and removes secondary labels. The table label cannot be removed. |
+| `define_vector_index(def)`, `vector_index(name)`, `vector_indexes()`, `drop_index(name)` | Manage `VectorIndexDef` catalog entries, as `CREATE VECTOR INDEX` / `DROP INDEX` do. |
+| `commit()`, `cancel()` | Used by `Engine` internally; a closure does not call them. `commit` returns a `CommitInfo` with the `Versionstamp` and the changed record ids. |
 
 ```rust
 use atlantis_db::{Direction, Engine, Object, Value};
@@ -126,6 +140,9 @@ engine.transaction(|tx| {
     let alice = tx.create_node(&["Person", "Admin"], alice)?;   // Person:alice
     let bob = tx.create_node(&["Person"], Object::new())?;      // Person:<ULID>
     tx.relate(&alice.id, "KNOWS", &bob.id, Object::new())?;
+    // Cypher in the same transaction sees the uncommitted edge.
+    let rs = tx.execute("MATCH (:Person {id: 'alice'})-[:KNOWS]->(b) RETURN b", &[])?;
+    assert_eq!(rs.row_count(), 1);
     Ok(())
 }).await?;
 
@@ -135,8 +152,9 @@ let friends = engine.read(|tx| {
 ```
 
 The integration tests in
-[`crates/atlantis-db/tests/records.rs`](../crates/atlantis-db/tests/records.rs) show
-checkpoint and reopen, edge-table restrictions, rollback, and conflicts.
+[`crates/atlantis-db/tests/records.rs`](../crates/atlantis-db/tests/records.rs) and
+[`cypher.rs`](../crates/atlantis-db/tests/cypher.rs) show reopen, edge-table
+restrictions, rollback, conflicts, and Cypher and records sharing data.
 
 ### Config
 
@@ -168,7 +186,7 @@ Every builder method and field is listed in [22 — Configuration](22-configurat
 
 | `ResultSet` method | Returns | Notes |
 |---|---|---|
-| `columns()` | `&[String]` | `RETURN` aliases, or `var` / `var.prop` when no alias is given, otherwise `expr`. |
+| `columns()` | `&[String]` | `RETURN` aliases, or the item's source text when no alias is given. |
 | `row_count()` | `usize` | |
 | `is_empty()` | `bool` | |
 | `rows()` | `impl Iterator<Item = Row<'_>>` | Borrowed views into the result set. |
@@ -205,8 +223,9 @@ and `insert(key, value)`; read it with `as_map()` or `into_map()`.
 `Value` has the original seven variants (`Null`, `Bool`, `Integer`, `Float`, `String`,
 `Array`, `Vector`) plus `Bytes`, `Datetime`, `Duration`, `Uuid`, `Object`, `Geometry`
 and `RecordId`. The variant list and semantics are in
-[03 — Data Model](03-data-model.md#value). Cypher produces and stores only the original
-seven today; the others are available through record transactions.
+[03 — Data Model](03-data-model.md#value). Cypher stores and returns all of them: map
+literals are `Object`s, nodes are `RecordId`s, and functions such as `datetime`,
+`duration` and `point` build the others.
 
 | Conversion | Result |
 |---|---|
@@ -233,17 +252,13 @@ the target error type. `is_retryable()` returns `true` for `TxConflict` only.
 
 | Variant | Raised when |
 |---|---|
-| `Parse(String)` | The Cypher text does not parse, including unsupported clauses such as `MERGE`. |
-| `InvalidQuery(String)` | The statement parses but cannot be planned, e.g. `WHERE` with no preceding clause, an unknown procedure, or a non-literal `k` in `db.vector.search`. |
-| `NodeNotFound(NodeId)` | A referenced Cypher node does not exist. |
-| `Storage(String)` | Storage failure, e.g. a graph-store `checkpoint` without a disk path, or a database directory already open in another engine. |
-| `Vector(String)` | Vector index failure, e.g. the query argument is not a vector. |
+| `Parse(String)` | The Cypher text does not parse, including unsupported constructs such as `FOREACH` and trailing text after `RETURN`. The message has a `line:column` position. |
+| `InvalidQuery(String)` | The statement parses but cannot run, e.g. an unbound variable, a missing parameter, an unknown function or procedure, a bad vector index option, a `null` in a `MERGE` pattern, or committing a poisoned transaction. |
+| `Storage(String)` | Storage failure, e.g. a database directory already open in another engine, or a directory holding only a legacy `checkpoint.db`. |
 | `DimensionMismatch { expected, actual }` | A vector does not match the index dimension. |
 | `Io(std::io::Error)` | Filesystem error. |
 | `Serialization(String)` | Encoding or decoding failure. |
 | `Config(String)` | Config validation failure from `build()` or `validate()`. |
-| `Shutdown` | The actor has stopped or its channel is closed. |
-| `Channel(String)` | Internal channel failure. |
 | `InvalidValue(String)` | A value is malformed, e.g. a geometry outside WGS84 bounds or an unparsable datetime. |
 | `InvalidIdentifier(String)` | A namespace, database, table or label name is not a valid identifier, or a user table starts with `_`. |
 | `InvalidRecordId(String)` | A record id or key cannot be parsed or used. |
@@ -255,20 +270,15 @@ the target error type. `is_retryable()` returns `true` for `TxConflict` only.
 | `TxReadOnly` | A write was attempted in a read-only transaction. |
 | `Encoding(String)` | A key cannot be encoded or decoded, e.g. a `Vector` in a key. |
 
+
 ```rust
 match engine.execute("MATCH (n) RETURN n", &[]).await {
     Ok(result) => { /* ... */ }
     Err(AtlantisError::Parse(msg)) => eprintln!("syntax error: {msg}"),
-    Err(AtlantisError::Shutdown) => eprintln!("engine stopped"),
+    Err(e) if e.is_retryable() => eprintln!("conflict, retry: {e}"),
     Err(e) => eprintln!("error: {e}"),
 }
 ```
-
-### Lower-level handle
-
-`atlantis_engine::EngineHandle` also has `create_node(labels, properties)` and
-`get_node(id)`, which bypass Cypher. The facade does not expose them. See
-[16 — Engine Runtime](16-engine-runtime.md).
 
 ## Target design
 
@@ -283,9 +293,9 @@ the other languages).
 |---|---|---|
 | Embedded open | `open`, `open_with_config`, `open_in_memory`, `execute`, `checkpoint`, `shutdown` | Implemented |
 | URL connections | `Engine::connect("mem://")`, `Engine::connect("rocksdb://path")` | Phase 1 |
-| Transactions | `transaction`, `transaction_with_isolation`, `transaction_with_retry`, `read`, `Error::TxConflict` | Implemented for the record store (`mem` backend). Cypher inside transactions: Phase 1 |
-| Session context | `use_db(ns, db)` | Implemented (record transactions only) |
-| Session context | `use_ns`, `set_var`, `unset_var`, `use_db` for Cypher | Phase 2 |
+| Transactions | `transaction`, `transaction_with_isolation`, `transaction_with_retry`, `read`, `Transaction::execute`, `Error::TxConflict` | Implemented (`mem` backend) |
+| Session context | `use_db(ns, db)` | Implemented (Cypher and record transactions) |
+| Session context | `use_ns`, `set_var`, `unset_var` | Phase 2 |
 | Record identity | `RecordId`, `RecordKey`, `Record`, `Edge`, extended `Value` variants including `Geometry` | Implemented, except `Decimal` and `Range` (Phase 2) |
 | Record operations in a transaction | `RecordTx` methods (`create`, `get`, `update`, `merge`, `delete`, `relate`, `scan`, ...) | Implemented |
 | Record helpers on `Engine` | `select`, `create`, `insert`, `update`, `merge`, `patch`, `delete`, `relate` | Phase 2 |
@@ -318,73 +328,38 @@ need a cargo feature on `atlantis-db`: `protocol-ws` for `ws://` and `wss://`, a
 `kv-rocksdb` and `kv-tikv`. URL forms are
 listed in [19 — Client SDKs](19-client-sdks.md) and backend settings in
 [22 — Configuration](22-configuration.md). `Engine::open(path)` stays as a shorthand for
-`rocksdb://path` once Phase 1 replaces the hot/cold tier.
+`rocksdb://path` once the `rocksdb` backend lands.
 
-### Namespace and database (`use_db` implemented for records; rest Planned — Phase 2)
+### Namespace and database (`use_db` implemented; rest Planned — Phase 2)
 
 ```rust
 let mut engine = Engine::open_in_memory().await?;
-engine.use_db("acme", "shop")?;   // implemented: selects acme.shop for record transactions
+engine.use_db("acme", "shop")?;   // implemented: Cypher and transactions use acme.shop
 ```
 
-Today `use_db` is synchronous, takes `&mut self`, and applies only to record
-transactions on that `Engine` handle. In Phase 2 the same selection also applies to
-Cypher, the same as `USE acme.shop;`. A separate chained `use_ns(...).use_db(...)` form
-is no longer planned.
+Today `use_db` is synchronous, takes `&mut self`, and applies to Cypher and record
+transactions on that `Engine` handle. In Phase 2 the Cypher statement `USE acme.shop;`
+does the same inside a script. A separate chained `use_ns(...).use_db(...)` form is no
+longer planned.
 `set_var(name, value)` defines a session parameter that every later query can read as
 `$name`, and `unset_var(name)` removes it. They match the RPC `let` and `unset`
 methods. Embedded engines
 start in namespace `atlantis`, database `default`. The hierarchy is explained in
 [03 — Data Model](03-data-model.md).
 
-### Querying (`execute` exists; extensions planned)
+### Querying
 
-`execute` remains the general entry point. From Phase 1 it accepts multi-statement
-text including `BEGIN; ... COMMIT;`. From Phase 2, results may contain `Object`,
-`RecordId` and the other extended values below, and `RETURN n` returns the record as an
-`Object` rather than an integer id.
-
-### Transactions (Implemented for records; Cypher statements Planned — Phase 1)
-
-```rust
-pub async fn transaction<T, F>(&self, f: F) -> Result<T, Error>
-where
-    F: FnOnce(&mut RecordTx) -> Result<T, Error>;
-
-pub async fn transaction_with_isolation<T, F>(&self, isolation: Isolation, f: F) -> Result<T, Error>
-where
-    F: FnOnce(&mut RecordTx) -> Result<T, Error>;
-
-pub async fn transaction_with_retry<T, F>(&self, max_attempts: u32, f: F) -> Result<T, Error>
-where
-    F: FnMut(&mut RecordTx) -> Result<T, Error>;
-
-pub async fn read<T, F>(&self, f: F) -> Result<T, Error>
-where
-    F: FnOnce(&mut RecordTx) -> Result<T, Error>;
-```
-
-The closure is **synchronous** and borrows the transaction. An earlier draft of this
-design took an `async move` closure that owned a `Transaction`; that form is no longer
-the plan. The example under [Record transactions](#record-transactions) shows the
-current form, and [05 — Transactions and Consistency](05-transactions-consistency.md)
-has a retry example.
-
-The closure runs against one snapshot. Returning `Ok` commits and returning `Err`
-rolls back. `transaction` never retries: a conflict at commit returns
-`Error::TxConflict`. `transaction_with_retry` re-runs the closure on `TxConflict` only,
-so the closure must be safe to run more than once. Running Cypher inside the closure
-(for example a `tx.execute(...)` method) is Phase 1, once Cypher runs on the record
-store. Isolation levels and durability are
-covered in [05 — Transactions and Consistency](05-transactions-consistency.md).
+`execute` remains the general entry point. Multi-statement scripts with
+`BEGIN; ... COMMIT;` work today. Returning one result set per statement is planned with
+the server protocols (Phase 5).
 
 ### Record helpers (Planned — Phase 2)
 
 These `Engine`-level helpers mirror the WebSocket RPC methods in
 [17 — Server and Protocols](17-server-protocols.md). Each one compiles to Atlantis
 Cypher, so permissions and events apply in the same way. Inside a transaction, the
-`RecordTx` methods already cover the same operations
-([Record transactions](#record-transactions)).
+`RecordTx` methods and `Transaction::execute` already cover the same operations
+([Transactions](#transactions)).
 
 | Method | Purpose |
 |---|---|
@@ -407,7 +382,7 @@ engine.relate(alice, "WORKS_AT", acme, json!({"since": 2024})).await?;
 
 `json!` here stands for any value that converts into `Value::Object`.
 
-### RecordId (Implemented; Cypher functions Planned — Phase 2)
+### RecordId (Implemented)
 
 **File:** [`crates/atlantis-core/src/record.rs`](../crates/atlantis-core/src/record.rs)
 
@@ -421,8 +396,8 @@ assert_eq!(a.table, "Person");
 ```
 
 `RecordId::new` validates the table name. The text forms and key kinds are in
-[03 — Data Model](03-data-model.md#records-and-recordid). In Cypher, `id(n)` returning the
-`RecordId` and `rid('Person', 'alice')` constructing one are Phase 2.
+[03 — Data Model](03-data-model.md#records-and-recordid). In Cypher, `id(n)` and `n.id`
+return the `RecordId`, and `rid('Person', 'alice')` constructs one.
 
 ### Extended Value (Partially implemented — Phase 2)
 
@@ -431,8 +406,8 @@ The target `Value` adds variants without removing any of the original ones:
 | Variant | Status |
 |---|---|
 | `Null`, `Bool`, `Integer(i64)`, `Float(f64)`, `String`, `Array`, `Vector(Vec<f32>)` | Implemented |
-| `Bytes`, `Datetime`, `Duration`, `Uuid`, `Object`, `RecordId` | Implemented in Rust; Cypher literals and functions Phase 2 |
-| `Geometry` (Point, LineString, Polygon, Multi*, Collection) | Implemented as a value type; geo functions and spatial index Phase 3 |
+| `Bytes`, `Datetime`, `Duration`, `Uuid`, `Object`, `RecordId` | Implemented; Cypher has map literals and `datetime`, `duration`, `rid` |
+| `Geometry` (Point, LineString, Polygon, Multi*, Collection) | Implemented as a value type; Cypher has `point` and `point.distance`; other geo functions and the spatial index Phase 3 |
 | `Decimal`, `Range` | Phase 2 |
 
 More accessors (for example `as_datetime`) follow the existing pattern as needed. DDL type names are listed in
@@ -508,11 +483,11 @@ Embedded engines run as root unless a session signs in.
 
 | Variant | Raised when | Status |
 |---|---|---|
-| `TxConflict` | A transaction lost a write-write or serializable read-set check. Retryable. | Implemented (record store) |
+| `TxConflict` | A transaction lost a write-write or serializable read-set check. Retryable. | Implemented |
 | `SchemaViolation` | A write breaks a field type, `ASSERT`, or a constraint. | Implemented for table and edge rules; field checks Phase 2 |
 | `ParseError` | The query does not parse (replaces `Parse`). | Phase 2 |
-| `Timeout` | A statement exceeded `query.timeout`. | Phase 1 |
-| `NotFound` | A referenced record, table or index does not exist (replaces `NodeNotFound`). Records raise `RecordNotFound` today. | Phase 2 |
+| `Timeout` | A statement exceeded `query.timeout` (no per-query limits exist today). | Phase 1 |
+| `NotFound` | A referenced record, table or index does not exist (generalizes `RecordNotFound`). Records raise `RecordNotFound` today. | Phase 2 |
 | `PermissionDenied` | The session lacks the role or record permission for the operation. | Phase 5 |
 | `AuthenticationFailed` | Sign-in, sign-up or token validation failed. | Phase 5 |
 

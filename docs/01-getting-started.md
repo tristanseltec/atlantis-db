@@ -1,6 +1,6 @@
 # 01 — Getting Started
 
-> **Status:** Partially implemented — the embedded Rust quickstart reflects today's API; the server quickstart and multi-model examples are Planned (phase marked per section)
+> **Status:** Partially implemented — the embedded Rust quickstart, Cypher, transactions and vector search reflect today's API; the server quickstart and the other multi-model examples are Planned (phase marked per section)
 > **Crates:** `atlantis-db`, `atlantis-server` (planned)
 
 This guide shows how to use Atlantis DB as an embedded Rust library today, how the
@@ -10,30 +10,24 @@ look like. Each planned part is marked with the phase that delivers it (see
 
 ## What Works Today
 
-Atlantis DB is pre-release. The workspace builds, but the Cypher engine still has the
-Phase 0 gaps in the table below. The record store (documents, nodes and edges in
-namespaced tables, with transactions) works through the Rust API; Cypher cannot query
-it yet.
+Atlantis DB is pre-release. The embedded engine stores documents, graph nodes and edges
+as records in namespaced tables. Cypher and the Rust record API read and write the same
+records, in ACID transactions, and every commit is durable through a write-ahead log.
+The authoritative list of working behaviour is the integration test suite in
+`crates/atlantis-db/tests/`.
 
 | Capability | Status |
 |---|---|
-| Embedded engine, in memory or with a disk path | Implemented |
-| `CREATE` single nodes with labels and properties | Implemented |
-| Single-node `MATCH` by label with `WHERE`, `RETURN ... AS`, `ORDER BY`, `SKIP`, `LIMIT` | Implemented |
-| Parameters (`$name`) | Implemented |
-| Explicit checkpoint and checkpoint on shutdown; restore on open | Partial — restored nodes get new IDs (Phase 0) |
-| `CREATE` with relationship patterns (relationships are skipped; only the last node is returned) | Phase 0 |
-| Multi-hop `MATCH` (the far node is bound to every node with that label) | Phase 0 |
-| `MATCH ... SET` (updates nothing today) | Phase 0 |
-| `DELETE` (only tombstones the node) | Phase 0 |
-| `RETURN` or `UNWIND` as the first clause (returns no rows) | Phase 0 |
-| `MERGE`, `REMOVE`, `OPTIONAL MATCH` (silently ignored) | Phase 0 |
-| Variable-length paths | Phase 0 |
-| `db.vector.search` returning results (the HNSW index is never populated) | Phase 0 |
-| Automatic checkpoints and eviction | Phase 0 |
-| Transactions, RocksDB backend | Phase 1 |
-| Tables, schema, documents, record links | Phase 2 |
-| Full-text, geospatial, key-value, time series | Phase 3 |
+| Embedded engine, in memory or in a directory (write-ahead log, periodic checkpoints) | Implemented |
+| Cypher reads and writes: `MATCH` (multi-hop, any direction, variable length), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `WITH`, `UNWIND`, `UNION` | Implemented |
+| Expressions, aggregation, `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, parameters (`$name`) | Implemented |
+| Scripts separated by `;`, `BEGIN` / `COMMIT` / `ROLLBACK` | Implemented |
+| Rust record transactions (`engine.transaction`, `read`, retry on conflict), with Cypher inside them | Implemented |
+| Nested documents and record links that dereference on property access | Implemented |
+| `CREATE VECTOR INDEX`, `DROP INDEX`, `db.vector.search` | Implemented |
+| RocksDB backend, connection URLs | Phase 1 |
+| Schema DDL, secondary indexes, constraints, `USE` | Phase 2 |
+| `shortestPath`, graph algorithms, full-text, geospatial indexes, key-value API, time series | Phase 3 |
 | Live queries and events | Phase 4 |
 | Server, HTTP, WebSocket RPC, auth | Phase 5 |
 | SDKs for Python, JavaScript/TypeScript, Go, Java | Phase 6 |
@@ -56,9 +50,7 @@ atlantis-db = { path = "../atlantis-db/crates/atlantis-db" }
 tokio = { version = "1", features = ["full"] }
 ```
 
-The examples in this section compile; the queries they run are limited by the Phase 0
-gaps listed above. The [Implementation Roadmap](25-implementation-roadmap.md) tracks
-progress.
+The examples in this section compile against the current API.
 
 ### Open a database
 
@@ -67,14 +59,14 @@ use atlantis_db::Engine;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Opens or creates a database at this path.
-    // If a checkpoint exists there, the nodes are restored from it
-    // (with new node IDs until the Phase 0 fix).
+    // Opens or creates a database in this directory and recovers every
+    // committed transaction from its checkpoint and write-ahead log.
     let engine = Engine::open("./my_atlantis_db").await?;
 
     // ... run queries ...
 
-    // Writes a checkpoint (because a disk path is set) and stops the engine.
+    // Folds the write-ahead log into the checkpoint file. Commits are already
+    // durable without this; it only shortens the next recovery.
     engine.shutdown().await?;
     Ok(())
 }
@@ -86,8 +78,9 @@ For tests and throwaway data, open an in-memory engine:
 let engine = Engine::open_in_memory().await?;
 ```
 
-`Engine` is cheap to clone and safe to share across tasks. Call `engine.checkpoint()`
-to write a checkpoint without shutting down.
+`Engine` is cheap to clone and safe to share across tasks. A directory can be open in
+only one engine at a time (a `LOCK` file guards it). The database closes when the last
+clone is dropped.
 
 ### Custom configuration
 
@@ -130,60 +123,77 @@ for row in result.rows() {
 - Parameters are `(&str, Value)` pairs referenced as `$name`.
 - `Row` has typed accessors (`get_string`, `get_int`, `get_float`, `get_bool`,
   `get_vector`) that return `Option`, plus `get` for the raw `Value`.
-- A node returned on its own (`RETURN p`) comes back as its integer node ID today.
-  It becomes a full record in Phase 2 (see [Data Model](03-data-model.md)).
+- A node or relationship returned on its own (`RETURN p`) comes back as its document,
+  with an `id` field holding its `RecordId`. `p.id` and `id(p)` return the `RecordId`.
+  See [Data Model](03-data-model.md).
 
-### Relationships and updates (Phase 0)
-
-The parser accepts relationship patterns in `CREATE`, but the planner skips the
-relationship, so this statement creates only the two nodes today:
+### Relationships, traversal and updates
 
 ```cypher
-CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})
-```
+CREATE (a:Person {id: 'alice', name: 'Alice'})-[:KNOWS {since: 2020}]->(b:Person {id: 'bob', name: 'Bob'});
 
-Once the Phase 0 fixes for relationship creation and multi-hop binding land, traversal
-and updates work as in any Cypher database:
-
-```cypher
 MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(friend:Person)
 RETURN friend.name AS friend;
 
-MATCH (p:Person {name: 'Alice'}) SET p.age = 35;   // updates nothing today
+MATCH (p:Person {name: 'Alice'}) SET p.age = 35, p.address.city = 'Hue';
+
+MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..3]->(b:Person)
+RETURN DISTINCT b.name;
 ```
 
-### Vector search (Planned — Phase 0)
+The `id` property sets the record key: the first statement creates the records
+`Person:alice` and `Person:bob`. A node's first label is its table.
 
-Vector search returns nothing today, because the engine never inserts vectors into the
-HNSW index. Vectors can still be stored as `Vector` property values. Write embedding
-literals as `f32`:
+### Records from Rust
+
+The same records are reachable from the Rust record API, and Cypher runs inside a Rust
+transaction with `tx.execute`, seeing that transaction's uncommitted writes:
 
 ```rust
-let embedding: Vec<f32> = vec![0.12, 0.45, 0.78 /* ... 384 values */];
+use atlantis_db::{Engine, Object, Value};
+
+engine.transaction(|tx| {
+    let mut carol = Object::new();
+    carol.insert("id".into(), Value::from("carol"));       // key: Person:carol
+    carol.insert("name".into(), Value::from("Carol"));
+    let carol = tx.create_node(&["Person"], carol)?;
+    tx.relate(&"Person:bob".parse()?, "KNOWS", &carol.id, Object::new())?;
+    let rs = tx.execute("MATCH (:Person {id: 'bob'})-[:KNOWS]->(c) RETURN c.name AS name", &[])?;
+    assert_eq!(rs.row_count(), 1);
+    Ok(())
+}).await?;
+```
+
+See [Transactions & Consistency](05-transactions-consistency.md) and
+[API Reference](21-api-reference.md).
+
+### Vector search
+
+Create a vector index for a label and property, store vectors as `Vector` values (or
+lists of numbers), and search with `db.vector.search`:
+
+```rust
+engine.execute(
+    "CREATE VECTOR INDEX embedding_vec FOR (e:Embedding) ON (e.vector)
+     OPTIONS {dimension: 384, metric: 'cosine'}",
+    &[],
+).await?;
+
+let embedding: Vec<f32> = vec![0.1; 384];
 engine.execute(
     "CREATE (e:Embedding {vector: $vec, text: 'Rust ownership'})",
-    &[("vec", Value::from(embedding))],
+    &[("vec", Value::from(embedding.clone()))],
+).await?;
+
+let hits = engine.execute(
+    "CALL db.vector.search('embedding_vec', $q, 10) YIELD node, score
+     RETURN node.text AS text, score",
+    &[("q", Value::from(embedding))],
 ).await?;
 ```
 
-Today's procedure call is parsed and planned, and runs against the empty index:
-
-```cypher
-CALL db.vector.search('Embedding', $query_vec, 10, 0.7) YIELD node, score
-RETURN node, score
-```
-
-Today's signature is `db.vector.search(label, vector, k[, threshold])`:
-
-- The label is ignored.
-- `k` and the optional threshold must be literals, not parameters.
-- The first `YIELD` column holds the index's internal integer ID, not a node.
-- `score` is `1 - distance`.
-
-Phase 0 populates the index. From Phase 3 the signature becomes
-`db.vector.search(indexName, vector, k[, thresholdOrOptions])`, where `indexName` is a
-vector index created with `CREATE VECTOR INDEX`. The full design is in
-[Vector Index](10-vector-index.md).
+`node` is the record id of the hit, so `node.text` reads its property. The full syntax
+is in [Vector Index](10-vector-index.md).
 
 ## Server Quickstart (Planned — Phase 5)
 
@@ -215,10 +225,11 @@ connect with `ws://localhost:7700` (Phase 6, see [Client SDKs](19-client-sdks.md
 The same Rust `Engine` API will accept `mem://`, `rocksdb://path`, `ws://`, `http://`
 and `tikv://` connection URLs.
 
-## A Taste of Multi-Model Atlantis Cypher (Planned)
+## A Taste of Multi-Model Atlantis Cypher
 
 Every example below is plain Atlantis Cypher, sent through `engine.execute` embedded or
-`POST /query` on a server. Each block names its phase.
+`POST /query` on a server (Phase 5). Each block says whether it works today or names its
+phase.
 
 ### Namespaces, tables and schema (Phase 2)
 
@@ -235,7 +246,7 @@ CREATE CONSTRAINT person_email_unique FOR (p:Person) REQUIRE p.email IS UNIQUE;
 
 See [Schema & DDL](07-schema-ddl.md).
 
-### Documents and record links (Phase 2)
+### Documents and record links (implemented)
 
 ```cypher
 CREATE (o:Order {
@@ -252,10 +263,10 @@ RETURN o.customer.name AS customer, size(o.lines) AS lineCount;
 
 See [Document & Relational](08-document-relational.md).
 
-### Graph traversal (Phase 0 and Phase 3)
+### Graph traversal (implemented; algorithms Phase 3)
 
 ```cypher
-MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..3]->(b:Person)      // Phase 0
+MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..3]->(b:Person)      // implemented
 RETURN DISTINCT b.name;
 
 CALL algo.pagerank('Person', 'KNOWS') YIELD node, score          // Phase 3
@@ -264,7 +275,7 @@ RETURN node.name, score ORDER BY score DESC LIMIT 10;
 
 See [Graph Model](09-graph-model.md).
 
-### Hybrid text + vector search (Phase 3)
+### Hybrid text + vector search (Phase 3; `CREATE VECTOR INDEX` implemented)
 
 ```cypher
 CREATE FULLTEXT INDEX doc_text FOR (d:Doc) ON EACH [d.title, d.body]
@@ -279,7 +290,7 @@ RETURN node.title, score;
 
 See [Full-Text Search](11-full-text-search.md) and [RAG Patterns](24-rag-patterns.md).
 
-### Geospatial (Phase 3)
+### Geospatial (Phase 3; `point()` and `point.distance` work today)
 
 ```cypher
 CREATE POINT INDEX place_location FOR (p:Place) ON (p.location);
@@ -304,18 +315,17 @@ RETURN ts.bucket(r.ts, duration('PT5M')) AS bucket, avg(r.value) AS avgValue;
 
 See [Key-Value & Time-Series](13-key-value-time-series.md).
 
-### Transactions (Phase 1)
+### Transactions (implemented)
 
 ```cypher
 BEGIN;
-MATCH (a:Account {id: rid('Account', 'a')}) SET a.balance = a.balance - 100;
-MATCH (b:Account {id: rid('Account', 'b')}) SET b.balance = b.balance + 100;
+MATCH (a:Account {id: 'a'}) SET a.balance = a.balance - 100;
+MATCH (b:Account {id: 'b'}) SET b.balance = b.balance + 100;
 COMMIT;
 ```
 
 In Rust the same unit of work is written as `engine.transaction(|tx| { ... }).await`
-with a synchronous closure (implemented today for the record API), which does not retry
-on its own;
+with a synchronous closure, which does not retry on its own;
 `engine.transaction_with_retry(max_attempts, f)` retries on `Error::TxConflict`. See
 [Transactions & Consistency](05-transactions-consistency.md).
 

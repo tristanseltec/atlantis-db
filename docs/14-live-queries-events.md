@@ -11,10 +11,11 @@ Atlantis DB becomes reactive through three related features:
 | **Live query** | "Tell me as soon as the result of this query changes." | Push, while the session is open |
 | **Event** | "When this kind of write happens, also do that." | Runs inside the writing transaction |
 
-None of these exist today. The engine (`crates/atlantis-engine/src/actor.rs`) processes
-queries and node writes through one command channel and has no notification or
-subscription path. All three features depend on the transactional storage layer
-(Phase 1) and the table model (Phase 2).
+None of these exist today. The engine (`crates/atlantis-engine/src/datastore.rs`) runs
+queries and record transactions on the caller's task and has no notification or
+subscription path. Commits already report the record ids they changed (`CommitInfo`),
+which today only keeps vector indexes current. All three features build on the
+transactional storage layer (implemented on `mem`) and the table model (Phase 2).
 
 ## Change Feeds (Planned — Phase 4)
 

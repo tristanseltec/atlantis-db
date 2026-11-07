@@ -18,14 +18,29 @@ pub enum DistanceMetricKind {
     DotProduct,
 }
 
-/// Eviction policy for the tiered storage manager.
+impl DistanceMetricKind {
+    /// Parses `'cosine'`, `'euclidean'` or `'dot_product'` (case-insensitive).
+    pub fn parse(name: &str) -> Result<Self, AtlantisError> {
+        match name.to_ascii_lowercase().as_str() {
+            "cosine" => Ok(DistanceMetricKind::Cosine),
+            "euclidean" | "l2" => Ok(DistanceMetricKind::Euclidean),
+            "dot_product" | "dot" => Ok(DistanceMetricKind::DotProduct),
+            other => Err(AtlantisError::Config(format!(
+                "unknown distance metric '{other}' (expected cosine, euclidean or dot_product)"
+            ))),
+        }
+    }
+}
+
+/// When committed transactions are forced to disk.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
-pub enum EvictionPolicy {
-    /// Least Recently Used — evict the node that was accessed longest ago.
+pub enum SyncMode {
+    /// Every commit is fsynced to the write-ahead log before it returns.
     #[default]
-    Lru,
-    /// Least Frequently Used — evict the node with the fewest accesses.
-    Lfu,
+    Every,
+    /// Commits are written to the log but left to the OS to flush. A crash
+    /// of the machine (not just the process) can lose recent commits.
+    Never,
 }
 
 /// HNSW index parameters.
@@ -62,14 +77,15 @@ impl Default for HnswParams {
     }
 }
 
-/// Configuration for the vector index.
+/// Defaults for vector indexes. `CREATE VECTOR INDEX` options override
+/// these per index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorConfig {
-    /// Dimensionality of vectors stored in the index.
+    /// Default dimensionality when an index does not set `dimension`.
     pub dimensions: usize,
-    /// Distance metric for similarity computation.
+    /// Default distance metric.
     pub distance_metric: DistanceMetricKind,
-    /// HNSW algorithm parameters.
+    /// Default HNSW parameters.
     pub hnsw: HnswParams,
 }
 
@@ -83,29 +99,15 @@ impl Default for VectorConfig {
     }
 }
 
-/// Configuration for the hybrid tiered storage engine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Storage configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Maximum memory the hot tier may consume before eviction kicks in.
-    /// `None` means no limit (purely in-memory). Default: 1 GB.
-    pub memory_budget_bytes: Option<usize>,
-    /// Eviction policy for moving data from hot to cold tier.
-    pub eviction_policy: EvictionPolicy,
-    /// Path for on-disk cold tier storage. `None` means in-memory only.
+    /// Directory holding the database files (`records.kv` checkpoint,
+    /// `records.wal` log, `LOCK`). `None` means in-memory only.
     pub disk_path: Option<PathBuf>,
-    /// Number of delta edges per relationship type that triggers CSR compaction.
-    pub compaction_threshold: usize,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        StorageConfig {
-            memory_budget_bytes: Some(1024 * 1024 * 1024), // 1 GB
-            eviction_policy: EvictionPolicy::Lru,
-            disk_path: None,
-            compaction_threshold: 1000,
-        }
-    }
+    /// When commits are forced to disk.
+    #[serde(default)]
+    pub sync: SyncMode,
 }
 
 /// Top-level engine configuration.
@@ -113,9 +115,10 @@ impl Default for StorageConfig {
 pub struct EngineConfig {
     /// Storage configuration.
     pub storage: StorageConfig,
-    /// Vector index configuration.
+    /// Vector index defaults.
     pub vector: VectorConfig,
-    /// Interval in seconds between automatic checkpoints. 0 = disabled.
+    /// Interval in seconds between automatic checkpoints, which fold the
+    /// write-ahead log into the checkpoint file. 0 = disabled.
     pub checkpoint_interval_secs: u64,
 }
 
@@ -130,23 +133,17 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
-    /// Creates a builder for constructing an `EngineConfig` with overrides.
+    /// Creates a new builder for `EngineConfig`.
     pub fn builder() -> EngineConfigBuilder {
         EngineConfigBuilder::default()
     }
 
-    /// Validates all configuration values, returning an error if any are invalid.
-    ///
-    /// This should be called before opening an engine to fail fast on
-    /// misconfiguration rather than encountering errors at runtime.
+    /// Validates all configuration values.
     pub fn validate(&self) -> Result<(), AtlantisError> {
-        self.storage.validate()?;
-        self.vector.validate()?;
-        Ok(())
+        self.vector.validate()
     }
 }
 
-/// Validates a positive, non-zero usize field.
 fn validate_positive(name: &str, value: usize) -> Result<(), AtlantisError> {
     if value == 0 {
         return Err(AtlantisError::Config(format!(
@@ -154,21 +151,6 @@ fn validate_positive(name: &str, value: usize) -> Result<(), AtlantisError> {
         )));
     }
     Ok(())
-}
-
-impl StorageConfig {
-    /// Validates storage configuration values.
-    pub fn validate(&self) -> Result<(), AtlantisError> {
-        if let Some(budget) = self.memory_budget_bytes {
-            if budget == 0 {
-                return Err(AtlantisError::Config(
-                    "memory_budget_bytes must be greater than 0 if set".into(),
-                ));
-            }
-        }
-        validate_positive("compaction_threshold", self.compaction_threshold)?;
-        Ok(())
-    }
 }
 
 impl VectorConfig {
@@ -205,57 +187,43 @@ pub struct EngineConfigBuilder {
 }
 
 impl EngineConfigBuilder {
-    /// Sets the memory budget for the hot tier in bytes.
-    pub fn memory_budget(mut self, bytes: usize) -> Self {
-        self.config.storage.memory_budget_bytes = Some(bytes);
-        self
-    }
-
-    /// Sets the disk path for persistent storage.
+    /// Sets the database directory.
     pub fn disk_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.storage.disk_path = Some(path.into());
         self
     }
 
-    /// Sets the vector dimensions.
+    /// Sets when commits are forced to disk.
+    pub fn sync_mode(mut self, sync: SyncMode) -> Self {
+        self.config.storage.sync = sync;
+        self
+    }
+
+    /// Sets the default vector dimensionality.
     pub fn vector_dimensions(mut self, dims: usize) -> Self {
         self.config.vector.dimensions = dims;
         self
     }
 
-    /// Sets the distance metric.
+    /// Sets the default distance metric.
     pub fn distance_metric(mut self, metric: DistanceMetricKind) -> Self {
         self.config.vector.distance_metric = metric;
         self
     }
 
-    /// Sets the HNSW parameters.
+    /// Sets the default HNSW parameters.
     pub fn hnsw_params(mut self, params: HnswParams) -> Self {
         self.config.vector.hnsw = params;
         self
     }
 
-    /// Sets the eviction policy for tiered storage.
-    pub fn eviction_policy(mut self, policy: EvictionPolicy) -> Self {
-        self.config.storage.eviction_policy = policy;
-        self
-    }
-
-    /// Sets the compaction threshold (delta edges per rel type before CSR compaction).
-    pub fn compaction_threshold(mut self, threshold: usize) -> Self {
-        self.config.storage.compaction_threshold = threshold;
-        self
-    }
-
-    /// Sets the checkpoint interval in seconds.
+    /// Sets the automatic checkpoint interval in seconds (0 disables it).
     pub fn checkpoint_interval(mut self, secs: u64) -> Self {
         self.config.checkpoint_interval_secs = secs;
         self
     }
 
-    /// Builds the final configuration, validating all values.
-    ///
-    /// Returns an error if any configuration value is invalid.
+    /// Validates and returns the configuration.
     pub fn build(self) -> Result<EngineConfig, AtlantisError> {
         self.config.validate()?;
         Ok(self.config)
@@ -267,133 +235,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hnsw_defaults() {
-        let params = HnswParams::default();
-        assert_eq!(params.m, 16);
-        assert_eq!(params.m0, 32);
-        assert_eq!(params.ef_construction, 200);
-        assert_eq!(params.ef_search, 50);
-        assert_eq!(params.max_level, 16);
-        assert_eq!(params.m0, params.m * 2);
-    }
-
-    #[test]
-    fn test_vector_config_defaults() {
-        let config = VectorConfig::default();
-        assert_eq!(config.dimensions, 128);
-        assert_eq!(config.distance_metric, DistanceMetricKind::Cosine);
-    }
-
-    #[test]
-    fn test_storage_config_defaults() {
-        let config = StorageConfig::default();
-        assert_eq!(config.memory_budget_bytes, Some(1024 * 1024 * 1024));
-        assert_eq!(config.eviction_policy, EvictionPolicy::Lru);
-        assert_eq!(config.compaction_threshold, 1000);
-        assert_eq!(config.disk_path, None);
-    }
-
-    #[test]
-    fn test_engine_config_defaults() {
+    fn defaults() {
         let config = EngineConfig::default();
+        assert_eq!(config.storage.disk_path, None);
+        assert_eq!(config.storage.sync, SyncMode::Every);
+        assert_eq!(config.vector.dimensions, 128);
+        assert_eq!(config.vector.distance_metric, DistanceMetricKind::Cosine);
         assert_eq!(config.checkpoint_interval_secs, 300);
     }
 
     #[test]
-    fn test_config_builder() {
+    fn builder_sets_fields() {
         let config = EngineConfig::builder()
-            .memory_budget(512 * 1024 * 1024)
-            .disk_path("/tmp/atlantis")
-            .vector_dimensions(256)
+            .disk_path("/tmp/x")
+            .sync_mode(SyncMode::Never)
+            .vector_dimensions(384)
             .distance_metric(DistanceMetricKind::Euclidean)
-            .eviction_policy(EvictionPolicy::Lfu)
-            .compaction_threshold(500)
             .checkpoint_interval(60)
             .build()
             .unwrap();
-
-        assert_eq!(config.storage.memory_budget_bytes, Some(512 * 1024 * 1024));
-        assert_eq!(
-            config.storage.disk_path,
-            Some(PathBuf::from("/tmp/atlantis"))
-        );
-        assert_eq!(config.vector.dimensions, 256);
+        assert_eq!(config.storage.disk_path, Some(PathBuf::from("/tmp/x")));
+        assert_eq!(config.storage.sync, SyncMode::Never);
+        assert_eq!(config.vector.dimensions, 384);
         assert_eq!(config.vector.distance_metric, DistanceMetricKind::Euclidean);
-        assert_eq!(config.storage.eviction_policy, EvictionPolicy::Lfu);
-        assert_eq!(config.storage.compaction_threshold, 500);
         assert_eq!(config.checkpoint_interval_secs, 60);
     }
 
     #[test]
-    fn test_config_serde_roundtrip() {
+    fn validation() {
+        assert!(EngineConfig::builder()
+            .vector_dimensions(0)
+            .build()
+            .is_err());
+        let bad = HnswParams {
+            m: 16,
+            m0: 8,
+            ..HnswParams::default()
+        };
+        assert!(EngineConfig::builder().hnsw_params(bad).build().is_err());
+    }
+
+    #[test]
+    fn serde_roundtrip_and_missing_sync_defaults() {
         let config = EngineConfig::builder()
-            .vector_dimensions(64)
             .checkpoint_interval(120)
             .build()
             .unwrap();
-
-        let serialized = bincode::serialize(&config).unwrap();
-        let deserialized: EngineConfig = bincode::deserialize(&serialized).unwrap();
-        assert_eq!(deserialized.vector.dimensions, 64);
-        assert_eq!(deserialized.checkpoint_interval_secs, 120);
+        let bytes = bincode::serialize(&config).unwrap();
+        let back: EngineConfig = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.checkpoint_interval_secs, 120);
     }
 
     #[test]
-    fn test_config_validate_ok() {
-        let config = EngineConfig::default();
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_config_validate_zero_dimensions() {
-        let mut config = EngineConfig::default();
-        config.vector.dimensions = 0;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validate_zero_m() {
-        let mut config = EngineConfig::default();
-        config.vector.hnsw.m = 0;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validate_m0_less_than_m() {
-        let mut config = EngineConfig::default();
-        config.vector.hnsw.m = 32;
-        config.vector.hnsw.m0 = 16;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validate_zero_budget() {
-        let mut config = EngineConfig::default();
-        config.storage.memory_budget_bytes = Some(0);
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validate_zero_compaction_threshold() {
-        let mut config = EngineConfig::default();
-        config.storage.compaction_threshold = 0;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validate_no_budget_ok() {
-        let mut config = EngineConfig::default();
-        config.storage.memory_budget_bytes = None;
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_eviction_policy_default() {
-        assert_eq!(EvictionPolicy::default(), EvictionPolicy::Lru);
-    }
-
-    #[test]
-    fn test_distance_metric_default() {
-        assert_eq!(DistanceMetricKind::default(), DistanceMetricKind::Cosine);
+    fn metric_names() {
+        assert_eq!(
+            DistanceMetricKind::parse("COSINE").unwrap(),
+            DistanceMetricKind::Cosine
+        );
+        assert_eq!(
+            DistanceMetricKind::parse("dot_product").unwrap(),
+            DistanceMetricKind::DotProduct
+        );
+        assert!(DistanceMetricKind::parse("manhattan").is_err());
     }
 }

@@ -34,11 +34,10 @@ impl Layer {
     }
 
     fn neighbors(&self, node: NodeId) -> &[NodeId] {
-        self.adjacency.get(&node).map(|v| v.as_slice()).unwrap_or(&[])
-    }
-
-    fn len(&self) -> usize {
-        self.adjacency.len()
+        self.adjacency
+            .get(&node)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -143,7 +142,11 @@ impl HnswIndex {
             let candidates = self.search_layer(node_id, current, ef, l);
 
             // Select M nearest neighbors
-            let m = if l == 0 { self.params.m0 } else { self.params.m };
+            let m = if l == 0 {
+                self.params.m0
+            } else {
+                self.params.m
+            };
             let neighbors = self.select_neighbors(&candidates, m, l);
 
             // Add bidirectional edges
@@ -151,7 +154,11 @@ impl HnswIndex {
                 self.layers[l].add_edge(node_id, neighbor);
 
                 // Prune neighbor's connections if exceeded max
-                let max_conn = if l == 0 { self.params.m0 } else { self.params.m };
+                let max_conn = if l == 0 {
+                    self.params.m0
+                } else {
+                    self.params.m
+                };
                 self.prune_connections(neighbor, max_conn, l);
             }
 
@@ -291,9 +298,16 @@ impl HnswIndex {
     }
 
     /// Greedy search at a single layer using a raw query vector.
-    fn greedy_search_layer_with_vector(&self, query: &[f32], start: NodeId, layer: usize) -> NodeId {
+    fn greedy_search_layer_with_vector(
+        &self,
+        query: &[f32],
+        start: NodeId,
+        layer: usize,
+    ) -> NodeId {
         let mut current = start;
-        let mut current_dist = self.distance.distance(query, self.vectors.get(start).unwrap_or(&[]));
+        let mut current_dist = self
+            .distance
+            .distance(query, self.vectors.get(start).unwrap_or(&[]));
 
         loop {
             let neighbors = self.layers[layer].neighbors(current);
@@ -358,10 +372,7 @@ impl HnswIndex {
 
         while let Some(&(closest_id, closest_dist)) = candidates.last() {
             // Find the farthest in results
-            let farthest_dist = results
-                .iter()
-                .map(|(_, d)| *d)
-                .fold(f32::MIN, f32::max);
+            let farthest_dist = results.iter().map(|(_, d)| *d).fold(f32::MIN, f32::max);
 
             if closest_dist > farthest_dist && results.len() >= ef {
                 break;
@@ -383,10 +394,7 @@ impl HnswIndex {
 
                 if let Some(vec) = self.vectors.get(neighbor) {
                     let dist = self.distance.distance(query, vec);
-                    let farthest = results
-                        .iter()
-                        .map(|(_, d)| *d)
-                        .fold(f32::MIN, f32::max);
+                    let farthest = results.iter().map(|(_, d)| *d).fold(f32::MIN, f32::max);
 
                     if results.len() < ef || dist < farthest {
                         candidates.push((neighbor, dist));
@@ -394,7 +402,9 @@ impl HnswIndex {
 
                         if results.len() > ef {
                             // Remove the farthest
-                            results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                            results.sort_by(|a, b| {
+                                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
                             results.truncate(ef);
                         }
                     }
@@ -416,11 +426,7 @@ impl HnswIndex {
         m: usize,
         _layer: usize,
     ) -> Vec<NodeId> {
-        candidates
-            .iter()
-            .take(m)
-            .map(|(id, _)| *id)
-            .collect()
+        candidates.iter().take(m).map(|(id, _)| *id).collect()
     }
 
     /// Prunes a node's connections to stay within the max limit.
@@ -505,7 +511,7 @@ mod tests {
     }
 
     fn random_vector(dims: usize, seed: f32) -> Vec<f32> {
-        (0..dims).map(|i| ((seed * (i as f32 + 1.0)).sin())).collect()
+        (0..dims).map(|i| (seed * (i as f32 + 1.0)).sin()).collect()
     }
 
     #[test]
@@ -529,14 +535,15 @@ mod tests {
     fn test_insert_and_search() {
         let mut index = make_index(8);
 
-        // Insert 100 vectors
+        // Insert 100 vectors. Seeds start at 0.1: seed 0 would produce the
+        // all-zero vector, which has no direction and ties with everything.
         for i in 0..100 {
-            let vec = random_vector(8, i as f32 * 0.1);
+            let vec = random_vector(8, (i + 1) as f32 * 0.1);
             index.insert(NodeId(i), vec).unwrap();
         }
 
-        // Search for a vector similar to the first one
-        let query = random_vector(8, 0.0);
+        // Search for the first inserted vector itself
+        let query = random_vector(8, 0.1);
         let results = index.search(&query, 5, None).unwrap();
 
         assert!(!results.is_empty());
@@ -549,7 +556,10 @@ mod tests {
     fn test_dimension_mismatch_on_insert() {
         let mut index = make_index(4);
         let result = index.insert(NodeId(0), vec![1.0, 2.0]);
-        assert!(matches!(result, Err(AtlantisError::DimensionMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(AtlantisError::DimensionMismatch { .. })
+        ));
     }
 
     #[test]
@@ -589,7 +599,9 @@ mod tests {
         );
 
         // Insert 500 random vectors
-        let vectors: Vec<Vec<f32>> = (0..500).map(|i| random_vector(32, i as f32 * 0.01)).collect();
+        let vectors: Vec<Vec<f32>> = (0..500)
+            .map(|i| random_vector(32, i as f32 * 0.01))
+            .collect();
         for (i, vec) in vectors.iter().enumerate() {
             index.insert(NodeId(i as u64), vec.clone()).unwrap();
         }
@@ -635,7 +647,9 @@ mod tests {
         }
 
         let params = SearchParams::top_k(3).with_threshold(0.5);
-        let results = index.search_with_params(&[1.0, 0.0, 0.0, 0.0], &params).unwrap();
+        let results = index
+            .search_with_params(&[1.0, 0.0, 0.0, 0.0], &params)
+            .unwrap();
         // With threshold 0.5, only very similar results are kept
         // cosine similarity of [1,0,0,0] and [1,0,0,0] = 1.0, distance = 0.0
         // threshold 0.5 means 1 - dist >= 0.5, so dist <= 0.5

@@ -32,11 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `Engine` also offers `open_with_config`, `checkpoint`, `shutdown`, and the record API
-(`transaction`, `transaction_with_retry`, `read`, `use_db`; see
-[21-api-reference.md](21-api-reference.md)). Errors are `atlantis_db::Error`, an alias
-of `AtlantisError`. Several query features the sample relies on are incomplete (see
-[25-implementation-roadmap.md](25-implementation-roadmap.md), Phase 0). There are no
-connection URLs, no remote connections, no authentication, and no other language SDKs.
+(`transaction`, `transaction_with_retry`, `read`, `use_db`, and Cypher inside a
+transaction with `tx.execute`; see [21-api-reference.md](21-api-reference.md)). Errors
+are `atlantis_db::Error`, an alias of `AtlantisError`. There are no connection URLs, no
+remote connections, no authentication, and no other language SDKs.
 The full current surface is in [21-api-reference.md](21-api-reference.md).
 
 The rest of this chapter is the **target design** for Phase 6. The Rust remote

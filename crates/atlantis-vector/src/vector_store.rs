@@ -120,7 +120,10 @@ mod tests {
     fn test_dimension_mismatch() {
         let mut store = VectorStore::new(3);
         let result = store.insert(vec![1.0, 2.0]);
-        assert!(matches!(result, Err(AtlantisError::DimensionMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(AtlantisError::DimensionMismatch { .. })
+        ));
     }
 
     #[test]

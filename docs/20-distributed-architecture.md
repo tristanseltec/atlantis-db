@@ -11,14 +11,14 @@ failure behaviour and operations.
 
 ## Implemented Today
 
-Nothing in this chapter is implemented. Atlantis DB runs in one process today, with a
-single-writer tokio actor over an in-memory hot tier and an append-only cold tier on
-local disk (see [04-storage-engine.md](04-storage-engine.md) and
-[16-engine-runtime.md](16-engine-runtime.md)). There is no `atlantis-kv` layer yet, and
-no network protocol.
+Nothing in this chapter is implemented. Atlantis DB runs in one process today: record
+transactions on `atlantis-kv` with the in-memory `mem` backend and a local write-ahead
+log (see [04-storage-engine.md](04-storage-engine.md) and
+[16-engine-runtime.md](16-engine-runtime.md)). There is no `tikv` backend and no
+network protocol.
 
 Cluster mode depends on the earlier phases: the transactional KV layer and key encoding
-(Phase 1), the record model and indexes (Phases 2–3), live queries and change feeds
+(Phase 1, implemented on `mem`), the record model and indexes (Phases 2–3), live queries and change feeds
 (Phase 4), and the server (Phase 5). Phase 7 adds the `tikv` backend and the cluster
 behaviour described below.
 
@@ -193,7 +193,7 @@ when held in memory:
 | Secondary B-tree (`atlantis-index`) | `ix/` entries | None needed; range scans go to TiKV |
 | HNSW (`atlantis-vector`) | `vx/` graph and vectors | Graph cache for search |
 | Full-text (`atlantis-text`) | `ft/` postings and statistics | Hot postings and BM25 statistics |
-| Adjacency (`atlantis-storage`) | `g/` entries | CSR adjacency cache |
+| Adjacency (`atlantis-storage`) | `g/` entries | Adjacency cache |
 | Spatial (`atlantis-geo`) | Cell entries | None needed |
 
 Caches are kept correct with **version checks**. Each cached index records the version of

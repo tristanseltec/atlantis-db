@@ -17,10 +17,10 @@ none. The same engine is designed to run embedded in an application, as a standa
 server and as a distributed cluster.
 
 > **Project status:** pre-release. The code today is an embedded engine in seven crates
-> with two stores that do not share data yet: a Cypher graph + vector engine, and a
-> transactional record store (documents, graph nodes and edges in namespaced tables) on
-> an in-memory MVCC key-value layer. Everything else in this README is target design,
-> marked with the phase that delivers it. See the
+> with one transactional record store (documents, graph nodes and edges in namespaced
+> tables) on an in-memory MVCC key-value layer made durable by a write-ahead log. Cypher
+> and the Rust record API read and write the same records. Everything not marked as
+> implemented below is target design, marked with the phase that delivers it. See the
 > [Implementation Roadmap](docs/25-implementation-roadmap.md).
 
 Inspired by the best ideas from:
@@ -43,17 +43,15 @@ full-text relevance, follow graph relationships and filter on document fields.
 
 | Capability | Status |
 |---|---|
-| Embedded Rust library (`atlantis-db`) | Implemented (in-memory or file path; one engine per directory) |
-| Property graph model, Cypher subset (single-node `MATCH`, `WHERE`, `RETURN`, `ORDER BY`, `SKIP`, `LIMIT`) | Partial |
-| Relationship creation, multi-hop and variable-length traversal, `MATCH ... SET`, `MERGE` | Phase 0 |
-| HNSW vector index | Partial (index code exists; the engine does not populate it until Phase 0) |
-| Hot/cold tiered storage with CSR + delta adjacency | Partial (eviction and auto-checkpoint not wired until Phase 0) |
-| Transactional KV layer (`atlantis-kv`), MVCC, snapshot and serializable isolation | Implemented (in-memory `mem` backend, durable only at checkpoints) |
-| Record transactions in Rust (`engine.transaction`, `read`, retry on conflict) | Implemented (record store only; not visible to Cypher yet) |
-| RocksDB backend, sync modes, Cypher on the KV layer, `BEGIN`/`COMMIT` | Phase 1 |
-| Record model: namespaces, databases, tables, `RecordId`, documents, edge tables, label index, extended value types | Partial (Rust record API; `Decimal`, `Range` and Cypher access Phase 2) |
-| Schema DDL, record links, joins, secondary indexes | Phase 2 |
-| Full-text search, geospatial, key-value API, time-series tables, vector index DDL, graph algorithms | Phase 3 |
+| Embedded Rust library (`atlantis-db`) | Implemented (in-memory or a directory; one engine per directory) |
+| Cypher on the record store: `MATCH` (multi-hop, any direction, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation | Implemented |
+| Transactional KV layer (`atlantis-kv`), MVCC, snapshot and serializable isolation, write-ahead log with sync modes `every` / `never` | Implemented (in-memory `mem` backend) |
+| Transactions: Rust closures (`engine.transaction`, `read`, retry on conflict) with Cypher inside, and `BEGIN` / `COMMIT` scripts | Implemented |
+| Record model: namespaces, databases, tables, `RecordId`, nested documents, record links, edge tables, label index, extended value types | Implemented (`Decimal`, `Range` Phase 2) |
+| HNSW vector index: `CREATE VECTOR INDEX`, `db.vector.search` | Implemented (derived from records; filtering and quantization Phase 3) |
+| RocksDB backend, connection URLs, commit sequencer, query timeouts | Phase 1 |
+| Schema DDL, secondary indexes, constraints, cost-based optimizer | Phase 2 |
+| Full-text search, geospatial indexes, key-value API, time-series tables, shortest paths, graph algorithms | Phase 3 |
 | Change feeds, events, live queries | Phase 4 |
 | `atlantis` server, HTTP, WebSocket RPC, users, roles, permissions | Phase 5 |
 | SDKs (Rust remote, Python, JavaScript/TypeScript + WASM, Go, Java), optional Bolt | Phase 6 |
@@ -93,12 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The [Getting Started](docs/01-getting-started.md) guide lists exactly which Cypher
-queries work today.
+The [Getting Started](docs/01-getting-started.md) guide lists what works today.
 
 ### Records and transactions
 
-Records live in a separate record store for now, so Cypher queries do not see them.
+The Rust record API works on the same records as Cypher.
 
 ```rust
 use atlantis_db::{Direction, Engine, Object, Value};
@@ -123,7 +120,11 @@ async fn main() -> Result<(), atlantis_db::Error> {
     }).await?;
     println!("{employers:?}");
 
-    engine.shutdown().await?; // writes records.kv; commits after the last checkpoint are lost on a crash
+    // The same data through Cypher.
+    let rs = engine.execute("MATCH (:Person {id: 'alice'})-[:WORKS_AT]->(c) RETURN c", &[]).await?;
+    assert_eq!(rs.row_count(), 1);
+
+    engine.shutdown().await?; // optional: commits are already durable in records.wal
     Ok(())
 }
 ```
@@ -132,14 +133,21 @@ See [API Reference](docs/21-api-reference.md) for the record API and
 [Transactions & Consistency](docs/05-transactions-consistency.md) for isolation,
 conflicts and durability.
 
-## A Taste of Atlantis Cypher (Planned)
+## A Taste of Atlantis Cypher
 
 ```cypher
-// Phase 2 — schema, documents and record links
-CREATE TABLE Person SCHEMAFULL;
-CREATE FIELD email ON Person TYPE string ASSERT value =~ '.+@.+';
+// Implemented — documents, record links, traversal, vector search
 CREATE (o:Order {customer: rid('Customer', 'c-17'), address: {city: 'Hue'}});
 MATCH (o:Order) WHERE o.address.city = 'Hue' RETURN o.customer.name;
+MATCH (a:Person {id: 'alice'})-[:KNOWS*1..3]->(b) RETURN DISTINCT b.name;
+CREATE VECTOR INDEX chunk_embedding FOR (c:Chunk) ON (c.embedding)
+  OPTIONS {dimension: 1536, metric: 'cosine'};
+CALL db.vector.search('chunk_embedding', $vec, 10) YIELD node, score
+RETURN node.text, score;
+
+// Phase 2 — schema
+CREATE TABLE Person SCHEMAFULL;
+CREATE FIELD email ON Person TYPE string ASSERT value =~ '.+@.+';
 
 // Phase 3 — hybrid full-text + vector search, then graph traversal
 CALL db.search.hybrid({text: 'doc_text', vector: 'chunk_embedding'},
@@ -163,9 +171,9 @@ atlantis start --bind 0.0.0.0:7700 --user root --pass "$ATLANTIS_PASS" rocksdb:/
                          │
  atlantis-server (planned)      protocols, sessions, auth
  atlantis-engine                transactions, permissions, execution, live queries
- atlantis-cypher                parser, planner, cost-based optimizer
+ atlantis-cypher                parser; planner and cost-based optimizer (planned)
  index layer                    atlantis-index · atlantis-vector · atlantis-text · atlantis-geo
- atlantis-storage               records, edges, CSR adjacency cache
+ atlantis-storage               records, edges, adjacency cache (planned)
  atlantis-kv                    transactional ordered KV: mem (today) | rocksdb | tikv
  atlantis-core                  Value, RecordId, errors, config
 ```
