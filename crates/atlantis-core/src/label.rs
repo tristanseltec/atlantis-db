@@ -28,7 +28,6 @@ impl From<&str> for Label {
     fn from(s: &str) -> Self {
         Label::new(s)
     }
-
 }
 
 impl From<String> for Label {

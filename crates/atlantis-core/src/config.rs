@@ -149,7 +149,9 @@ impl EngineConfig {
 /// Validates a positive, non-zero usize field.
 fn validate_positive(name: &str, value: usize) -> Result<(), AtlantisError> {
     if value == 0 {
-        return Err(AtlantisError::Config(format!("{name} must be greater than 0")));
+        return Err(AtlantisError::Config(format!(
+            "{name} must be greater than 0"
+        )));
     }
     Ok(())
 }

@@ -103,13 +103,8 @@ mod tests {
 
     #[test]
     fn test_relationship_serde_roundtrip() {
-        let rel = Relationship::new(
-            EdgeId(10),
-            NodeId(3),
-            NodeId(7),
-            RelType::from("ACTED_IN"),
-        )
-        .with_property("role", "Neo");
+        let rel = Relationship::new(EdgeId(10), NodeId(3), NodeId(7), RelType::from("ACTED_IN"))
+            .with_property("role", "Neo");
 
         let serialized = bincode::serialize(&rel).unwrap();
         let deserialized: Relationship = bincode::deserialize(&serialized).unwrap();

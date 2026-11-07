@@ -4,10 +4,17 @@ use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
 
-/// A property value that can be stored on nodes and relationships.
+use crate::geometry::Geometry;
+use crate::ids::Uuid;
+use crate::record::{Object, RecordId};
+use crate::temporal::{Datetime, Duration};
+
+/// A value stored in a record field, node property or edge property.
 ///
-/// Variants cover the standard property types plus a dedicated `Vector`
-/// variant for embedding data used by the HNSW index.
+/// Variants cover scalars, nested documents (`Object`, `Array`), embeddings
+/// (`Vector`), temporal and spatial types, and links to other records
+/// (`RecordId`). New variants are appended at the end so that values
+/// serialized by earlier versions still decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     /// Absence of a value.
@@ -25,9 +32,45 @@ pub enum Value {
     /// A fixed-dimension float vector for embedding similarity search.
     /// Distinct from `Array` to enable type-checking and efficient HNSW storage.
     Vector(Vec<f32>),
+    /// Raw bytes.
+    Bytes(Vec<u8>),
+    /// A UTC instant with nanosecond precision.
+    Datetime(Datetime),
+    /// A signed length of time.
+    Duration(Duration),
+    /// A UUID.
+    Uuid(Uuid),
+    /// A nested document (field name → value).
+    Object(Object),
+    /// A WGS84 geometry.
+    Geometry(Geometry),
+    /// A link to another record.
+    RecordId(RecordId),
 }
 
 impl Value {
+    /// Returns the value as an object if it is an `Object`.
+    pub fn as_object(&self) -> Option<&Object> {
+        match self {
+            Value::Object(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Returns the value as a record id if it is a `RecordId`.
+    pub fn as_record_id(&self) -> Option<&RecordId> {
+        match self {
+            Value::RecordId(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Follows a dotted path into nested objects, e.g. `address.city`.
+    pub fn get_path(&self, path: &str) -> Option<&Value> {
+        path.split('.')
+            .try_fold(self, |v, part| v.as_object()?.get(part))
+    }
+
     /// Returns the value as a `&str` if it is a `String`.
     pub fn as_string(&self) -> Option<&str> {
         match self {
@@ -89,6 +132,13 @@ impl Value {
             Value::String(_) => "string",
             Value::Array(_) => "array",
             Value::Vector(_) => "vector",
+            Value::Bytes(_) => "bytes",
+            Value::Datetime(_) => "datetime",
+            Value::Duration(_) => "duration",
+            Value::Uuid(_) => "uuid",
+            Value::Object(_) => "object",
+            Value::Geometry(_) => "geometry",
+            Value::RecordId(_) => "record",
         }
     }
 }
@@ -103,6 +153,13 @@ impl PartialEq for Value {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::Datetime(a), Value::Datetime(b)) => a == b,
+            (Value::Duration(a), Value::Duration(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Object(a), Value::Object(b)) => a == b,
+            (Value::Geometry(a), Value::Geometry(b)) => a == b,
+            (Value::RecordId(a), Value::RecordId(b)) => a == b,
             // Cross-type numeric comparison: Integer vs Float
             (Value::Integer(a), Value::Float(b)) => (*a as f64) == *b,
             (Value::Float(a), Value::Integer(b)) => *a == (*b as f64),
@@ -131,6 +188,12 @@ impl PartialOrd for Value {
             (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
             (Value::Array(a), Value::Array(b)) => a.partial_cmp(b),
             (Value::Vector(a), Value::Vector(b)) => a.partial_cmp(b),
+            (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
+            (Value::Datetime(a), Value::Datetime(b)) => Some(a.cmp(b)),
+            (Value::Duration(a), Value::Duration(b)) => Some(a.cmp(b)),
+            (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
+            (Value::Object(a), Value::Object(b)) => a.partial_cmp(b),
+            (Value::RecordId(a), Value::RecordId(b)) => a.partial_cmp(b),
             _ => None,
         }
     }
@@ -164,7 +227,71 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Bytes(b) => {
+                write!(f, "b'")?;
+                for byte in b {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, "'")
+            }
+            Value::Datetime(d) => write!(f, "d'{d}'"),
+            Value::Duration(d) => write!(f, "{d}"),
+            Value::Uuid(u) => write!(f, "u'{u}'"),
+            Value::Object(obj) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k}: {v}")?;
+                }
+                write!(f, "}}")
+            }
+            Value::Geometry(g) => write!(f, "{g}"),
+            Value::RecordId(id) => write!(f, "{id}"),
         }
+    }
+}
+
+impl From<Datetime> for Value {
+    fn from(v: Datetime) -> Self {
+        Value::Datetime(v)
+    }
+}
+
+impl From<Duration> for Value {
+    fn from(v: Duration) -> Self {
+        Value::Duration(v)
+    }
+}
+
+impl From<Uuid> for Value {
+    fn from(v: Uuid) -> Self {
+        Value::Uuid(v)
+    }
+}
+
+impl From<Object> for Value {
+    fn from(v: Object) -> Self {
+        Value::Object(v)
+    }
+}
+
+impl From<Geometry> for Value {
+    fn from(v: Geometry) -> Self {
+        Value::Geometry(v)
+    }
+}
+
+impl From<RecordId> for Value {
+    fn from(v: RecordId) -> Self {
+        Value::RecordId(v)
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(v: Vec<u8>) -> Self {
+        Value::Bytes(v)
     }
 }
 
@@ -360,5 +487,67 @@ mod tests {
             let deserialized: Value = bincode::deserialize(&serialized).unwrap();
             assert_eq!(v, &deserialized);
         }
+    }
+
+    #[test]
+    fn test_multi_model_variants_roundtrip() {
+        use crate::{Geometry, Point, RecordId, Uuid};
+        let mut address = Object::new();
+        address.insert("city".into(), Value::from("Hue"));
+        let mut doc = Object::new();
+        doc.insert("address".into(), Value::Object(address));
+        doc.insert(
+            "owner".into(),
+            Value::RecordId("Person:alice".parse::<RecordId>().unwrap()),
+        );
+        let values = vec![
+            Value::Bytes(vec![0xde, 0xad]),
+            Value::Datetime("2026-11-07T13:46:10Z".parse().unwrap()),
+            Value::Duration("1h30m".parse().unwrap()),
+            Value::Uuid(Uuid::new_v4()),
+            Value::Object(doc.clone()),
+            Value::Geometry(Geometry::Point(Point::new(107.59, 16.46).unwrap())),
+            Value::RecordId("Order:42".parse().unwrap()),
+        ];
+        for v in &values {
+            let bytes = bincode::serialize(v).unwrap();
+            let back: Value = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(v, &back);
+        }
+        let doc = Value::Object(doc);
+        assert_eq!(doc.get_path("address.city"), Some(&Value::from("Hue")));
+        assert_eq!(doc.get_path("address.zip"), None);
+        assert_eq!(
+            doc.get_path("owner")
+                .and_then(Value::as_record_id)
+                .unwrap()
+                .table,
+            "Person"
+        );
+    }
+
+    #[test]
+    fn test_legacy_encoding_still_decodes() {
+        // Variant indices 0..=6 predate the multi-model types; values written
+        // by earlier versions must keep decoding to the same variant.
+        let legacy = [
+            (Value::Null, 0u32),
+            (Value::Integer(7), 2),
+            (Value::Vector(vec![1.0]), 6),
+        ];
+        for (v, index) in legacy {
+            let bytes = bincode::serialize(&v).unwrap();
+            assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), index);
+        }
+    }
+
+    #[test]
+    fn test_new_variant_display() {
+        assert_eq!(Value::Bytes(vec![0xde, 0xad]).to_string(), "b'dead'");
+        let dt: crate::Datetime = "2026-11-07T00:00:00Z".parse().unwrap();
+        assert_eq!(Value::from(dt).to_string(), "d'2026-11-07T00:00:00Z'");
+        let id: crate::RecordId = "Person:alice".parse().unwrap();
+        assert_eq!(Value::from(id).to_string(), "Person:alice");
+        assert_eq!(Value::Uuid(crate::Uuid([0; 16])).type_name(), "uuid");
     }
 }

@@ -129,7 +129,10 @@ mod tests {
         assert!(node.has_label(&Label::from("Person")));
         assert!(node.has_label(&Label::from("Adult")));
         assert!(!node.has_label(&Label::from("Child")));
-        assert_eq!(node.get_property("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(
+            node.get_property("name"),
+            Some(&Value::String("Alice".into()))
+        );
         assert_eq!(node.get_property("age"), Some(&Value::Integer(30)));
         assert_eq!(node.get_property("missing"), None);
     }
