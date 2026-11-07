@@ -288,10 +288,7 @@ mod tests {
         let mut store = CsrStore::new();
         assert!(store.is_empty());
 
-        store.build_rel_type(
-            RelType::from("KNOWS"),
-            &[(NodeId(0), NodeId(1), EdgeId(0))],
-        );
+        store.build_rel_type(RelType::from("KNOWS"), &[(NodeId(0), NodeId(1), EdgeId(0))]);
         assert_eq!(store.len(), 1);
 
         let csr = store.get(&RelType::from("KNOWS")).unwrap();

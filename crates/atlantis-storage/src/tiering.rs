@@ -1,7 +1,7 @@
 //! Tiering manager for moving data between hot and cold tiers.
 
-use atlantis_core::{NodeId, StorageConfig};
 use atlantis_core::AtlantisError;
+use atlantis_core::{NodeId, StorageConfig};
 
 use crate::cold_tier::ColdTier;
 use crate::hot_tier::HotTier;
@@ -16,11 +16,7 @@ pub struct TieringManager<'a> {
 
 impl<'a> TieringManager<'a> {
     /// Creates a new tiering manager with references to both tiers.
-    pub fn new(
-        hot: &'a mut HotTier,
-        cold: &'a mut ColdTier,
-        config: &'a StorageConfig,
-    ) -> Self {
+    pub fn new(hot: &'a mut HotTier, cold: &'a mut ColdTier, config: &'a StorageConfig) -> Self {
         TieringManager { hot, cold, config }
     }
 
@@ -56,7 +52,10 @@ impl<'a> TieringManager<'a> {
     /// Promotes a node from the cold tier back to the hot tier.
     ///
     /// Returns the node if it was found in the cold tier.
-    pub fn promote(&mut self, node_id: NodeId) -> Result<Option<atlantis_core::Node>, AtlantisError> {
+    pub fn promote(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<Option<atlantis_core::Node>, AtlantisError> {
         if !self.cold.contains(node_id) {
             return Ok(None);
         }
@@ -96,7 +95,10 @@ mod tests {
         let mut cold = ColdTier::open(dir.path()).unwrap();
         let config = make_storage_config(1_000_000_000); // 1GB budget
 
-        hot.insert_node(LabelSet::from_iter([Label::from("Test")]), PropertyMap::new());
+        hot.insert_node(
+            LabelSet::from_iter([Label::from("Test")]),
+            PropertyMap::new(),
+        );
 
         let mut mgr = TieringManager::new(&mut hot, &mut cold, &config);
         let evicted = mgr.maybe_evict().unwrap();

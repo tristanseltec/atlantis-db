@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use atlantis_core::{EdgeId, Label, Node, NodeId, RelType, Relationship, StorageConfig};
 use atlantis_core::AtlantisError;
+use atlantis_core::{EdgeId, Label, Node, NodeId, RelType, Relationship, StorageConfig};
 
 use crate::cold_tier::PageLocation;
 use crate::hot_tier::HotTier;
@@ -47,10 +47,7 @@ pub fn serialize_hot_tier(hot: &HotTier, cold_index: &HashMap<NodeId, PageLocati
     let mut label_index: HashMap<Label, Vec<NodeId>> = HashMap::new();
     for node in &nodes {
         for label in node.labels.iter() {
-            label_index
-                .entry(label.clone())
-                .or_default()
-                .push(node.id);
+            label_index.entry(label.clone()).or_default().push(node.id);
         }
     }
 
@@ -90,7 +87,11 @@ pub fn deserialize_store(data: &[u8]) -> Result<SerializedStore, AtlantisError> 
 }
 
 /// Writes the serialized store to a file at the given path.
-pub fn checkpoint(hot: &HotTier, cold_index: &HashMap<NodeId, PageLocation>, path: &Path) -> Result<(), AtlantisError> {
+pub fn checkpoint(
+    hot: &HotTier,
+    cold_index: &HashMap<NodeId, PageLocation>,
+    path: &Path,
+) -> Result<(), AtlantisError> {
     let data = serialize_hot_tier(hot, cold_index);
     std::fs::write(path, &data)?;
     Ok(())
@@ -116,7 +117,9 @@ pub fn restore(data: &[u8]) -> Result<(HotTier, HashMap<NodeId, PageLocation>), 
 }
 
 /// Restores from a file path.
-pub fn restore_from_file(path: &Path) -> Result<(HotTier, HashMap<NodeId, PageLocation>), AtlantisError> {
+pub fn restore_from_file(
+    path: &Path,
+) -> Result<(HotTier, HashMap<NodeId, PageLocation>), AtlantisError> {
     let data = std::fs::read(path)?;
     restore(&data)
 }

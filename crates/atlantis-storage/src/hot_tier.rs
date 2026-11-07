@@ -87,10 +87,7 @@ impl HotTier {
 
         // Update label index
         for label in node.labels.iter() {
-            self.label_index
-                .entry(label.clone())
-                .or_default()
-                .push(id);
+            self.label_index.entry(label.clone()).or_default().push(id);
         }
 
         let slot = if let Some(slot) = self.free_node_slots.pop() {
@@ -237,7 +234,7 @@ impl HotTier {
         if let Some(Some(edge)) = self.edges.get_mut(id.0 as usize) {
             let from = edge.from;
             let _ = edge.from; // edge.from used before clearing
-            // Remove from delta logs
+                               // Remove from delta logs
             for delta in self.deltas.values_mut() {
                 delta.remove_edge(id);
             }
@@ -333,9 +330,8 @@ impl HotTier {
             .iter()
             .filter_map(|n| n.as_ref())
             .map(|n| {
-                std::mem::size_of::<Node>()
-                    + n.labels.len() * 32
-                    + n.properties.len() * 64 // rough: key + value
+                std::mem::size_of::<Node>() + n.labels.len() * 32 + n.properties.len() * 64
+                // rough: key + value
             })
             .sum();
 
@@ -343,9 +339,7 @@ impl HotTier {
             .edges
             .iter()
             .filter_map(|e| e.as_ref())
-            .map(|e| {
-                std::mem::size_of::<Relationship>() + e.properties.len() * 64
-            })
+            .map(|e| std::mem::size_of::<Relationship>() + e.properties.len() * 64)
             .sum();
 
         node_mem + edge_mem
@@ -489,7 +483,10 @@ mod tests {
         let id = tier.insert_node(LabelSet::new(), PropertyMap::new());
 
         tier.set_property(id, "score", Value::from(42i64));
-        assert_eq!(tier.get_node(id).unwrap().get_property("score"), Some(&Value::Integer(42)));
+        assert_eq!(
+            tier.get_node(id).unwrap().get_property("score"),
+            Some(&Value::Integer(42))
+        );
 
         tier.remove_property(id, "score");
         assert_eq!(tier.get_node(id).unwrap().get_property("score"), None);

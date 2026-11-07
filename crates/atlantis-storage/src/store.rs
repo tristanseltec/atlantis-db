@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use atlantis_core::AtlantisError;
 use atlantis_core::{
     Direction, EdgeId, Label, LabelSet, Node, NodeId, PropertyMap, RelType, Relationship,
     StorageConfig, Value,
 };
-use atlantis_core::AtlantisError;
 
 use crate::cold_tier::{ColdTier, PageLocation};
 use crate::hot_tier::HotTier;

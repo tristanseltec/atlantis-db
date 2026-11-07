@@ -79,9 +79,9 @@ impl DeltaLog {
 
     /// Returns an iterator over `(from, to, edge_id)` tuples.
     pub fn iter(&self) -> impl Iterator<Item = (NodeId, NodeId, EdgeId)> + '_ {
-        self.entries.iter().flat_map(|(&from, pairs)| {
-            pairs.iter().map(move |&(to, edge_id)| (from, to, edge_id))
-        })
+        self.entries
+            .iter()
+            .flat_map(|(&from, pairs)| pairs.iter().map(move |&(to, edge_id)| (from, to, edge_id)))
     }
 }
 
@@ -96,7 +96,10 @@ mod tests {
         delta.insert(NodeId(0), NodeId(2), EdgeId(1));
         delta.insert(NodeId(1), NodeId(2), EdgeId(2));
 
-        assert_eq!(delta.get(NodeId(0)), [(NodeId(1), EdgeId(0)), (NodeId(2), EdgeId(1))]);
+        assert_eq!(
+            delta.get(NodeId(0)),
+            [(NodeId(1), EdgeId(0)), (NodeId(2), EdgeId(1))]
+        );
         assert_eq!(delta.get(NodeId(1)), [(NodeId(2), EdgeId(2))]);
         assert!(delta.get(NodeId(99)).is_empty());
     }

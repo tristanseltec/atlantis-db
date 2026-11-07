@@ -9,8 +9,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use atlantis_core::{Node, NodeId};
 use atlantis_core::AtlantisError;
+use atlantis_core::{Node, NodeId};
 
 /// Location of a node within the cold tier page file.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -52,7 +52,8 @@ impl ColdTier {
 
     /// Writes a node to the cold tier, recording its location.
     pub fn write_node(&mut self, node: &Node) -> Result<PageLocation, AtlantisError> {
-        let data = bincode::serialize(node).map_err(|e| AtlantisError::Serialization(e.to_string()))?;
+        let data =
+            bincode::serialize(node).map_err(|e| AtlantisError::Serialization(e.to_string()))?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let size = data.len() as u32;
         self.file.write_all(&data)?;
@@ -72,7 +73,8 @@ impl ColdTier {
         self.file.seek(SeekFrom::Start(loc.offset))?;
         let mut buf = vec![0u8; loc.size as usize];
         self.file.read_exact(&mut buf)?;
-        let node: Node = bincode::deserialize(&buf).map_err(|e| AtlantisError::Serialization(e.to_string()))?;
+        let node: Node =
+            bincode::deserialize(&buf).map_err(|e| AtlantisError::Serialization(e.to_string()))?;
         Ok(node)
     }
 
@@ -184,7 +186,10 @@ mod tests {
         assert_eq!(cold.len(), 10);
         for i in 0..10 {
             let node = cold.read_node(NodeId(i)).unwrap();
-            assert_eq!(node.get_property("name"), Some(&Value::String(format!("User{i}").into())));
+            assert_eq!(
+                node.get_property("name"),
+                Some(&Value::String(format!("User{i}").into()))
+            );
         }
     }
 
