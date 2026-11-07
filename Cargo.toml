@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/atlantis-core",
+    "crates/atlantis-kv",
     "crates/atlantis-storage",
     "crates/atlantis-vector",
     "crates/atlantis-cypher",
@@ -32,6 +33,7 @@ chumsky = "0.10"
 
 # Internal crates
 atlantis-core = { path = "crates/atlantis-core" }
+atlantis-kv = { path = "crates/atlantis-kv" }
 atlantis-storage = { path = "crates/atlantis-storage" }
 atlantis-vector = { path = "crates/atlantis-vector" }
 atlantis-cypher = { path = "crates/atlantis-cypher" }

@@ -100,6 +100,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlantis-kv"
+version = "0.1.0"
+dependencies = [
+ "atlantis-core",
+ "bincode",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "atlantis-storage"
 version = "0.1.0"
 dependencies = [
