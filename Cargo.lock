@@ -90,6 +90,7 @@ dependencies = [
  "bincode",
  "proptest",
  "serde",
+ "tracing",
 ]
 
 [[package]]

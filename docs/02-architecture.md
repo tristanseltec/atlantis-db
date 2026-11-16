@@ -162,7 +162,8 @@ client ── POST /query or WS {method: "query"} ──────────
 
 Today Cypher statements and record transactions run as optimistic MVCC transactions
 on the `mem` backend; commits are validated and logged one at a time under a
-store-wide lock. The per-database commit sequencer below is still planned.
+store-wide lock, and made durable outside it with group commit. The per-database
+commit sequencer below is still planned.
 
 - **Writes**: each database has one **commit sequencer**, which replaces today's
   store-wide commit lock. It orders commits and validates conflicts.
@@ -226,7 +227,7 @@ All operators read through the same `RecordTx`, so they share one snapshot
 | **Fusion** | `atlantis-engine` | `HybridFuse` merges the ranked lists by reciprocal rank fusion (`1 / (60 + rank)` by default, weights per input), then re-applies the allow set as a safety check. |
 | **Index image** | `atlantis-vector`, `atlantis-text` | At each checkpoint, every built index writes an image file tagged with the checkpoint's `Versionstamp`. On open, the engine loads the image and replays only records changed after it, so a 1M-vector database opens in under a second. A missing or mismatched image falls back to a rebuild from records, so images stay derived data. |
 | **Concurrency** | `atlantis-engine` | One lock per index (*done*). Searches take a read lock; commit apply takes a short write lock per batch. Search and index builds run on a query worker pool, not on the async executor (open). |
-| **Group commit** | `atlantis-kv` | The commit sequencer batches the write-ahead-log fsyncs of concurrent commits, so durable ingest scales with writers instead of being bound by one fsync per commit. |
+| **Group commit** | `atlantis-kv` | *Done* (in `MemStore`, ahead of the sequencer). The commit path batches the write-ahead-log fsyncs of concurrent commits, so durable ingest scales with writers instead of being bound by one fsync per commit. |
 
 ### Why Versioned Index Entries
 
@@ -420,7 +421,7 @@ See [Engine Runtime](16-engine-runtime.md) for the details.
 
 | Today | Target | Phase |
 |---|---|---|
-| Store-wide commit lock in `MemStore` | Commit sequencer per database plus concurrent snapshot readers | 1 |
+| Store-wide staging lock in `MemStore`, group commit outside it | Commit sequencer per database plus concurrent snapshot readers | 1 |
 | `mem` backend with write-ahead log and checkpoint file | Adds the `rocksdb` backend (default persistent) | 1 |
 | Traversal by prefix scans of adjacency keys | Plus an in-memory adjacency cache rebuilt from `g/` keys | 1 (open) |
 | HNSW rebuilt in memory from records on first search | Checkpointed index image plus replay of later commits; `vx/` keys for the distributed backend | Focus track |

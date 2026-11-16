@@ -16,7 +16,7 @@ docs refers to a phase defined here.
 | Item | State |
 |---|---|
 | Phase 0 — graph + vector core | Essentially complete. Cypher runs on the record store; every parser and executor gap listed for Phase 0 is fixed and pinned by integration tests; vector indexes are populated and derived from records. Not done, and moved: `shortestPath`/`allShortestPaths` and `algo.*` stay in Phase 3; HNSW persistence is replaced by rebuilding indexes from records (persistence in `vx/` keys stays open, below); the Criterion baseline is not recorded. |
-| Phase 1 — transactional storage | Mostly done. Done: the `atlantis-kv` crate, memcomparable keys, MVCC with snapshot and serializable isolation, the `mem` backend with a write-ahead log (`SyncMode::Every`/`Never`), crash recovery and periodic checkpoints, one engine per directory (`LOCK`), record transactions on `Engine`, Cypher on KV (the legacy graph store is deleted), multi-statement scripts with `BEGIN`/`COMMIT`/`ROLLBACK`, and Cypher inside Rust transactions. Open: the `rocksdb` backend and backend features, the `interval` sync mode, the per-database commit sequencer, the adjacency cache, HNSW in `vx/` keys, `Engine::connect`, config keys, query workers off the async executor and `query.timeout`. The importer from legacy checkpoints is dropped: opening a legacy `checkpoint.db` fails with an error. |
+| Phase 1 — transactional storage | Mostly done. Done: the `atlantis-kv` crate, memcomparable keys, MVCC with snapshot and serializable isolation, the `mem` backend with a write-ahead log (`SyncMode::Every`/`Never`), crash recovery and periodic checkpoints, one engine per directory (`LOCK`), record transactions on `Engine`, Cypher on KV (the legacy graph store is deleted), multi-statement scripts with `BEGIN`/`COMMIT`/`ROLLBACK`, and Cypher inside Rust transactions. Also done: group commit, the `interval` sync mode and `transaction.isolation`. Open: the `rocksdb` backend and backend features, the per-database commit sequencer, the adjacency cache, HNSW in `vx/` keys, `Engine::connect`, config keys, query workers off the async executor and `query.timeout`. The importer from legacy checkpoints is dropped: opening a legacy `checkpoint.db` fails with an error. |
 | Phase 2 — unified record model | Partial. Done: `RecordId`/`RecordKey`, `Record`, `Edge`, the extended `Value` types except `Decimal` and `Range`, namespaces and databases (`DatabaseRef`, `use_db` for Cypher and records), the table catalog with implicit schemaless tables, edge tables with endpoint restrictions, `_default`, the secondary label index, nested document access and updates, map literals as `Object`, record links that dereference, `id(n)`/`rid()`, explicit keys through Cypher `{id: ...}`. Open: schema DDL, fields and assertions, `atlantis-index` B-tree indexes and constraints, `CREATE NAMESPACE`/`CREATE DATABASE`/`USE`, the planner and cost-based optimizer, `EXPLAIN`, and engine-level record helpers. |
 | Phase 3 — search | Partial. Done: `CREATE VECTOR INDEX` / `DROP INDEX` with per-index options, `db.vector.search(indexName, ...)` with threshold and `efSearch`, filtered vector search with `WHERE` push-down (F3), `point()` and `point.distance`. Open: everything else in Phase 3. |
 
@@ -114,7 +114,7 @@ them: the transactional hybrid retrieval path. In order:
 | F3 | **Filtered search**: *done:* allow-set bitmaps, exact and filtered-traversal strategies chosen per query by a cost estimate, per-field columns with value maps kept current by commits, `WHERE`-after-`YIELD` push-down of field comparisons (filtered recall@10 0.09 → 1.00 at 1% selectivity, p50 0.15 ms at 20k × 768). Open: push-down of labels, nested fields and `OR`; property indexes to replace columns; measurement at 1M | Phase 2 (planner), Phase 3 | recall@10 ≥ 0.95 at 1% selectivity |
 | F4 | **Consistent search**: versioned index entries, transaction overlay (read-your-writes), index image at checkpoint | Phase 1, Phase 3 | A write is searchable in its own transaction; open of 1M vectors < 1 s |
 | F5 | **BM25 and fusion**: `atlantis-text`, `db.text.search`, `db.search.hybrid` with RRF, on the same snapshot | Phase 3 | Hybrid p50 / p99 ≤ 3 ms / ≤ 8 ms under mixed load |
-| F6 | **Group commit** in the commit sequencer | Phase 1 | Durable ingest ≥ 50,000 records/s |
+| F6 | **Group commit**: *done* in `MemStore` ahead of the sequencer (single-record durable commits 204/s → 6,198/s at 64 writers on NVMe; readers under write load 801 → 4,695 QPS), with the `interval` sync mode and `transaction.isolation`. Open: the per-database sequencer; 50,000/s needs multi-record transactions or index maintenance off the commit path (F4) | Phase 1 | Durable ingest ≥ 50,000 records/s |
 | F7 | **`atlantis-py`**: embedded Python package (PyO3, NumPy buffers, GIL released) | Ahead of Phase 6 | The RAG patterns in [24](24-rag-patterns.md) run from Python |
 | F8 | **Publish** the benchmark and results | — | Reproducible by a third party |
 
@@ -213,9 +213,11 @@ model shares ACID storage.
   traits (`begin`, `get`, `set`, `delete`, `scan`, `commit`, `cancel`) and the
   memcomparable key encoding from [04 — Storage Engine](04-storage-engine.md).
 - *Done:* MVCC with snapshot isolation by default and optional serializable isolation.
-- *Done:* the `mem` backend with a write-ahead log, sync modes `every` and `never`,
-  crash recovery, and periodic and explicit checkpoints. Open: the `rocksdb` backend,
-  the `interval` sync mode, and the Cargo features `kv-mem` and `kv-rocksdb`.
+- *Done:* the `mem` backend with a write-ahead log, sync modes `every`, `interval` and
+  `never`, group commit (fsync outside the store lock, shared by concurrent commits,
+  durable commits published in version order), idempotent catalog writes, crash
+  recovery, and periodic and explicit checkpoints. Open: the `rocksdb` backend and the
+  Cargo features `kv-mem` and `kv-rocksdb`.
 - *Done:* Cypher on KV; the legacy graph store is deleted. Open: an adjacency cache
   rebuilt from `g/` keys, and HNSW persisted under `vx/`.
 - A commit sequencer per database, replacing the store-wide commit lock, and query work
@@ -225,9 +227,9 @@ model shares ACID storage.
   `;` scripts, `BEGIN`/`COMMIT`/`ROLLBACK`, and Cypher inside transactions
   (`Transaction::execute`).
 - `Engine::connect("mem://" | "rocksdb://...")`.
-- Config keys `storage.url`, `storage.sync`, `transaction.isolation`, `query.timeout`
-  and the cache sizes. *Done:* `StorageConfig::sync` and `checkpoint_interval_secs` in
-  `EngineConfig`.
+- Config keys `storage.url`, `query.timeout` and the cache sizes. *Done:*
+  `StorageConfig::sync` (with `Interval`), `transaction.isolation`
+  (`TransactionConfig`) and `checkpoint_interval_secs` in `EngineConfig`.
 - *Dropped:* the importer from legacy checkpoints. Opening a directory with only a
   legacy `checkpoint.db` fails with an error.
 

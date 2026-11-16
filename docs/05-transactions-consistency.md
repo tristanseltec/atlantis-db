@@ -1,6 +1,6 @@
 # 05 — Transactions & Consistency
 
-> **Status:** Partially implemented — transactions on the `mem` backend (MVCC, snapshot and serializable isolation, conflicts, retry, write-ahead-log durability with sync modes `every` and `never`) for Cypher and the Rust record API, and `BEGIN`/`COMMIT`/`ROLLBACK` scripts, are implemented; the `interval` sync mode, `rocksdb` and the commit sequencer Planned — Phase 1; change-feed versionstamps Phase 4
+> **Status:** Partially implemented — transactions on the `mem` backend (MVCC, snapshot and serializable isolation, conflicts, retry, write-ahead-log durability with group commit and sync modes `every`, `interval` and `never`, a configurable default isolation) for Cypher and the Rust record API, and `BEGIN`/`COMMIT`/`ROLLBACK` scripts, are implemented; `rocksdb` and the per-database commit sequencer Planned — Phase 1; change-feed versionstamps Phase 4
 > **Crates:** `atlantis-kv`, `atlantis-storage`, `atlantis-db`, `atlantis-engine`
 
 This chapter defines the transaction model of Atlantis DB: ACID guarantees, MVCC, isolation levels, explicit transactions in Cypher and Rust, conflict handling and retry, durability modes, and the versionstamps that change feeds use.
@@ -15,10 +15,10 @@ Every Cypher statement and every Rust record transaction runs as a transaction o
 
 | Property | Today |
 |---|---|
-| Isolation | MVCC. Snapshot isolation by default; serializable with `transaction_with_isolation(Isolation::Serializable, ...)`. Cypher sent through `Engine::execute` always uses snapshot isolation. |
+| Isolation | MVCC. Snapshot isolation by default; serializable with `transaction_with_isolation(Isolation::Serializable, ...)`. `Engine::transaction`, `transaction_with_retry` and Cypher sent through `Engine::execute` use `transaction.isolation` (snapshot unless configured). |
 | Atomicity | All keys a transaction writes (records, adjacency entries, label entries, catalog entries) commit together or not at all. A closure that returns `Err`, or a Cypher statement that fails, writes nothing. |
 | Consistency | Table kind (normal or edge), edge endpoint tables, existing endpoints that are not themselves edges, and detach-before-delete are checked inside the transaction (`SchemaViolation`, `RecordNotFound`, `RecordExists`). `relate` rewrites both endpoint records unchanged, so a concurrent delete of an endpoint fails with `TxConflict` instead of leaving a dangling edge. Field schemas are Phase 2. |
-| Durability | An engine opened on a directory appends every committing transaction to a write-ahead log (`records.wal`) before the commit returns. With the default `SyncMode::Every` the log is fsynced first, so an acknowledged commit survives a crash or power loss. With `SyncMode::Never` flushing is left to the OS: commits survive a process crash, but recent ones can be lost if the machine fails. An in-memory engine (`Engine::open_in_memory`) is not durable. |
+| Durability | An engine opened on a directory appends every committing transaction to a write-ahead log (`records.wal`) before the commit returns. With the default `SyncMode::Every` the commit waits for an fsync covering its record (shared with concurrent commits, outside the store lock), so an acknowledged commit survives a crash or power loss. With `SyncMode::Interval` a background thread fsyncs periodically. With `SyncMode::Never` flushing is left to the OS: commits survive a process crash, but recent ones can be lost if the machine fails. An in-memory engine (`Engine::open_in_memory`) is not durable. |
 | Concurrent engines | `Engine::open(dir)` takes an exclusive `LOCK` file in the directory, so a second engine on the same directory fails with "already open in another engine". |
 | Conflicts | First committer wins. A losing commit fails with `TxConflict`, which `is_retryable()` reports as retryable. |
 | Multi-statement Cypher | A `;`-separated script runs each statement in its own transaction, unless statements are grouped in `BEGIN; ... COMMIT;`. Inside a Rust transaction, `tx.execute` runs Cypher in that transaction; a failed statement makes the whole transaction roll back. |
@@ -48,7 +48,7 @@ Atlantis DB uses multi-version concurrency control. Writers never block readers,
 - Writes are buffered in the transaction and become visible to others only at commit, under a new **commit version**.
 - Concurrency is **optimistic**: no locks are taken while the transaction runs. Conflicts are detected at commit.
 
-Each backend supplies the versions. `mem` keeps a version list per key, validates and applies commits one at a time under a store-wide lock, and prunes versions that no open snapshot can read. Planned: `rocksdb` uses snapshots plus the per-database commit sequencer (Phase 1), and `tikv` uses timestamps from its placement driver (Phase 7).
+Each backend supplies the versions. `mem` keeps a version list per key, validates and stages commits one at a time under a store-wide lock (held only for validation and the log append, never for an fsync), publishes them in version order once durable, and prunes versions that no open snapshot can read. Planned: `rocksdb` uses snapshots plus the per-database commit sequencer (Phase 1), and `tikv` uses timestamps from its placement driver (Phase 7).
 
 ### Isolation levels (Implemented)
 
@@ -59,7 +59,7 @@ Each backend supplies the versions. `mem` keeps a version list per key, validate
 
 **Write skew** is the anomaly snapshot isolation allows. Example: two transactions each check "at least one doctor is on call", each sees two doctors, and each takes a different doctor off call. Both commit under snapshot isolation; under serializable one of them fails with a conflict.
 
-Choose serializable for invariants that span several records and are not covered by a unique constraint. It costs more memory (the read set is tracked) and causes more retries under contention. Today the level is set per transaction with `engine.transaction_with_isolation`. A transaction without writes commits without validation. A database-wide default (`transaction.isolation`) is Phase 1 ([22 — Configuration](22-configuration.md)).
+Choose serializable for invariants that span several records and are not covered by a unique constraint. It costs more memory (the read set is tracked) and causes more retries under contention. The level is set per transaction with `engine.transaction_with_isolation`, or for the whole engine with `transaction.isolation` (builder method `default_isolation`), which `engine.transaction`, `transaction_with_retry` and Cypher statements use ([22 — Configuration](22-configuration.md)). A transaction without writes commits without validation.
 
 ### Implicit and explicit transactions (Implemented)
 
@@ -127,15 +127,34 @@ Guidance for callers:
 
 `engine.transaction` and `engine.execute` do not retry. `engine.transaction_with_retry(max_attempts, f)` re-runs the closure from the start on a retryable error, up to `max_attempts` attempts in total, immediately and without backoff; add backoff in the caller if contention is high. A single Cypher statement that fails with `TxConflict` is safe to resend because it has no client-side state.
 
-### Durability and sync modes (Partially implemented — `every` and `never` on `mem`; `interval` and `rocksdb` Phase 1)
+### Durability and sync modes (Implemented on `mem`; `rocksdb` Phase 1)
 
 A commit is first written to the backend's write-ahead log: `records.wal` for `mem` today ([04 — Storage Engine](04-storage-engine.md#write-ahead-log-and-checkpoints-implemented--mem-backend)), RocksDB's own log in Phase 1. The sync mode (`StorageConfig::sync`, builder method `sync_mode`) controls when the log is flushed to stable storage:
 
 | Mode | Behaviour | Data at risk on power loss | Status |
 |---|---|---|---|
-| `every` (`SyncMode::Every`, default) | fsync on every commit before returning | None | Implemented |
-| `interval` | fsync on a timer | Commits within the last interval | Phase 1 |
+| `every` (`SyncMode::Every`, default) | Commit returns and becomes visible only after an fsync covering it; concurrent commits share one fsync (group commit) | None | Implemented |
+| `interval` (`SyncMode::Interval(duration)`) | A background thread fsyncs at the interval; commits return at once | Commits within the last interval | Implemented |
 | `never` (`SyncMode::Never`) | Leave flushing to the OS | Anything not yet flushed by the OS | Implemented |
+
+**Group commit.** The store lock covers only validation and the log append. A commit
+waiting for durability either joins the fsync in flight or leads the next one, which
+covers every record appended so far, so throughput grows with the number of concurrent
+writers while each commit waits about two fsyncs. Committed state becomes visible in
+version order only once durable, and reads never wait for an fsync. Measured on an NVMe
+drive with an fdatasync of about 4.8 ms (`rbench --workloads ingest --dir`):
+
+| Durable ingest, NVMe, 1 record per transaction | Before (fsync under the lock) | Group commit |
+|---|---|---|
+| 1 writer | 205/s, p50 4.8 ms | 206/s, p50 4.8 ms |
+| 8 writers | 204/s, p50 39 ms | 912/s, p50 9.4 ms |
+| 32 writers | 204/s, p50 156 ms | 3,174/s, p50 10.0 ms |
+| 64 writers | 204/s, p50 311 ms | 6,198/s, p50 10.3 ms |
+
+One writer stays bound by the fsync latency; batch records into larger transactions for
+bulk loads. Under the mixed read/write workload on disk, readers went from 801 to 4,695
+QPS (p99 22.6 → 3.8 ms), since they no longer queue behind fsyncs
+(`benches/results/2026-11-16-small-dir-group-commit.*`).
 
 All modes survive a process crash and a clean exit. Checkpoints fold the log into `records.kv` to bound its size and the recovery time; durability does not depend on them. Recovery replays the log after the checkpoint and stops at the first torn or corrupt record, so the recovered state is always a prefix of the commit history. With `tikv` (Phase 7), durability comes from Raft replication and the `sync` mode does not apply. Configuration keys are in [22 — Configuration](22-configuration.md).
 
@@ -165,7 +184,7 @@ It has no deadlocks and no lock manager, and it maps directly onto the commit mo
 Partial transactions are a common source of corrupted application state. A transaction either fully applies or fully disappears.
 
 **Why one commit sequencer per database?**
-It replaces today's store-wide commit lock with a component that only orders commits per database, while reads and query execution run concurrently on snapshots. Ordering per database also gives versionstamps a simple meaning ([16 — Engine Runtime](16-engine-runtime.md)).
+It replaces today's store-wide staging lock (which no longer covers fsyncs) with a component that only orders commits per database, while reads and query execution run concurrently on snapshots. Ordering per database also gives versionstamps a simple meaning ([16 — Engine Runtime](16-engine-runtime.md)).
 
 ## What's Next
 

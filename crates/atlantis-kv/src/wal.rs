@@ -19,6 +19,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use atlantis_core::AtlantisError;
 use serde::{Deserialize, Serialize};
@@ -35,14 +37,22 @@ const HEADER_LEN: usize = 8;
 /// When commits are forced to stable storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SyncMode {
-    /// `fdatasync` the log before every commit returns: an acknowledged
-    /// commit survives power loss.
+    /// The log is `fdatasync`ed before a commit returns or becomes visible:
+    /// an acknowledged commit survives power loss. Concurrent commits share
+    /// one sync (group commit).
     #[default]
     Every,
+    /// A background thread syncs the log at this interval; commits return
+    /// without waiting. Power loss can lose the commits of the last interval.
+    Interval(Duration),
     /// Never sync the log on commit; the OS flushes it eventually. Commits
     /// survive a process crash but may be lost on power loss.
     Never,
 }
+
+/// A handle to the active log file that can be synced without the store
+/// lock. [`Wal::rotate`] replaces the file inside it.
+pub(crate) type SyncHandle = Arc<Mutex<Arc<File>>>;
 
 /// One committed transaction as stored in the log.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -176,13 +186,16 @@ fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// The active log of a durable store. Accessed only under the store's write
-/// lock, so log order equals commit-version order.
+/// The active log of a durable store. Appended to only under the store's
+/// write lock, so log order equals commit-version order. Syncing happens
+/// outside that lock, through [`Wal::sync_handle`].
 pub(crate) struct Wal {
     dir: PathBuf,
     file: File,
     size: u64,
     sync: SyncMode,
+    /// A clone of `file` for syncing without the store lock.
+    sync_handle: SyncHandle,
     /// Set when a failure left the files in an unknown state; every later
     /// append or rotation fails until the store is reopened (which recovers).
     broken: bool,
@@ -199,13 +212,29 @@ impl Wal {
         if !existed {
             sync_dir(dir)?;
         }
+        let sync_handle = Arc::new(Mutex::new(Arc::new(file.try_clone()?)));
         Ok(Wal {
             dir: dir.to_path_buf(),
             file,
             size,
             sync,
+            sync_handle,
             broken: false,
         })
+    }
+
+    pub(crate) fn sync_mode(&self) -> SyncMode {
+        self.sync
+    }
+
+    /// The handle the group-commit leader and the interval syncer sync.
+    pub(crate) fn sync_handle(&self) -> SyncHandle {
+        self.sync_handle.clone()
+    }
+
+    /// Marks the log unusable (a sync failed elsewhere).
+    pub(crate) fn mark_broken(&mut self) {
+        self.broken = true;
     }
 
     pub(crate) fn dir(&self) -> &Path {
@@ -226,10 +255,10 @@ impl Wal {
         }
     }
 
-    /// Appends one framed record and, with [`SyncMode::Every`], syncs it.
-    /// On failure the log is cut back to its previous length; if even that
-    /// fails (or the sync failed, leaving the page cache state unknown) the
-    /// log is marked broken.
+    /// Appends one framed record without syncing it; the caller makes it
+    /// durable (group commit, the interval syncer, or not at all). On
+    /// failure the log is cut back to its previous length; if even that
+    /// fails the log is marked broken.
     pub(crate) fn append(&mut self, frame: &[u8]) -> Result<(), AtlantisError> {
         self.check_usable()?;
         if let Err(e) = self.file.write_all(frame) {
@@ -239,14 +268,6 @@ impl Wal {
             return Err(AtlantisError::Storage(format!(
                 "write-ahead log append failed: {e}"
             )));
-        }
-        if self.sync == SyncMode::Every {
-            if let Err(e) = self.file.sync_data() {
-                self.broken = true;
-                return Err(AtlantisError::Storage(format!(
-                    "write-ahead log sync failed: {e}"
-                )));
-            }
         }
         self.size += frame.len() as u64;
         Ok(())
@@ -287,7 +308,17 @@ impl Wal {
                 Ok(file)
             })();
             match reopened {
-                Ok(file) => self.file = file,
+                Ok(file) => {
+                    let clone = match file.try_clone() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.broken = true;
+                            return Err(e.into());
+                        }
+                    };
+                    *self.sync_handle.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(clone);
+                    self.file = file;
+                }
                 Err(e) => {
                     self.broken = true;
                     return Err(e.into());
@@ -300,6 +331,8 @@ impl Wal {
 
     #[cfg(test)]
     pub(crate) fn replace_file_for_test(&mut self, file: File) {
+        *self.sync_handle.lock().unwrap_or_else(|e| e.into_inner()) =
+            Arc::new(file.try_clone().expect("clone test file"));
         self.file = file;
     }
 }

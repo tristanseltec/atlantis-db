@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="880" height="236" viewBox="0 0 880 236" role="img" aria-labelledby="title desc" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif'>
 <title id="title">Focus track: the transactional hybrid retrieval path</title>
-<desc id="desc">F1 Retrieval Bench: Partly done; F2 Vector core: Partly done; F3 Filtered search: Done; F4 Consistent search: Next; F5 BM25 + fusion: Designed; F6 Group commit: Designed; F7 Python package: Designed; F8 Publish results: Designed</desc>
+<desc id="desc">F1 Retrieval Bench: Partly done; F2 Vector core: Partly done; F3 Filtered search: Done; F4 Consistent search: Next; F5 BM25 + fusion: Designed; F6 Group commit: Done; F7 Python package: Designed; F8 Publish results: Designed</desc>
 <defs><marker id="arrow-ink2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#52514e"/></marker><marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#6f6d68"/></marker><marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#2a78d6"/></marker></defs>
 <rect x="0.5" y="0.5" width="879" height="235" rx="12" fill="#fcfcfb" stroke="#dcdbd3"/>
 <text x="28" y="40" font-size="18" font-weight="650" fill="#0b0b0b" text-anchor="start">Focus track</text>
@@ -36,7 +36,8 @@
 <text x="492.85714285714283" y="146" font-size="14" font-weight="650" fill="#0b0b0b" text-anchor="middle">F5</text>
 <text x="492.85714285714283" y="165" font-size="13" font-weight="400" fill="#52514e" text-anchor="middle">BM25 +</text>
 <text x="492.85714285714283" y="182" font-size="13" font-weight="400" fill="#52514e" text-anchor="middle">fusion</text>
-<circle cx="598.5714285714286" cy="110" r="13" fill="#fcfcfb" stroke="#6f6d68" stroke-width="2" stroke-dasharray="4 3"/>
+<circle cx="598.5714285714286" cy="110" r="13" fill="#2a78d6"/>
+<path d="M593.0714285714286,110.5 L597.0714285714286,114.5 L604.5714285714286,106" fill="none" stroke="#fcfcfb" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="598.5714285714286" y="146" font-size="14" font-weight="650" fill="#0b0b0b" text-anchor="middle">F6</text>
 <text x="598.5714285714286" y="165" font-size="13" font-weight="400" fill="#52514e" text-anchor="middle">Group</text>
 <text x="598.5714285714286" y="182" font-size="13" font-weight="400" fill="#52514e" text-anchor="middle">commit</text>

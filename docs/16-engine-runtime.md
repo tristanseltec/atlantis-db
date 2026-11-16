@@ -48,10 +48,11 @@ There is no actor, no command channel and no tokio task of its own.
 ### Concurrency properties
 
 - **Transactions run on the calling task.** Snapshot reads and buffered writes need no
-  lock; several transactions run concurrently. Only commits are serialized, by the
-  store-wide lock in `MemStore`.
+  lock; several transactions run concurrently. Commits are validated and staged one at a
+  time under the store-wide lock in `MemStore`, which is released before the WAL fsync;
+  concurrent commits share fsyncs (group commit, [05](05-transactions-consistency.md#durability-and-sync-modes-implemented-on-mem-rocksdb-phase-1)).
 - **The async API is synchronous inside.** The `async` methods of `Engine` do their work
-  on the calling task before returning: query execution, the WAL fsync of every commit,
+  on the calling task before returning: query execution, waiting for the WAL fsync,
   and the first-search build of a vector index, which holds that index's write lock
   (searches of the index wait for it; other indexes do not). A heavy call therefore blocks its tokio worker thread. For large
   workloads, call the engine from `tokio::task::spawn_blocking` or from a dedicated

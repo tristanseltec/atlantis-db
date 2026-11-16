@@ -278,7 +278,7 @@ ROADMAP = [
     ("F3", "Filtered", "search", "done"),
     ("F4", "Consistent", "search", "next"),
     ("F5", "BM25 +", "fusion", "designed"),
-    ("F6", "Group", "commit", "designed"),
+    ("F6", "Group", "commit", "done"),
     ("F7", "Python", "package", "designed"),
     ("F8", "Publish", "results", "designed"),
 ]
@@ -326,7 +326,7 @@ def roadmap(mode: str) -> None:
     step = (right - left) / (len(ROADMAP) - 1)
     for i in range(len(ROADMAP) - 1):
         x1, x2 = left + i * step + 15, left + (i + 1) * step - 15
-        done = ROADMAP[i + 1][3] in ("done", "partial", "next")
+        done = ROADMAP[i][3] != "designed" and ROADMAP[i + 1][3] != "designed"
         s.line(x1, cy, x2, cy, stroke="blue" if done else "axis", sw=2)
     for i, (k, a, b, st) in enumerate(ROADMAP):
         cx = left + i * step

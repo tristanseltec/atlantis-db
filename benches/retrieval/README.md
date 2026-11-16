@@ -40,6 +40,7 @@ Deterministic (seeded SplitMix64; the same corpus on every machine):
 | `graphrag` | Filtered top-k → document → mentioned entity → related entities, one thread |
 | `concurrent` | The graph-RAG query on `--threads` threads for `--duration` seconds: QPS and latency |
 | `mixed` | `concurrent` while a writer adds memories at `--write-rate` per second: reader latency, achieved write rate, write latency |
+| `ingest` | `--threads` writers each commit one plain record per transaction (no embedding) for `--duration`: durable commits/s and commit latency. Use `--dir` on a real disk |
 | `freshness` | Writes a memory and searches for it in the same transaction, then rolls back; the share of probes where search saw the write |
 | `reopen` | With `--dir`: close, reopen, time to the first answer (index rebuild included) |
 

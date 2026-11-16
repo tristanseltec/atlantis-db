@@ -319,6 +319,17 @@ impl Adapter for Atlantis {
         }
     }
 
+    fn ingest_record(&self, id: u64, user: u32, text: &str) -> anyhow::Result<()> {
+        let mut o = Object::new();
+        o.insert("user".into(), Value::Integer(user as i64));
+        o.insert("text".into(), Value::from(text));
+        block_on(self.engine().transaction(|tx| {
+            tx.create("Event", Some(RecordKey::Integer(id as i64)), vec![], o)?;
+            Ok(())
+        }))?;
+        Ok(())
+    }
+
     fn reopen(&self) -> anyhow::Result<Option<Duration>> {
         let Some(dir) = &self.dir else {
             return Ok(None);

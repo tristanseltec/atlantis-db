@@ -71,4 +71,8 @@ pub trait Adapter: Send + Sync {
     /// Closes and reopens a persistent database; returns the time until the
     /// first query is answered. `None` for in-memory runs.
     fn reopen(&self) -> anyhow::Result<Option<Duration>>;
+
+    /// Writes one plain record (no embedding, no edge) in its own durable
+    /// transaction: the commit path without index maintenance.
+    fn ingest_record(&self, id: u64, user: u32, text: &str) -> anyhow::Result<()>;
 }

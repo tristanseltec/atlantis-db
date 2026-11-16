@@ -31,6 +31,7 @@ const WORKLOADS: &[&str] = &[
     "graphrag",
     "concurrent",
     "mixed",
+    "ingest",
     "freshness",
     "reopen",
 ];
@@ -223,6 +224,10 @@ fn main() -> anyhow::Result<()> {
             write_errors: w.errors,
         });
     }
+    if has("ingest") {
+        eprintln!("[ingest] {} writers, {:?}", s.threads, s.duration);
+        r.ingest = Some(workload::ingest(a, &ds, s, &next_id)?);
+    }
     if has("freshness") {
         eprintln!("[freshness]");
         r.reads_own_writes = Some(workload::reads_own_writes(
@@ -380,6 +385,14 @@ fn markdown(r: &Report) -> String {
             "Write (mixed)",
             &mx.write_latency,
             format!("{} errors", mx.write_errors),
+        );
+    }
+    if let Some(ing) = &res.ingest {
+        row(
+            &mut m,
+            &format!("Ingest, {} writers, 1 record/tx", ing.threads),
+            &ing.commit_latency,
+            format!("{:.0} records/s; {} errors", ing.records_per_s, ing.errors),
         );
     }
     if let Some(f) = res.reads_own_writes {

@@ -182,13 +182,15 @@ impl RecordTx {
         if self.catalog_checked {
             return Ok(());
         }
+        // Idempotent: concurrent first writes register identical entries
+        // without conflicting.
         let ns_key = keys::namespace_def(&self.db.ns);
         if self.tx.get(&ns_key)?.is_none() {
-            self.tx.set(ns_key, encode(&self.db.ns)?)?;
+            self.tx.set_idempotent(ns_key, encode(&self.db.ns)?)?;
         }
         let db_key = keys::database_def(&self.db);
         if self.tx.get(&db_key)?.is_none() {
-            self.tx.set(db_key, encode(&self.db)?)?;
+            self.tx.set_idempotent(db_key, encode(&self.db)?)?;
         }
         self.catalog_checked = true;
         Ok(())
@@ -266,8 +268,10 @@ impl RecordTx {
             name: name.to_string(),
             kind,
         };
+        // An implicit definition is deterministic, so concurrent first
+        // writes to a new table do not conflict over it.
         self.tx
-            .set(keys::table_def(&self.db, name), encode(&def)?)?;
+            .set_idempotent(keys::table_def(&self.db, name), encode(&def)?)?;
         Ok(def)
     }
 

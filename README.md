@@ -74,9 +74,9 @@ built in the open, and this is the best time to shape them.
 | Works today | In progress (focus track) |
 |---|---|
 | Embedded engine, in memory or on disk with a write-ahead log and crash recovery | Snapshot-consistent, read-your-writes search (F4) |
-| MVCC transactions: snapshot and serializable isolation, retry on conflict | Persisted index images: open 1M vectors in under a second (F4) |
+| MVCC transactions: snapshot and serializable isolation (configurable default), retry on conflict, group commit | Persisted index images: open 1M vectors in under a second (F4) |
 | Cypher: `MATCH` (multi-hop, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation, `BEGIN`/`COMMIT` | BM25 full-text and `db.search.hybrid` with rank fusion (F5) |
-| Record model: namespaces, tables, documents, record links, edge tables | Group commit (F6) |
+| Record model: namespaces, tables, documents, record links, edge tables | Per-database commit sequencer |
 | HNSW vector index (SIMD kernels, parallel build, per-index locks) with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package (F7) |
 | Filtered vector search: `YIELD ... WHERE node.field = $x` runs inside the index, recall@10 1.00 at 1% selectivity | Faster vector core: SQ8 quantization, AVX-512 and NEON |
 | Retrieval Bench harness with exact ground truth | Competitor adapters for the benchmark |
@@ -208,7 +208,7 @@ Current numbers and the gaps between them and the targets are tracked in
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/roadmap.dark.svg">
-  <img alt="Focus track: F1 Retrieval Bench and F2 vector core partly done; F3 filtered search done; F4 consistent search next; F5 BM25 and fusion, F6 group commit, F7 Python package and F8 publish results designed." src="docs/assets/roadmap.light.svg" width="100%">
+  <img alt="Focus track: F1 Retrieval Bench and F2 vector core partly done; F3 filtered search and F6 group commit done; F4 consistent search next; F5 BM25 and fusion, F7 Python package and F8 publish results designed." src="docs/assets/roadmap.light.svg" width="100%">
 </picture>
 
 | Step | What | Status |
@@ -218,7 +218,7 @@ Current numbers and the gaps between them and the targets are tracked in
 | **F3** | Filtered search inside HNSW, with predicate pushdown from Cypher | Done: filtered recall@10 0.09 → 1.00 at 1% selectivity |
 | **F4** | Versioned index entries, transaction overlay, persisted index images | Next |
 | **F5** | BM25 (`atlantis-text`) and `db.search.hybrid` | Designed |
-| **F6** | Group commit | Designed |
+| **F6** | Group commit | Done: durable commits scale with writers (204/s → 6,198/s at 64), reads never wait on fsync |
 | **F7** | Embedded Python package (PyO3) | Designed |
 | **F8** | Publish benchmark results against competitors | — |
 
@@ -241,7 +241,7 @@ contributions shape the core.
 | **Filtered search** | Push down labels, nested fields and `OR`; property indexes behind allow sets | Algorithms, research papers made real |
 | **Full-text** (`atlantis-text`, new crate) | Analyzers, inverted index, BM25, rank fusion | Information retrieval |
 | **Query engine** (`atlantis-cypher`, `atlantis-engine`) | Predicate pushdown, a first planner, batched execution, `EXPLAIN` | Compilers, query optimization |
-| **Storage** (`atlantis-kv`) | RocksDB backend, group commit, versioned index entries | Transactions, durability, MVCC |
+| **Storage** (`atlantis-kv`) | RocksDB backend, the per-database commit sequencer, versioned index entries | Transactions, durability, MVCC |
 | **Python** (`atlantis-py`, new crate) | PyO3 bindings, NumPy buffers, a LangChain / LlamaIndex integration | Developer experience, the AI ecosystem |
 | **Benchmarks** (`benches/retrieval`) | Adapters for SurrealDB, LadybugDB, FalkorDB, Neo4j, Qdrant + Neo4j | Fair, reproducible measurement |
 | **Commerce** ([docs/27](docs/27-commerce.md)) | Reference schema, dataset generator, MCP tool gateway | Product building, agentic commerce |

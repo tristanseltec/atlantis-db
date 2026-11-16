@@ -63,6 +63,7 @@ pub struct Datastore {
 fn kv_sync(sync: SyncMode) -> atlantis_kv::SyncMode {
     match sync {
         SyncMode::Every => atlantis_kv::SyncMode::Every,
+        SyncMode::Interval(d) => atlantis_kv::SyncMode::Interval(d),
         SyncMode::Never => atlantis_kv::SyncMode::Never,
     }
 }
@@ -136,6 +137,12 @@ impl Datastore {
         self.inner.dir.as_deref()
     }
 
+    /// The isolation of read-write transactions that do not choose one
+    /// (`transaction.isolation`).
+    pub fn default_isolation(&self) -> Isolation {
+        self.inner.config.transaction.isolation
+    }
+
     /// Starts a transaction in database `db`.
     pub fn begin(
         &self,
@@ -175,7 +182,11 @@ impl Datastore {
                             "BEGIN inside an open transaction".into(),
                         ));
                     }
-                    open = Some(self.begin(db.clone(), TxMode::ReadWrite, Isolation::Snapshot)?);
+                    open = Some(self.begin(
+                        db.clone(),
+                        TxMode::ReadWrite,
+                        self.default_isolation(),
+                    )?);
                 }
                 Statement::Commit => {
                     let tx = open.take().ok_or_else(|| {
@@ -192,8 +203,11 @@ impl Datastore {
                     last = match open.as_mut() {
                         Some(tx) => tx.run(other, params)?,
                         None => {
-                            let mut tx =
-                                self.begin(db.clone(), TxMode::ReadWrite, Isolation::Snapshot)?;
+                            let mut tx = self.begin(
+                                db.clone(),
+                                TxMode::ReadWrite,
+                                self.default_isolation(),
+                            )?;
                             let result = tx.run(other, params)?;
                             tx.commit()?;
                             result
