@@ -45,14 +45,26 @@ Cosine distance clamps the similarity to `[-1, 1]` and returns `1 - similarity`:
 identical vectors give 0.0, orthogonal 1.0, opposite 2.0. A zero vector gives 1.0.
 `distance::from_kind(DistanceMetricKind)` builds a boxed metric from the config enum.
 
+The kernels under them, `distance::dot` and `distance::l2_squared`, use AVX2 and FMA on
+x86-64 when the CPU has them (detected at run time) and otherwise a portable loop with
+sixteen independent accumulators that the compiler vectorises. `HnswIndex` does not go
+through the boxed trait: it takes a `DistanceMetricKind`, stores `1 / ‖v‖` for every
+vector at insert, so a cosine distance costs one dot product, and keeps Euclidean
+distances squared internally (the square root is taken only on results).
+
 ### HNSW Index
 
 **File:** [`crates/atlantis-vector/src/hnsw.rs`](../crates/atlantis-vector/src/hnsw.rs)
 
-`HnswIndex` holds one adjacency map per layer (`HashMap<NodeId, Vec<NodeId>>`) of
-**directed** links, a `VectorStore`, the entry point (the node with the highest level),
-the current maximum level, the distance metric, and a `deleted` tombstone set. It
-follows Malkov & Yashunin (2018), Algorithms 1, 2 and 4.
+`HnswIndex` is laid out for the search loop. Node ids are dense slots (below
+`u32::MAX`; the engine assigns them sequentially). Vectors live in one contiguous `f32`
+arena (`VectorStore`, slot `i` at `i * dim`). Layer-0 links, which every search walks,
+are one flat `u32` array with a fixed stride of `m0 + 1` per node (a count, then the
+ids); upper-layer links are per-node lists. Links are **directed**. Per slot it also
+keeps the inverse norm, the node's level and a tombstone flag, plus the entry point
+(the node with the highest level) and the current maximum level. Searches mark visited
+nodes in an epoch-stamped array reused per thread, and prefetch the next neighbour's
+vector. It follows Malkov & Yashunin (2018), Algorithms 1, 2 and 4.
 
 **Insertion** — `insert(node_id, vector)`. The caller supplies the ID.
 
@@ -201,9 +213,10 @@ Only the definition is stored; the HNSW graph is **derived data** held in memory
 - **Restart.** Nothing but the definition survives a restart; the first search rebuilds
   the graph from records.
 
-Builds and updates run synchronously on the calling task, under one mutex shared by all
-indexes, so the first search of a large index blocks other index work for the length of
-the build ([16 — Engine Runtime](16-engine-runtime.md)).
+Builds and updates run synchronously on the calling task. Each built index has its own
+read-write lock: searches of an index run in parallel, a build holds its index's write
+lock (other indexes stay available), and a commit write-locks only the indexes of its
+database while it applies its changes ([16 — Engine Runtime](16-engine-runtime.md)).
 
 ## Target Design
 
@@ -289,8 +302,8 @@ Combining vector similarity with BM25 keyword relevance through Reciprocal Rank 
 
 ### Concurrency
 
-Today the built indexes sit behind one mutex in the engine: searches, builds and
-post-commit updates take it in turn. In the target runtime, writers go through the
+Today each built index sits behind its own read-write lock in the engine: searches
+share it, and builds and post-commit updates take it exclusively. In the target runtime, writers go through the
 commit sequencer and readers search a consistent snapshot concurrently
 (see [05 — Transactions & Consistency](05-transactions-consistency.md) and
 [16 — Engine Runtime](16-engine-runtime.md)).

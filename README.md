@@ -171,7 +171,7 @@ Current numbers and the gaps between them and the targets are tracked in
 | Step | What | Status |
 |---|---|---|
 | **F1** | Retrieval Bench: corpus, ground truth, workloads, report | Done for Atlantis; competitor adapters open |
-| **F2** | Vector core: HNSW correctness, SIMD, contiguous storage, per-index locks, SQ8 | Correctness done; speed in progress |
+| **F2** | Vector core: HNSW correctness, SIMD, contiguous storage, per-index locks, SQ8 | Correctness, SIMD, arena and locks done (7× faster search, 9× faster build); parallel build and SQ8 open |
 | **F3** | Filtered search inside HNSW, with predicate pushdown from Cypher | Next |
 | **F4** | Versioned index entries, transaction overlay, persisted index images | Designed |
 | **F5** | BM25 (`atlantis-text`) and `db.search.hybrid` | Designed |
@@ -194,7 +194,7 @@ contributions shape the core.
 
 | Area | Good first steps | You'll enjoy this if you like |
 |---|---|---|
-| **Vector search** (`atlantis-vector`) | Precompute norms, SIMD distance kernels, contiguous vector arena, SQ8 quantization with re-ranking | Performance engineering, ANN algorithms |
+| **Vector search** (`atlantis-vector`) | Parallel index build, AVX-512 and NEON kernels, SQ8 quantization with re-ranking | Performance engineering, ANN algorithms |
 | **Filtered search** (F3) | Allow-set bitmaps; exact, filtered-traversal and post-filter strategies chosen per query | Algorithms, research papers made real |
 | **Full-text** (`atlantis-text`, new crate) | Analyzers, inverted index, BM25, rank fusion | Information retrieval |
 | **Query engine** (`atlantis-cypher`, `atlantis-engine`) | Predicate pushdown, a first planner, batched execution, `EXPLAIN` | Compilers, query optimization |

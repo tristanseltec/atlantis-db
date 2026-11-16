@@ -3,51 +3,43 @@
 //! Implements the HNSW algorithm for approximate nearest neighbor search.
 //! Builds a multi-layer graph where upper layers are sparse (for fast
 //! navigation) and the base layer is dense (for accurate search).
+//!
+//! Layout, chosen for the search loop:
+//!
+//! - vectors live in one contiguous arena ([`VectorStore`]);
+//! - layer-0 links, which every search walks, are one flat `u32` array with
+//!   a fixed stride of `m0 + 1` per node (a count, then the ids), so a
+//!   node's links sit next to each other in memory;
+//! - upper-layer links (a few percent of nodes) are per-node lists;
+//! - the inverse norm of every vector is computed once at insert, so a
+//!   cosine distance is one dot product;
+//! - visited sets are epoch-stamped arrays reused per thread instead of a
+//!   hash set per search.
+//!
+//! Ids are dense slot numbers (`NodeId` below `u32::MAX`); the engine
+//! assigns them sequentially.
 
+use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 
 use rand::Rng;
 
-use atlantis_core::{AtlantisError, NodeId};
+use atlantis_core::{AtlantisError, DistanceMetricKind, NodeId};
 
-use crate::distance::DistanceMetric;
+use crate::distance::{cosine_from_dot, dot, inverse_norm, l2_squared};
 use crate::params::SearchParams;
 use crate::vector_store::VectorStore;
 
-/// A single layer of the HNSW graph.
-///
-/// Edges are **directed**: `adjacency[a]` is the list of nodes `a` links to.
-/// When a list is pruned, only that list changes; the nodes that link *to*
-/// `a` keep their links. Storing edges undirected and pruning both
-/// directions (the previous design) silently disconnected nodes.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-struct Layer {
-    /// Adjacency: node ID -> the node IDs it links to at this layer.
-    adjacency: HashMap<NodeId, Vec<NodeId>>,
-}
-
-impl Layer {
-    fn new() -> Self {
-        Layer {
-            adjacency: HashMap::new(),
-        }
-    }
-
-    fn neighbors(&self, node: NodeId) -> &[NodeId] {
-        self.adjacency
-            .get(&node)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-}
+/// `levels[i]` of a slot that holds no node.
+const NO_LEVEL: u8 = u8::MAX;
 
 /// A node and its distance to the current query, ordered by distance
 /// (then id, so equal distances order deterministically).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Scored {
     dist: f32,
-    id: NodeId,
+    id: u32,
 }
 
 impl Eq for Scored {}
@@ -62,19 +54,74 @@ impl Ord for Scored {
     fn cmp(&self, other: &Self) -> Ordering {
         self.dist
             .total_cmp(&other.dist)
-            .then(self.id.0.cmp(&other.id.0))
+            .then(self.id.cmp(&other.id))
     }
+}
+
+/// A query vector with its inverse norm, computed once per search.
+struct Query<'a> {
+    v: &'a [f32],
+    inv_norm: f32,
+}
+
+/// Visited marks for one search: slot `i` was visited iff
+/// `marks[i] == epoch`. Starting a search bumps the epoch instead of
+/// clearing the array.
+#[derive(Default)]
+struct Visited {
+    marks: Vec<u32>,
+    epoch: u32,
+}
+
+impl Visited {
+    fn start(&mut self, slots: usize) {
+        if self.marks.len() < slots {
+            self.marks.resize(slots, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.marks.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Marks `i`; `true` if it was not marked yet.
+    #[inline]
+    fn insert(&mut self, i: u32) -> bool {
+        let m = &mut self.marks[i as usize];
+        if *m == self.epoch {
+            false
+        } else {
+            *m = self.epoch;
+            true
+        }
+    }
+}
+
+thread_local! {
+    static VISITED: RefCell<Visited> = RefCell::new(Visited::default());
 }
 
 /// The HNSW vector index.
 pub struct HnswIndex {
     params: crate::params::HnswParams,
-    layers: Vec<Layer>,
+    metric: DistanceMetricKind,
     vectors: VectorStore,
-    entry_point: Option<NodeId>,
+    /// Per slot: `1 / ‖v‖` (0 for the zero vector or an empty slot).
+    inv_norms: Vec<f32>,
+    /// Per slot: the node's top layer, or [`NO_LEVEL`].
+    levels: Vec<u8>,
+    /// Layer-0 links, stride `m0 + 1`: `[count, id_0, .., id_{m0-1}]`.
+    /// Links are **directed**: pruning a node's list never removes the links
+    /// other nodes hold to it (undirected pruning disconnected nodes).
+    layer0: Vec<u32>,
+    /// Per slot: links at layers `1..=level` (`upper[i][l - 1]`).
+    upper: Vec<Vec<Vec<u32>>>,
+    /// Per slot: tombstoned. Deleted nodes stay in the graph as waypoints.
+    deleted: Vec<bool>,
+    deleted_count: usize,
+    entry_point: Option<u32>,
     max_level: usize,
-    distance: Box<dyn DistanceMetric>,
-    deleted: HashSet<NodeId>,
 }
 
 impl HnswIndex {
@@ -82,17 +129,23 @@ impl HnswIndex {
     pub fn new(
         params: crate::params::HnswParams,
         dimensions: usize,
-        distance: Box<dyn DistanceMetric>,
+        metric: DistanceMetricKind,
     ) -> Self {
-        let max_level = params.max_level;
+        let mut params = params;
+        params.m = params.m.max(1);
+        params.m0 = params.m0.max(params.m);
         HnswIndex {
             params,
-            layers: vec![Layer::new(); max_level + 1],
-            vectors: VectorStore::with_capacity(dimensions, 1024),
+            metric,
+            vectors: VectorStore::new(dimensions),
+            inv_norms: Vec::new(),
+            levels: Vec::new(),
+            layer0: Vec::new(),
+            upper: Vec::new(),
+            deleted: Vec::new(),
+            deleted_count: 0,
             entry_point: None,
             max_level: 0,
-            distance,
-            deleted: HashSet::new(),
         }
     }
 
@@ -101,9 +154,14 @@ impl HnswIndex {
         &self.params
     }
 
+    /// Returns the distance metric.
+    pub fn metric(&self) -> DistanceMetricKind {
+        self.metric
+    }
+
     /// Returns the number of active (non-deleted) vectors.
     pub fn len(&self) -> usize {
-        self.vectors.len() - self.deleted.len()
+        self.vectors.len() - self.deleted_count
     }
 
     /// Returns `true` if the index is empty.
@@ -118,12 +176,40 @@ impl HnswIndex {
 
     /// Returns the entry point node ID, if the index is non-empty.
     pub fn entry_point(&self) -> Option<NodeId> {
-        self.entry_point
+        self.entry_point.map(|e| NodeId(e as u64))
     }
 
     /// Returns the current max level of the index.
     pub fn max_level(&self) -> usize {
         self.max_level
+    }
+
+    /// Returns the number of layers the index can have.
+    pub fn layer_count(&self) -> usize {
+        self.params.max_level + 1
+    }
+
+    /// Reserves room for `additional` more slots.
+    pub fn reserve(&mut self, additional: usize) {
+        let stride = self.params.m0 + 1;
+        self.inv_norms.reserve(additional);
+        self.levels.reserve(additional);
+        self.layer0.reserve(additional * stride);
+        self.upper.reserve(additional);
+        self.deleted.reserve(additional);
+    }
+
+    /// The distance between two vectors under this index's metric, as
+    /// reported by [`search`](Self::search).
+    pub fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        let d = match self.metric {
+            DistanceMetricKind::Cosine => {
+                cosine_from_dot(dot(a, b), inverse_norm(a), inverse_norm(b))
+            }
+            DistanceMetricKind::Euclidean => l2_squared(a, b),
+            DistanceMetricKind::DotProduct => -dot(a, b),
+        };
+        self.reported(d)
     }
 
     /// Inserts a vector into the index with the given node ID.
@@ -141,6 +227,13 @@ impl HnswIndex {
                 actual: vector.len(),
             });
         }
+        if node_id.0 >= u32::MAX as u64 {
+            return Err(AtlantisError::InvalidValue(format!(
+                "HNSW node id {} is too large (ids are dense slots below {})",
+                node_id.0,
+                u32::MAX
+            )));
+        }
         if self.vectors.contains(node_id) {
             // Links were chosen for the old vector, and other nodes link to
             // this id; replacing it in place would leave a wrong graph.
@@ -149,19 +242,25 @@ impl HnswIndex {
                 node_id.0
             )));
         }
-        let query = vector.clone();
-        self.vectors.insert_at(node_id, vector)?;
+        let idx = node_id.0 as u32;
+        self.ensure_slot(idx as usize);
+        let inv_norm = inverse_norm(&vector);
+        self.vectors.write(idx as usize, &vector);
+        self.inv_norms[idx as usize] = inv_norm;
         let level = self.random_level();
+        self.levels[idx as usize] = level as u8;
+        self.upper[idx as usize] = vec![Vec::new(); level];
 
         let Some(entry) = self.entry_point else {
-            self.entry_point = Some(node_id);
+            self.entry_point = Some(idx);
             self.max_level = level;
-            for layer in &mut self.layers[..=level] {
-                layer.adjacency.entry(node_id).or_default();
-            }
             return Ok(());
         };
 
+        let query = Query {
+            v: &vector,
+            inv_norm,
+        };
         let mut entry_points = vec![Scored {
             dist: self.dist_to(&query, entry),
             id: entry,
@@ -176,34 +275,26 @@ impl HnswIndex {
             let candidates: Vec<Scored> = found
                 .iter()
                 .copied()
-                .filter(|c| c.id != node_id && !self.deleted.contains(&c.id))
+                .filter(|c| c.id != idx && !self.deleted[c.id as usize])
                 .collect();
             let neighbors = self.select_neighbors(&candidates, self.params.m);
-            self.layers[l].adjacency.insert(node_id, neighbors.clone());
+            self.set_links(idx, l, &neighbors);
 
             let cap = if l == 0 {
                 self.params.m0
             } else {
                 self.params.m
             };
-            for neighbor in neighbors {
-                let list = self.layers[l].adjacency.entry(neighbor).or_default();
-                list.push(node_id);
-                if list.len() > cap {
-                    self.shrink(neighbor, cap, l);
-                }
+            for &neighbor in &neighbors {
+                self.add_link(neighbor, idx, l, cap);
             }
             if !found.is_empty() {
                 entry_points = found;
             }
         }
-        // Layers above the current top exist only for this node.
-        for layer in &mut self.layers[self.max_level + 1..=level.max(self.max_level)] {
-            layer.adjacency.entry(node_id).or_default();
-        }
         if level > self.max_level {
             self.max_level = level;
-            self.entry_point = Some(node_id);
+            self.entry_point = Some(idx);
         }
         Ok(())
     }
@@ -228,18 +319,22 @@ impl HnswIndex {
             return Ok(Vec::new());
         };
         let ef = ef_search.unwrap_or(self.params.ef_search).max(k);
+        let query = Query {
+            v: query,
+            inv_norm: inverse_norm(query),
+        };
 
         let mut entry_points = vec![Scored {
-            dist: self.dist_to(query, entry),
+            dist: self.dist_to(&query, entry),
             id: entry,
         }];
         for l in (1..=self.max_level).rev() {
-            entry_points = self.search_layer(query, &entry_points, 1, l, true);
+            entry_points = self.search_layer(&query, &entry_points, 1, l, true);
         }
         let mut results: Vec<(NodeId, f32)> = self
-            .search_layer(query, &entry_points, ef, 0, false)
+            .search_layer(&query, &entry_points, ef, 0, false)
             .into_iter()
-            .map(|c| (c.id, c.dist))
+            .map(|c| (NodeId(c.id as u64), self.reported(c.dist)))
             .collect();
         results.truncate(k);
         Ok(results)
@@ -268,24 +363,43 @@ impl HnswIndex {
     /// working; it is never returned and never chosen as a new neighbour.
     pub fn remove(&mut self, node_id: NodeId) {
         if self.vectors.contains(node_id) {
-            self.deleted.insert(node_id);
+            let d = &mut self.deleted[node_id.0 as usize];
+            if !*d {
+                *d = true;
+                self.deleted_count += 1;
+            }
         }
     }
 
     /// Returns the vector for a given node ID, if it exists.
     pub fn get_vector(&self, node_id: NodeId) -> Option<&[f32]> {
-        if self.deleted.contains(&node_id) {
+        if self.is_deleted(node_id.0) {
             return None;
         }
         self.vectors.get(node_id)
     }
 
-    /// Returns the number of layers in the index.
-    pub fn layer_count(&self) -> usize {
-        self.layers.len()
+    // ---- Internal methods ----
+
+    fn is_deleted(&self, id: u64) -> bool {
+        usize::try_from(id)
+            .ok()
+            .and_then(|i| self.deleted.get(i))
+            .copied()
+            .unwrap_or(false)
     }
 
-    // ---- Internal methods ----
+    fn ensure_slot(&mut self, idx: usize) {
+        if idx < self.levels.len() {
+            return;
+        }
+        let n = idx + 1;
+        self.inv_norms.resize(n, 0.0);
+        self.levels.resize(n, NO_LEVEL);
+        self.layer0.resize(n * (self.params.m0 + 1), 0);
+        self.upper.resize_with(n, Vec::new);
+        self.deleted.resize(n, false);
+    }
 
     /// Assigns a random level using the HNSW formula:
     /// `level = floor(-ln(unif(0,1)) * mL)` where `mL = 1 / ln(M)`.
@@ -293,7 +407,65 @@ impl HnswIndex {
         let ml = 1.0 / (self.params.m.max(2) as f64).ln();
         let uniform: f64 = rand::thread_rng().gen_range(f64::EPSILON..1.0);
         let level = (-uniform.ln() * ml).floor() as usize;
-        level.min(self.params.max_level)
+        level.min(self.params.max_level).min(NO_LEVEL as usize - 1)
+    }
+
+    /// The links of `node` at `layer`.
+    #[inline]
+    fn links(&self, node: u32, layer: usize) -> &[u32] {
+        let i = node as usize;
+        if layer == 0 {
+            let base = i * (self.params.m0 + 1);
+            let count = self.layer0[base] as usize;
+            &self.layer0[base + 1..base + 1 + count]
+        } else {
+            self.upper[i]
+                .get(layer - 1)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        }
+    }
+
+    fn set_links(&mut self, node: u32, layer: usize, links: &[u32]) {
+        let i = node as usize;
+        if layer == 0 {
+            let stride = self.params.m0 + 1;
+            debug_assert!(links.len() <= self.params.m0);
+            let base = i * stride;
+            self.layer0[base] = links.len() as u32;
+            self.layer0[base + 1..base + 1 + links.len()].copy_from_slice(links);
+        } else if let Some(list) = self.upper[i].get_mut(layer - 1) {
+            list.clear();
+            list.extend_from_slice(links);
+        }
+    }
+
+    /// Adds the link `node -> new` at `layer`, shrinking `node`'s list to
+    /// `cap` with the heuristic when it is full. Only `node`'s list changes.
+    fn add_link(&mut self, node: u32, new: u32, layer: usize, cap: usize) {
+        let current = self.links(node, layer);
+        if current.contains(&new) {
+            return;
+        }
+        if current.len() < cap {
+            let mut list = current.to_vec();
+            list.push(new);
+            self.set_links(node, layer, &list);
+            return;
+        }
+        let mut scored: Vec<Scored> = current
+            .iter()
+            .copied()
+            .chain(std::iter::once(new))
+            .filter(|&n| !self.deleted[n as usize])
+            .map(|n| Scored {
+                dist: self.dist_between(node, n),
+                id: n,
+            })
+            .collect();
+        scored.sort_unstable();
+        let kept = self.select_neighbors(&scored, cap);
+        self.set_links(node, layer, &kept);
     }
 
     /// Best-first search of one layer from `entry_points`, keeping the `ef`
@@ -306,22 +478,44 @@ impl HnswIndex {
     /// not take result slots.
     fn search_layer(
         &self,
-        query: &[f32],
+        query: &Query<'_>,
+        entry_points: &[Scored],
+        ef: usize,
+        layer: usize,
+        include_deleted: bool,
+    ) -> Vec<Scored> {
+        VISITED.with(|visited| {
+            let mut visited = visited.borrow_mut();
+            visited.start(self.levels.len());
+            self.search_layer_with(
+                &mut visited,
+                query,
+                entry_points,
+                ef,
+                layer,
+                include_deleted,
+            )
+        })
+    }
+
+    fn search_layer_with(
+        &self,
+        visited: &mut Visited,
+        query: &Query<'_>,
         entry_points: &[Scored],
         ef: usize,
         layer: usize,
         include_deleted: bool,
     ) -> Vec<Scored> {
         let ef = ef.max(1);
-        let mut visited: HashSet<NodeId> = HashSet::with_capacity(ef * 8);
         // Min-heap of nodes to expand; max-heap of the best `ef` found.
-        let mut candidates: BinaryHeap<Reverse<Scored>> = BinaryHeap::new();
-        let mut results: BinaryHeap<Scored> = BinaryHeap::new();
+        let mut candidates: BinaryHeap<Reverse<Scored>> = BinaryHeap::with_capacity(ef * 2);
+        let mut results: BinaryHeap<Scored> = BinaryHeap::with_capacity(ef + 1);
 
         for &ep in entry_points {
             if visited.insert(ep.id) {
                 candidates.push(Reverse(ep));
-                if include_deleted || !self.deleted.contains(&ep.id) {
+                if include_deleted || !self.deleted[ep.id as usize] {
                     results.push(ep);
                 }
             }
@@ -334,21 +528,22 @@ impl HnswIndex {
             if results.len() >= ef && results.peek().is_some_and(|w| current.dist > w.dist) {
                 break;
             }
-            for &neighbor in self.layers[layer].neighbors(current.id) {
-                if !visited.insert(neighbor) {
+            let links = self.links(current.id, layer);
+            for (j, &neighbor) in links.iter().enumerate() {
+                if let Some(&next) = links.get(j + 1) {
+                    self.prefetch(next);
+                }
+                if !visited.insert(neighbor) || self.levels[neighbor as usize] == NO_LEVEL {
                     continue;
                 }
-                let Some(vec) = self.vectors.get(neighbor).filter(|v| !v.is_empty()) else {
-                    continue;
-                };
-                let dist = self.distance.distance(query, vec);
+                let dist = self.dist_to(query, neighbor);
                 let full = results.len() >= ef;
                 if full && results.peek().is_some_and(|w| dist >= w.dist) {
                     continue;
                 }
                 let scored = Scored { dist, id: neighbor };
                 candidates.push(Reverse(scored));
-                if include_deleted || !self.deleted.contains(&neighbor) {
+                if include_deleted || !self.deleted[neighbor as usize] {
                     results.push(scored);
                     if results.len() > ef {
                         results.pop();
@@ -365,78 +560,95 @@ impl HnswIndex {
     /// point in different directions and reach other clusters. Remaining
     /// slots are filled with the closest discarded candidates
     /// (`keepPrunedConnections`), so nodes keep their full degree.
-    fn select_neighbors(&self, candidates: &[Scored], m: usize) -> Vec<NodeId> {
-        let mut kept: Vec<Scored> = Vec::with_capacity(m);
-        let mut discarded: Vec<NodeId> = Vec::new();
+    fn select_neighbors(&self, candidates: &[Scored], m: usize) -> Vec<u32> {
+        let mut kept: Vec<u32> = Vec::with_capacity(m);
+        let mut discarded: Vec<u32> = Vec::new();
         for &c in candidates {
             if kept.len() >= m {
                 break;
             }
-            let diverse = kept
-                .iter()
-                .all(|k| c.dist < self.dist_between_nodes(c.id, k.id));
+            if kept.contains(&c.id) || discarded.contains(&c.id) {
+                continue;
+            }
+            let diverse = kept.iter().all(|&k| c.dist < self.dist_between(c.id, k));
             if diverse {
-                kept.push(c);
+                kept.push(c.id);
             } else {
                 discarded.push(c.id);
             }
         }
-        let mut out: Vec<NodeId> = kept.into_iter().map(|k| k.id).collect();
         for id in discarded {
-            if out.len() >= m {
+            if kept.len() >= m {
                 break;
             }
-            out.push(id);
+            kept.push(id);
         }
-        out
+        kept
     }
 
-    /// Shrinks `node`'s link list at `layer` to `cap` with the heuristic.
-    /// Only `node`'s own list changes.
-    fn shrink(&mut self, node: NodeId, cap: usize, layer: usize) {
-        let Some(base) = self.vectors.get(node) else {
-            return;
-        };
-        let mut scored: Vec<Scored> = self.layers[layer]
-            .neighbors(node)
-            .iter()
-            .filter(|n| !self.deleted.contains(n))
-            .filter_map(|&n| {
-                self.vectors.get(n).map(|v| Scored {
-                    dist: self.distance.distance(base, v),
-                    id: n,
-                })
-            })
-            .collect();
-        scored.sort_unstable();
-        scored.dedup_by_key(|s| s.id);
-        let kept = self.select_neighbors(&scored, cap);
-        self.layers[layer].adjacency.insert(node, kept);
-    }
-
-    /// Distance from a query vector to a stored node (`f32::MAX` if absent).
-    fn dist_to(&self, query: &[f32], node: NodeId) -> f32 {
-        match self.vectors.get(node) {
-            Some(v) if !v.is_empty() => self.distance.distance(query, v),
-            _ => f32::MAX,
+    /// Internal distance from a query to a stored node. Euclidean stays
+    /// squared here (same order, no square root); see [`Self::reported`].
+    #[inline]
+    fn dist_to(&self, query: &Query<'_>, node: u32) -> f32 {
+        let v = self.vectors.slot(node as usize);
+        match self.metric {
+            DistanceMetricKind::Cosine => cosine_from_dot(
+                dot(query.v, v),
+                query.inv_norm,
+                self.inv_norms[node as usize],
+            ),
+            DistanceMetricKind::Euclidean => l2_squared(query.v, v),
+            DistanceMetricKind::DotProduct => -dot(query.v, v),
         }
     }
 
-    /// Computes distance between two stored nodes.
-    fn dist_between_nodes(&self, a: NodeId, b: NodeId) -> f32 {
-        match (self.vectors.get(a), self.vectors.get(b)) {
-            (Some(va), Some(vb)) if !va.is_empty() && !vb.is_empty() => {
-                self.distance.distance(va, vb)
+    /// Internal distance between two stored nodes.
+    #[inline]
+    fn dist_between(&self, a: u32, b: u32) -> f32 {
+        let (va, vb) = (self.vectors.slot(a as usize), self.vectors.slot(b as usize));
+        match self.metric {
+            DistanceMetricKind::Cosine => cosine_from_dot(
+                dot(va, vb),
+                self.inv_norms[a as usize],
+                self.inv_norms[b as usize],
+            ),
+            DistanceMetricKind::Euclidean => l2_squared(va, vb),
+            DistanceMetricKind::DotProduct => -dot(va, vb),
+        }
+    }
+
+    /// Converts an internal distance to the one callers see.
+    #[inline]
+    fn reported(&self, d: f32) -> f32 {
+        match self.metric {
+            DistanceMetricKind::Euclidean => d.sqrt(),
+            _ => d,
+        }
+    }
+
+    /// Hints the CPU to start loading `node`'s vector.
+    #[inline]
+    fn prefetch(&self, node: u32) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let v = self.vectors.slot(node as usize);
+            // SAFETY: prefetching is a hint and never faults; SSE is part of
+            // the x86-64 baseline.
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch::<_MM_HINT_T0>(v.as_ptr() as *const i8);
             }
-            _ => f32::MAX,
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = node;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distance::CosineDistance;
+    use crate::distance::{CosineDistance, DistanceMetric};
+    use std::collections::HashSet;
 
     fn make_index(dims: usize) -> HnswIndex {
         HnswIndex::new(
@@ -448,7 +660,7 @@ mod tests {
                 max_level: 5,
             },
             dims,
-            Box::new(CosineDistance),
+            DistanceMetricKind::Cosine,
         )
     }
 
@@ -537,7 +749,7 @@ mod tests {
                 max_level: 16,
             },
             32,
-            Box::new(CosineDistance),
+            DistanceMetricKind::Cosine,
         );
 
         // Insert 500 random vectors
@@ -559,7 +771,7 @@ mod tests {
             let mut brute: Vec<(NodeId, f32)> = vectors
                 .iter()
                 .enumerate()
-                .map(|(i, v)| (NodeId(i as u64), index.distance.distance(query, v)))
+                .map(|(i, v)| (NodeId(i as u64), CosineDistance.distance(query, v)))
                 .collect();
             brute.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             let brute_top5: HashSet<NodeId> = brute.iter().take(5).map(|(id, _)| *id).collect();
@@ -620,19 +832,20 @@ mod tests {
                 .insert(NodeId(i), random_vector(8, (i + 1) as f32 * 0.07))
                 .unwrap();
         }
-        for (l, layer) in index.layers.iter().enumerate() {
-            let cap = if l == 0 {
-                index.params.m0
-            } else {
-                index.params.m
-            };
-            for (node, links) in &layer.adjacency {
+        for node in 0..300u32 {
+            for l in 0..=index.levels[node as usize] as usize {
+                let cap = if l == 0 {
+                    index.params.m0
+                } else {
+                    index.params.m
+                };
+                let links = index.links(node, l);
                 assert!(
                     links.len() <= cap,
-                    "node {node:?} has {} links at layer {l}",
+                    "node {node} has {} links at layer {l}",
                     links.len()
                 );
-                assert!(!links.contains(node), "node {node:?} links to itself");
+                assert!(!links.contains(&node), "node {node} links to itself");
             }
         }
     }
@@ -664,5 +877,79 @@ mod tests {
 
         index.remove(NodeId(5));
         assert_eq!(index.get_vector(NodeId(5)), None);
+    }
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use crate::distance::{DistanceMetric, EuclideanDistance};
+
+    fn params() -> crate::params::HnswParams {
+        crate::params::HnswParams {
+            m: 8,
+            m0: 16,
+            ef_construction: 64,
+            ef_search: 64,
+            max_level: 5,
+        }
+    }
+
+    #[test]
+    fn euclidean_reports_true_distances() {
+        let mut index = HnswIndex::new(params(), 2, DistanceMetricKind::Euclidean);
+        for i in 0..50u64 {
+            index.insert(NodeId(i), vec![i as f32, 0.0]).unwrap();
+        }
+        let hits = index.search(&[3.0, 4.0], 3, None).unwrap();
+        assert_eq!(hits[0].0, NodeId(3));
+        assert!((hits[0].1 - 4.0).abs() < 1e-5, "got {}", hits[0].1);
+        assert!((hits[0].1 - EuclideanDistance.distance(&[3.0, 4.0], &[3.0, 0.0])).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dot_product_prefers_larger_projection() {
+        let mut index = HnswIndex::new(params(), 2, DistanceMetricKind::DotProduct);
+        for i in 1..20u64 {
+            index.insert(NodeId(i), vec![i as f32, 1.0]).unwrap();
+        }
+        let hits = index.search(&[1.0, 0.0], 1, Some(64)).unwrap();
+        assert_eq!(hits[0].0, NodeId(19));
+        assert!((hits[0].1 + 19.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rejects_ids_beyond_u32() {
+        let mut index = HnswIndex::new(params(), 2, DistanceMetricKind::Cosine);
+        index
+            .insert(NodeId(u32::MAX as u64), vec![1.0, 0.0])
+            .unwrap_err();
+    }
+
+    #[test]
+    fn sparse_ids_and_concurrent_searches() {
+        let mut index = HnswIndex::new(params(), 4, DistanceMetricKind::Cosine);
+        for i in 0..200u64 {
+            let v: Vec<f32> = (0..4).map(|d| ((i * 4 + d) as f32 * 0.37).sin()).collect();
+            index.insert(NodeId(i * 3), v).unwrap();
+        }
+        assert_eq!(index.len(), 200);
+        let index = std::sync::Arc::new(index);
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let index = index.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50u64 {
+                        let id = (t * 50 + i) * 3;
+                        let v = index.get_vector(NodeId(id)).unwrap().to_vec();
+                        let hits = index.search(&v, 1, Some(64)).unwrap();
+                        assert_eq!(hits[0].0, NodeId(id));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
