@@ -87,6 +87,21 @@ pub struct VectorConfig {
     pub distance_metric: DistanceMetricKind,
     /// Default HNSW parameters.
     pub hnsw: HnswParams,
+    /// Threads that build a vector index from its records; `0` (the
+    /// default) uses one per available CPU.
+    #[serde(default)]
+    pub build_threads: usize,
+}
+
+impl VectorConfig {
+    /// The number of index-build threads to use: `build_threads`, or the
+    /// available parallelism when it is `0`.
+    pub fn effective_build_threads(&self) -> usize {
+        match self.build_threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        }
+    }
 }
 
 impl Default for VectorConfig {
@@ -95,6 +110,7 @@ impl Default for VectorConfig {
             dimensions: 128,
             distance_metric: DistanceMetricKind::Cosine,
             hnsw: HnswParams::default(),
+            build_threads: 0,
         }
     }
 }
@@ -214,6 +230,12 @@ impl EngineConfigBuilder {
     /// Sets the default HNSW parameters.
     pub fn hnsw_params(mut self, params: HnswParams) -> Self {
         self.config.vector.hnsw = params;
+        self
+    }
+
+    /// Sets the number of vector-index build threads (`0`: one per CPU).
+    pub fn vector_build_threads(mut self, threads: usize) -> Self {
+        self.config.vector.build_threads = threads;
         self
     }
 

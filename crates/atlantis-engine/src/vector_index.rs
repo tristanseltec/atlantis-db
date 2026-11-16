@@ -147,13 +147,16 @@ fn write(slot: &Slot) -> RwLockWriteGuard<'_, Option<Built>> {
 /// All built vector indexes of a datastore.
 pub struct VectorIndexes {
     defaults: HnswParams,
+    /// Threads used to build an index from its records.
+    build_threads: usize,
     built: Mutex<HashMap<(DatabaseRef, String), Slot>>,
 }
 
 impl VectorIndexes {
-    pub fn new(defaults: HnswParams) -> Self {
+    pub fn new(defaults: HnswParams, build_threads: usize) -> Self {
         VectorIndexes {
             defaults,
+            build_threads: build_threads.max(1),
             built: Mutex::new(HashMap::new()),
         }
     }
@@ -270,17 +273,17 @@ impl VectorIndexes {
         let built = (|| {
             let mut tx = store.begin(key.0.clone(), TxMode::ReadOnly, Isolation::Snapshot)?;
             let records = tx.with_label(&def.label)?;
-            index.hnsw.reserve(records.len());
+            let mut items = Vec::with_capacity(records.len());
             for record in records {
                 if let Some(vector) = index.vector_of(record.get(&def.field)) {
                     let slot = index.next;
                     index.next += 1;
-                    index.hnsw.insert(NodeId(slot), vector)?;
+                    items.push((NodeId(slot), vector));
                     index.slots.insert(record.id.to_string(), slot);
                     index.records.insert(slot, record.id);
                 }
             }
-            Ok::<(), AtlantisError>(())
+            index.hnsw.insert_batch(items, self.build_threads)
         })();
         match built {
             Ok(()) => {

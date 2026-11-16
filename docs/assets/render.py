@@ -33,6 +33,7 @@ THEMES = {
         "border": "#dcdbd3",
         "before": "#b9b8b0",
         "blue": "#2a78d6",
+        "blue_soft": "#86b6ef",
         "orange": "#eb6834",
         "aqua": "#1baf7a",
     },
@@ -47,6 +48,7 @@ THEMES = {
         "border": "#383835",
         "before": "#5c5b56",
         "blue": "#3987e5",
+        "blue_soft": "#1c5cab",
         "orange": "#d95926",
         "aqua": "#199e70",
     },
@@ -198,58 +200,69 @@ def one_query(mode: str) -> None:
 # 2. F2 benchmark: before and after
 # --------------------------------------------------------------------------
 
+# Stages, oldest first: (legend label, colour key, report).
+STAGES = [
+    ("Before: 8a66a87 (HNSW fix)", "before", "2026-11-16-small-mem-hnsw-fix"),
+    ("Vector core: SIMD, arena, locks", "blue_soft", "2026-11-16-small-mem-f2-core"),
+    ("+ parallel build", "blue", "2026-11-16-small-mem-parallel-build"),
+]
+
 BENCH = [
-    # (metric, direction note, unit formatter, before, after, verdict)
-    ("Index build", "lower is better", lambda v: f"{v:.1f} s", 185.8, 20.9, "8.9× faster"),
-    ("Vector top-10, p50", "lower is better", lambda v: f"{v:.2f} ms", 1.87, 0.27, "6.9× faster"),
-    ("Graph-RAG, 8 threads", "higher is better", lambda v: f"{v:,.0f} QPS", 225, 3041, "13.5× the throughput"),
+    # (metric, direction note, unit formatter, value per stage, verdict)
+    ("Index build", "lower is better", lambda v: f"{v:.1f} s", (185.8, 20.9, 4.96), "37× faster"),
+    ("Vector top-10, p50", "lower is better", lambda v: f"{v:.2f} ms", (1.87, 0.27, 0.264), "7.1× faster"),
+    ("Graph-RAG, 8 threads", "higher is better", lambda v: f"{v:,.0f} QPS", (225, 3041, 4168), "18.5× the throughput"),
 ]
 
 
 def bench(mode: str) -> None:
     t = THEMES[mode]
-    W, row_h, head = 880, 92, 108
+    bar, step = 20, 26
+    W, head = 880, 108
+    row_h = 24 + step * len(STAGES)
     H = head + row_h * len(BENCH) + 40
     desc = "; ".join(
-        f"{m}: before {f(b)}, after {f(a)} ({v})" for m, _, f, b, a, v in BENCH
+        f"{m}: " + ", ".join(f"{lbl} {f(v)}" for (lbl, _, _), v in zip(STAGES, vals)) + f" ({verdict})"
+        for m, _, f, vals, verdict in BENCH
     )
     s = Svg(W, H, t, "F2 vector core: before and after", desc + ". Recall@10 stays 1.000.")
     s.text(28, 40, "F2 vector core: before and after", 18, weight=650)
     s.text(
         28, 64,
-        "Retrieval Bench, 20,000 chunks × 768 dims, in memory, same machine. Recall@10 stays 1.000.",
+        "Retrieval Bench, 20,000 chunks × 768 dims, in memory, 12 CPUs. Recall@10 stays 1.000 throughout.",
         13.5, "ink2",
     )
-    # Legend.
     lgx = 28
-    for key, label in (("before", "Before: 8a66a87 (HNSW fix)"), ("blue", "After: F2 vector core")):
+    for label, key, _ in STAGES:
         s.rect(lgx, 79, 12, 12, fill=key, stroke=None, rx=3)
         s.text(lgx + 18, 89.5, label, 13, "ink2")
-        lgx += 18 + len(label) * 7.1 + 28
+        lgx += 18 + len(label) * 6.9 + 26
 
     x0, maxw = 330, W - 330 - 120
-    for i, (metric, note, fmt, before, after, verdict) in enumerate(BENCH):
+    short = ["Before", "Core", "Parallel"]
+    for i, (metric, note, fmt, vals, verdict) in enumerate(BENCH):
         y = head + i * row_h
         s.line(28, y, W - 28, y, stroke="grid")
-        s.text(28, y + 30, metric, 15, weight=600)
-        s.text(28, y + 50, note, 13, "muted")
-        s.text(28, y + 72, verdict, 13.5, "ink", weight=650)
-        top = max(before, after)
-        for j, (key, label, v) in enumerate((("before", "Before", before), ("blue", "After", after))):
-            by = y + 18 + j * 30
+        s.text(28, y + 32, metric, 15, weight=600)
+        s.text(28, y + 52, note, 13, "muted")
+        s.text(28, y + 74, verdict, 13.5, "ink", weight=650)
+        top = max(vals)
+        last = len(vals) - 1
+        for j, ((_, key, _), v) in enumerate(zip(STAGES, vals)):
+            by = y + 12 + j * step
             w = max(6.0, maxw * v / top)
             r = 4
             s.add(
                 f'<path d="M{x0},{by} H{x0 + w - r} A{r},{r} 0 0 1 {x0 + w},{by + r} '
-                f'V{by + 22 - r} A{r},{r} 0 0 1 {x0 + w - r},{by + 22} H{x0} Z" fill="{t[key]}"/>'
+                f'V{by + bar - r} A{r},{r} 0 0 1 {x0 + w - r},{by + bar} H{x0} Z" fill="{t[key]}"/>'
             )
-            s.text(x0 - 10, by + 16, label, 13, "muted", anchor="end")
-            s.text(x0 + w + 8, by + 16, fmt(v), 13.5, "ink", weight=600 if key == "blue" else 400)
-        s.line(x0, y + 12, x0, y + 76, stroke="axis")
+            s.text(x0 - 10, by + 15, short[j], 13, "muted", anchor="end")
+            s.text(x0 + w + 8, by + 15, fmt(v), 13.5, "ink", weight=650 if j == last else 400)
+        s.line(x0, y + 6, x0, y + row_h - 6, stroke="axis")
     s.line(28, head + row_h * len(BENCH), W - 28, head + row_h * len(BENCH), stroke="grid")
     s.text(
         28, H - 16,
-        "Each row has its own scale. Full results: benches/results/2026-11-16-small-mem-f2-core.md",
+        "Each row has its own scale. Reports: benches/results/2026-11-16-small-mem-{hnsw-fix,f2-core,parallel-build}.md",
         12.5, "muted",
     )
     s.save("bench-f2", mode)

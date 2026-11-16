@@ -76,8 +76,8 @@ built in the open, and this is the best time to shape them.
 | Embedded engine, in memory or on disk with a write-ahead log and crash recovery | Filtered HNSW (filter inside the search) |
 | MVCC transactions: snapshot and serializable isolation, retry on conflict | BM25 full-text and `db.search.hybrid` with rank fusion |
 | Cypher: `MATCH` (multi-hop, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation, `BEGIN`/`COMMIT` | Snapshot-consistent, read-your-writes search |
-| Record model: namespaces, tables, documents, record links, edge tables | Faster vector core: parallel build, quantization, persisted indexes |
-| HNSW vector index (SIMD kernels, per-index locks) with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package |
+| Record model: namespaces, tables, documents, record links, edge tables | Faster vector core: quantization, persisted indexes |
+| HNSW vector index (SIMD kernels, parallel build, per-index locks) with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package |
 | Retrieval Bench harness with exact ground truth | Competitor adapters for the benchmark |
 
 The full plan is in the [Implementation Roadmap](docs/25-implementation-roadmap.md).
@@ -162,25 +162,28 @@ without giving any of that recall back:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-f2.dark.svg">
-  <img alt="F2 vector core, before and after, at 20,000 × 768: index build 185.8 s to 20.9 s (8.9× faster); vector top-10 p50 1.87 ms to 0.27 ms (6.9× faster); graph-RAG on 8 threads 225 to 3,041 QPS (13.5×). Recall@10 stays 1.000." src="docs/assets/bench-f2.light.svg" width="100%">
+  <img alt="F2 vector core at 20,000 × 768, before, after the vector core work, and after the parallel build: index build 185.8 s, 20.9 s, 5.0 s (37× faster); vector top-10 p50 1.87, 0.27, 0.26 ms (7.1× faster); graph-RAG on 8 threads 225, 3,041, 4,168 QPS (18.5×). Recall@10 stays 1.000." src="docs/assets/bench-f2.light.svg" width="100%">
 </picture>
 
 <details>
 <summary>The numbers as a table</summary>
 
-| Retrieval Bench, small (20,000 × 768), in memory | Before (`8a66a87`) | After (F2) |
-|---|---|---|
-| Index build | 185.8 s | 20.9 s |
-| Vector top-10, p50 / p99 | 1.87 / 2.90 ms | 0.27 / 0.63 ms |
-| Recall@10 | 1.000 | 1.000 |
-| Graph-RAG, 8 threads | 225 QPS | 3,041 QPS |
-| Graph-RAG, 8 threads + writes | 167 QPS | 1,411 QPS |
+| Retrieval Bench, small (20,000 × 768), in memory | Before (`8a66a87`) | Vector core | + parallel build |
+|---|---|---|---|
+| Index build | 185.8 s | 20.9 s | 5.0 s |
+| Vector top-10, p50 / p99 | 1.87 / 2.90 ms | 0.27 / 0.63 ms | 0.26 / 0.46 ms |
+| Recall@10 | 1.000 | 1.000 | 1.000 |
+| Graph-RAG, 8 threads | 225 QPS | 3,041 QPS | 4,168 QPS |
+| Graph-RAG, 8 threads + writes | 167 QPS | 1,411 QPS | 2,729 QPS |
 
-Full report: [`benches/results/2026-11-16-small-mem-f2-core.md`](benches/results/2026-11-16-small-mem-f2-core.md).
+At 100,000 × 768 the parallel build takes 27 s and top-10 p50 is 0.24 ms at recall 1.000.
+Reports: [`f2-core`](benches/results/2026-11-16-small-mem-f2-core.md),
+[`parallel-build`](benches/results/2026-11-16-small-mem-parallel-build.md),
+[`medium`](benches/results/2026-11-16-medium-mem-parallel-build.md).
 
 </details>
 
-What's left before the targets below: parallel index build, filtered search (F3),
+What's left before the targets below: filtered search (F3), persisted index images,
 and getting writes off the search path (F4, F6).
 
 | Target (1M chunks × 768, 1% filter, 8 threads under write load) | Goal |
@@ -205,7 +208,7 @@ Current numbers and the gaps between them and the targets are tracked in
 | Step | What | Status |
 |---|---|---|
 | **F1** | Retrieval Bench: corpus, ground truth, workloads, report | Done for Atlantis; competitor adapters open |
-| **F2** | Vector core: HNSW correctness, SIMD, contiguous storage, per-index locks, SQ8 | Correctness, SIMD, arena and locks done (7× faster search, 9× faster build); parallel build and SQ8 open |
+| **F2** | Vector core: HNSW correctness, SIMD, contiguous storage, per-index locks, SQ8 | Correctness, SIMD, arena, locks and parallel build done (7× faster search, 37× faster build); SQ8 open |
 | **F3** | Filtered search inside HNSW, with predicate pushdown from Cypher | Next |
 | **F4** | Versioned index entries, transaction overlay, persisted index images | Designed |
 | **F5** | BM25 (`atlantis-text`) and `db.search.hybrid` | Designed |
@@ -228,7 +231,7 @@ contributions shape the core.
 
 | Area | Good first steps | You'll enjoy this if you like |
 |---|---|---|
-| **Vector search** (`atlantis-vector`) | Parallel index build, AVX-512 and NEON kernels, SQ8 quantization with re-ranking | Performance engineering, ANN algorithms |
+| **Vector search** (`atlantis-vector`) | AVX-512 and NEON kernels, SQ8 quantization with re-ranking, a query worker pool | Performance engineering, ANN algorithms |
 | **Filtered search** (F3) | Allow-set bitmaps; exact, filtered-traversal and post-filter strategies chosen per query | Algorithms, research papers made real |
 | **Full-text** (`atlantis-text`, new crate) | Analyzers, inverted index, BM25, rank fusion | Information retrieval |
 | **Query engine** (`atlantis-cypher`, `atlantis-engine`) | Predicate pushdown, a first planner, batched execution, `EXPLAIN` | Compilers, query optimization |

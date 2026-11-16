@@ -109,7 +109,10 @@ impl Datastore {
         };
         let inner = Arc::new(Inner {
             records: RecordStore::new(Arc::new(kv.clone())),
-            vectors: VectorIndexes::new(config.vector.hnsw.clone()),
+            vectors: VectorIndexes::new(
+                config.vector.hnsw.clone(),
+                config.vector.effective_build_threads(),
+            ),
             dir: config.storage.disk_path.clone(),
             kv,
             _lock: lock,
