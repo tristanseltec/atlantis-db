@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="236" viewBox="0 0 880 236" role="img" aria-labelledby="title desc" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif'>
+<title id="title">Focus track: the transactional hybrid retrieval path</title>
+<desc id="desc">F1 Retrieval Bench: Partly done; F2 Vector core: Partly done; F3 Filtered search: Next; F4 Consistent search: Designed; F5 BM25 + fusion: Designed; F6 Group commit: Designed; F7 Python package: Designed; F8 Publish results: Designed</desc>
+<defs><marker id="arrow-ink2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#c3c2b7"/></marker><marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#9a9891"/></marker><marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 z" fill="#3987e5"/></marker></defs>
+<rect x="0.5" y="0.5" width="879" height="235" rx="12" fill="#1a1a19" stroke="#383835"/>
+<text x="28" y="40" font-size="18" font-weight="650" fill="#f0efec" text-anchor="start">Focus track</text>
+<text x="28" y="63" font-size="13.5" font-weight="400" fill="#c3c2b7" text-anchor="start">The transactional hybrid retrieval path, in order</text>
+<line x1="85.0" y1="110" x2="160.71428571428572" y2="110" stroke="#3987e5" stroke-width="2" stroke-linecap="round"/>
+<line x1="190.71428571428572" y1="110" x2="266.42857142857144" y2="110" stroke="#3987e5" stroke-width="2" stroke-linecap="round"/>
+<line x1="296.42857142857144" y1="110" x2="372.1428571428571" y2="110" stroke="#4a4a46" stroke-width="2" stroke-linecap="round"/>
+<line x1="402.1428571428571" y1="110" x2="477.85714285714283" y2="110" stroke="#4a4a46" stroke-width="2" stroke-linecap="round"/>
+<line x1="507.85714285714283" y1="110" x2="583.5714285714286" y2="110" stroke="#4a4a46" stroke-width="2" stroke-linecap="round"/>
+<line x1="613.5714285714286" y1="110" x2="689.2857142857142" y2="110" stroke="#4a4a46" stroke-width="2" stroke-linecap="round"/>
+<line x1="719.2857142857142" y1="110" x2="795.0" y2="110" stroke="#4a4a46" stroke-width="2" stroke-linecap="round"/>
+<circle cx="70.0" cy="110" r="13" fill="#1a1a19" stroke="#3987e5" stroke-width="2.5"/>
+<path d="M70.0,101 A9,9 0 0 1 70.0,119 Z" fill="#3987e5"/>
+<text x="70.0" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F1</text>
+<text x="70.0" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Retrieval</text>
+<text x="70.0" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Bench</text>
+<circle cx="175.71428571428572" cy="110" r="13" fill="#1a1a19" stroke="#3987e5" stroke-width="2.5"/>
+<path d="M175.71428571428572,101 A9,9 0 0 1 175.71428571428572,119 Z" fill="#3987e5"/>
+<text x="175.71428571428572" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F2</text>
+<text x="175.71428571428572" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Vector</text>
+<text x="175.71428571428572" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">core</text>
+<circle cx="281.42857142857144" cy="110" r="13" fill="#1a1a19" stroke="#3987e5" stroke-width="2.5"/>
+<circle cx="281.42857142857144" cy="110" r="3.5" fill="#3987e5"/>
+<text x="281.42857142857144" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F3</text>
+<text x="281.42857142857144" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Filtered</text>
+<text x="281.42857142857144" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">search</text>
+<circle cx="387.1428571428571" cy="110" r="13" fill="#1a1a19" stroke="#9a9891" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="387.1428571428571" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F4</text>
+<text x="387.1428571428571" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Consistent</text>
+<text x="387.1428571428571" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">search</text>
+<circle cx="492.85714285714283" cy="110" r="13" fill="#1a1a19" stroke="#9a9891" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="492.85714285714283" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F5</text>
+<text x="492.85714285714283" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">BM25 +</text>
+<text x="492.85714285714283" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">fusion</text>
+<circle cx="598.5714285714286" cy="110" r="13" fill="#1a1a19" stroke="#9a9891" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="598.5714285714286" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F6</text>
+<text x="598.5714285714286" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Group</text>
+<text x="598.5714285714286" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">commit</text>
+<circle cx="704.2857142857142" cy="110" r="13" fill="#1a1a19" stroke="#9a9891" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="704.2857142857142" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F7</text>
+<text x="704.2857142857142" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Python</text>
+<text x="704.2857142857142" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">package</text>
+<circle cx="810.0" cy="110" r="13" fill="#1a1a19" stroke="#9a9891" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="810.0" y="146" font-size="14" font-weight="650" fill="#f0efec" text-anchor="middle">F8</text>
+<text x="810.0" y="165" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">Publish</text>
+<text x="810.0" y="182" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="middle">results</text>
+<circle cx="38" cy="209" r="13" fill="#1a1a19" stroke="#3987e5" stroke-width="2.5"/>
+<path d="M38,200 A9,9 0 0 1 38,218 Z" fill="#3987e5"/>
+<text x="58" y="214" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="start">Partly done</text>
+<circle cx="175.2" cy="209" r="13" fill="#1a1a19" stroke="#3987e5" stroke-width="2.5"/>
+<circle cx="175.2" cy="209" r="3.5" fill="#3987e5"/>
+<text x="195.2" y="214" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="start">Next</text>
+<circle cx="262.0" cy="209" r="13" fill="#1a1a19" stroke="#9a9891" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="282.0" y="214" font-size="13" font-weight="400" fill="#c3c2b7" text-anchor="start">Designed</text>
+</svg>
