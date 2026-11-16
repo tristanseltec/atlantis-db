@@ -9,6 +9,7 @@ members = [
     "crates/atlantis-engine",
     "crates/atlantis-db",
     "benches",
+    "benches/retrieval",
 ]
 
 [workspace.package]

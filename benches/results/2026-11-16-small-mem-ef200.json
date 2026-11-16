@@ -1,0 +1,80 @@
+{
+  "bench": "atlantis-retrieval-bench",
+  "version": 1,
+  "date": "2026-11-16",
+  "git_commit": "40eb82a",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 12
+  },
+  "scale": "small",
+  "spec": {
+    "chunks": 20000,
+    "dim": 768,
+    "users": 100,
+    "clusters": 256,
+    "queries": 300,
+    "seed": 10951255
+  },
+  "edges": 44000,
+  "k": 10,
+  "threads": 8,
+  "duration_s": 10.0,
+  "adapter": "atlantis (embedded, in-memory)",
+  "capabilities": {
+    "filter_in_search": false,
+    "hybrid_text": false,
+    "search_reads_own_writes": false,
+    "graph_in_query": true,
+    "embedded": true
+  },
+  "adapter_notes": "filtered search = vector top-10×10 then WHERE; efSearch 200; no BM25 (graph-RAG is vector-only)",
+  "results": {
+    "load": {
+      "items": 67000,
+      "load_s": 0.651019547,
+      "items_per_s": 102915.49663715398,
+      "index_build_s": 86.409963739
+    },
+    "vector": {
+      "latency": {
+        "count": 300,
+        "mean_ms": 0.5988938433333332,
+        "p50_ms": 0.297415,
+        "p95_ms": 3.1062920000000003,
+        "p99_ms": 3.55449,
+        "p999_ms": 4.069221,
+        "max_ms": 4.069221
+      },
+      "recall_at_k": 0.2323333333333333,
+      "short_results": 17
+    },
+    "filtered_vector": {
+      "latency": {
+        "count": 300,
+        "mean_ms": 0.9429663333333334,
+        "p50_ms": 0.564184,
+        "p95_ms": 3.928117,
+        "p99_ms": 5.229679,
+        "p999_ms": 5.768175,
+        "max_ms": 5.768175
+      },
+      "recall_at_k": 0.033333333333333284,
+      "short_results": 300
+    },
+    "graph_rag": {
+      "count": 300,
+      "mean_ms": 1.0386094766666665,
+      "p50_ms": 0.639425,
+      "p95_ms": 4.258996,
+      "p99_ms": 5.359572,
+      "p999_ms": 5.936569,
+      "max_ms": 5.936569
+    },
+    "graph_rag_concurrent": null,
+    "mixed": null,
+    "reads_own_writes": null,
+    "reopen_s": null
+  }
+}

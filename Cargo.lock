@@ -93,6 +93,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlantis-retrieval-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "atlantis-db",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "atlantis-storage"
 version = "0.1.0"
 dependencies = [

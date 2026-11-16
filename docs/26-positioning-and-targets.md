@@ -124,6 +124,38 @@ Single-record paths are ready. Vector search and scans are the two gaps, and the
 gap is the main risk: if the HNSW path cannot reach about 2 ms at 1M × 768, the
 headline target fails. That work comes first, after the harness.
 
+### Retrieval Bench Baseline (2026-11-16)
+
+First run of [`rbench`](../benches/retrieval/README.md) at the `small` scale (20,000
+chunks × 768, 1% filter, 44,000 edges, k = 10), in-memory engine, same machine. Full
+results: `benches/results/2026-11-16-small-mem.{json,md}`.
+
+| Workload | p50 | p99 | Other | Target |
+|---|---|---|---|---|
+| Load | | | 110k items/s; **index build 85 s** | Open < 1 s at 1M |
+| Vector top-10 | 0.28 ms | 1.44 ms | **recall@10 0.22** | recall ≥ 0.95 |
+| Filtered top-10 (over-fetch 10×, then `WHERE`) | 0.51 ms | 2.73 ms | **recall@10 0.04**; every query short of 10 rows | recall ≥ 0.95 |
+| Graph-RAG, 8 threads | 4.95 ms | 11.1 ms | 1,564 QPS | |
+| Graph-RAG, 8 threads + writes | 10.1 ms | 19.7 ms | 789 QPS; **97 writes/s of 2,000** | p99 ≤ 8 ms at 1M, under load |
+| Search reads own write | | | **0%** | 100% |
+
+Findings:
+
+1. **HNSW recall collapses with size.** Recall@10 is 1.00 at 5,000 × 768 but 0.22 at
+   20,000 × 768 (0.84 at 20,000 × 64), and raising `efSearch` to 200 does not help
+   while latency falls. Search visits fewer nodes as the index grows, which points at
+   graph connectivity, not approximation: edges are stored undirected and pruning
+   removes both directions (`crates/atlantis-vector/src/hnsw.rs`, `prune_connections`),
+   and neighbours are chosen without the diversity heuristic, which fragments clustered
+   data. Fixing this is the first F2 task.
+2. **Index build is about 4 ms per vector** at 768 dimensions, with cosine norms
+   recomputed on every distance call.
+3. **No concurrency.** Eight threads give 2–3x one thread, and a writer at 2,000/s
+   achieves 97/s, consistent with the single mutex shared by vector search and
+   index updates.
+4. **Filtering after the search** returns fewer than k rows for every query at 1%
+   selectivity; F3 removes it.
+
 ## What's Next
 
 - [02 — Architecture](02-architecture.md#hybrid-retrieval-path-focus) — the design that

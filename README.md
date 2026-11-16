@@ -268,8 +268,11 @@ Baseline today (in-memory engine, 12-core Linux machine, short Criterion runs):
 | Cypher scan + filter + aggregate, 10k rows | 39.8 ms |
 | Vector top-10, 5k × 128 | 562 µs |
 
-Single-record paths are ready; vector search and scans are the gaps the focus track
-closes. Criterion benchmarks live in `benches/` and run with `cargo bench`. Details are
+The first [Retrieval Bench](benches/retrieval/README.md) run (20,000 chunks × 768)
+found HNSW recall@10 of 0.22, filtered recall@10 of 0.04, an 85 s index build and no
+write throughput under concurrent search: a graph-connectivity bug and the missing
+filtered search are the first fixes. Single-record paths are ready; vector search and
+scans are the gaps the focus track closes. Criterion benchmarks live in `benches/` and run with `cargo bench`. Details are
 in [Positioning & Performance Targets](docs/26-positioning-and-targets.md).
 
 ## Documentation
