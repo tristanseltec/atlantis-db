@@ -15,19 +15,23 @@
 //! index keeps next to the graph. A column is built on first use and kept
 //! current by the same per-commit refresh as the vectors; equality and `IN`
 //! use a value → slots map, other operators scan the column. The resulting
-//! allow set drives [`HnswIndex::search_filtered`].
+//! allow set drives
+//! [`HnswIndex::search_filtered`](atlantis_vector::HnswIndex::search_filtered).
 
-use std::collections::HashMap;
+mod built;
+mod column;
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
+
+use atlantis_core::{AtlantisError, DatabaseRef, NodeId, RecordId, Value};
 use atlantis_cypher::ast::BinaryOp;
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-use atlantis_core::{AtlantisError, DatabaseRef, DistanceMetricKind, NodeId, RecordId, Value};
 use atlantis_kv::{Isolation, TxMode};
-use atlantis_storage::{RecordStore, RecordTx, VectorIndexDef};
-use atlantis_vector::{AllowSet, HnswIndex, HnswParams};
-
-use crate::exec::eval::{compare_op, group_key, is_true};
+use atlantis_storage::{RecordStore, VectorIndexDef};
+use atlantis_vector::HnswParams;
+use built::Built;
 
 /// A nearest-neighbour search request.
 #[derive(Debug, Clone)]
@@ -54,87 +58,6 @@ pub struct FieldFilter {
     pub field_on_left: bool,
 }
 
-impl FieldFilter {
-    fn admits(&self, field_value: &Value) -> bool {
-        let r = if self.field_on_left {
-            compare_op(field_value, self.op, &self.value)
-        } else {
-            compare_op(&self.value, self.op, field_value)
-        };
-        r.is_ok_and(|v| is_true(&v))
-    }
-
-    /// The equality-map keys that can satisfy this condition, when it is an
-    /// equality or `field IN [...]` (`None`: scan the column instead).
-    fn lookup_keys(&self) -> Option<Vec<String>> {
-        match (self.op, self.field_on_left, &self.value) {
-            (BinaryOp::Eq, _, v) => Some(vec![group_key(std::slice::from_ref(v))]),
-            (BinaryOp::In, true, Value::Array(items)) => Some(
-                items
-                    .iter()
-                    .map(|v| group_key(std::slice::from_ref(v)))
-                    .collect(),
-            ),
-            _ => None,
-        }
-    }
-}
-
-/// A per-slot copy of one record field, kept for filtered search.
-#[derive(Default)]
-struct Column {
-    /// Slot → field value (`Null` when absent or the slot was removed).
-    values: Vec<Value>,
-    /// Value key → slots that had that value when written. Entries of
-    /// removed or changed slots go stale; candidates are re-checked against
-    /// `values`.
-    eq: HashMap<String, Vec<u32>>,
-}
-
-impl Column {
-    fn set(&mut self, slot: u64, value: Value) {
-        let i = slot as usize;
-        if self.values.len() <= i {
-            self.values.resize(i + 1, Value::Null);
-        }
-        if !value.is_null() {
-            self.eq
-                .entry(group_key(std::slice::from_ref(&value)))
-                .or_default()
-                .push(slot as u32);
-        }
-        self.values[i] = value;
-    }
-
-    fn get(&self, slot: u32) -> &Value {
-        self.values.get(slot as usize).unwrap_or(&Value::Null)
-    }
-
-    /// Slots whose value meets `filter`.
-    fn matching(&self, filter: &FieldFilter) -> AllowSet {
-        let mut set = AllowSet::with_capacity(self.values.len());
-        match filter.lookup_keys() {
-            Some(keys) => {
-                for key in keys {
-                    for &slot in self.eq.get(&key).into_iter().flatten() {
-                        if filter.admits(self.get(slot)) {
-                            set.insert(slot);
-                        }
-                    }
-                }
-            }
-            None => {
-                for (slot, v) in self.values.iter().enumerate() {
-                    if filter.admits(v) {
-                        set.insert(slot as u32);
-                    }
-                }
-            }
-        }
-        set
-    }
-}
-
 /// One search hit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorHit {
@@ -142,161 +65,6 @@ pub struct VectorHit {
     /// Higher is more similar: cosine similarity, dot product, or
     /// `1 / (1 + distance)` for Euclidean.
     pub score: f64,
-}
-
-struct Built {
-    def: VectorIndexDef,
-    hnsw: HnswIndex,
-    /// Internal id → record id.
-    records: HashMap<u64, RecordId>,
-    /// Record id text → internal id of its current vector.
-    slots: HashMap<String, u64>,
-    next: u64,
-    /// Removed entries still present as HNSW tombstones.
-    deleted: usize,
-    /// Field name → column, for filtered search.
-    columns: HashMap<String, Column>,
-}
-
-impl Built {
-    fn new(def: VectorIndexDef, defaults: &HnswParams) -> Self {
-        let params = HnswParams {
-            m: def.m,
-            m0: def.m * 2,
-            ef_construction: def.ef_construction,
-            ..defaults.clone()
-        };
-        let hnsw = HnswIndex::new(params, def.dimension, def.metric);
-        Built {
-            def,
-            hnsw,
-            records: HashMap::new(),
-            slots: HashMap::new(),
-            next: 0,
-            deleted: 0,
-            columns: HashMap::new(),
-        }
-    }
-
-    /// Records `record`'s fields in the columns for `slot`.
-    fn set_columns(&mut self, slot: u64, record: &atlantis_core::Record) {
-        for (field, column) in self.columns.iter_mut() {
-            column.set(slot, record.get(field).cloned().unwrap_or(Value::Null));
-        }
-    }
-
-    /// Builds the columns for `fields` that do not exist yet, from the
-    /// records of the index's label.
-    fn add_columns(&mut self, tx: &mut RecordTx, fields: &[&str]) -> Result<(), AtlantisError> {
-        let missing: Vec<String> = fields
-            .iter()
-            .filter(|f| !self.columns.contains_key(**f))
-            .map(|f| f.to_string())
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let mut built: Vec<(String, Column)> = missing
-            .into_iter()
-            .map(|f| (f, Column::default()))
-            .collect();
-        for record in tx.with_label(&self.def.label)? {
-            let Some(&slot) = self.slots.get(&record.id.to_string()) else {
-                continue;
-            };
-            for (field, column) in &mut built {
-                column.set(slot, record.get(field).cloned().unwrap_or(Value::Null));
-            }
-        }
-        self.columns.extend(built);
-        Ok(())
-    }
-
-    /// The live slots that meet every filter.
-    fn allow_set(&self, filters: &[FieldFilter]) -> AllowSet {
-        let mut sets = filters.iter().map(|f| {
-            self.columns
-                .get(&f.field)
-                .map(|c| c.matching(f))
-                .unwrap_or_default()
-        });
-        let mut allow = sets.next().unwrap_or_default();
-        for s in sets {
-            if allow.is_empty() {
-                break;
-            }
-            allow.intersect(&s);
-        }
-        allow
-    }
-
-    fn vector_of(&self, value: Option<&Value>) -> Option<Vec<f32>> {
-        let v: Vec<f32> = match value? {
-            Value::Vector(v) => v.clone(),
-            Value::Array(items) => items
-                .iter()
-                .map(|x| x.as_float().map(|f| f as f32))
-                .collect::<Option<_>>()?,
-            _ => return None,
-        };
-        (v.len() == self.def.dimension).then_some(v)
-    }
-
-    fn remove(&mut self, id: &RecordId) {
-        if let Some(slot) = self.slots.remove(&id.to_string()) {
-            self.hnsw.remove(NodeId(slot));
-            self.records.remove(&slot);
-            self.deleted += 1;
-            for column in self.columns.values_mut() {
-                if let Some(v) = column.values.get_mut(slot as usize) {
-                    *v = Value::Null;
-                }
-            }
-        }
-    }
-
-    /// Re-reads one record and updates its entry. An unchanged vector is
-    /// left in place, so writes to other fields do not churn the graph.
-    fn refresh(&mut self, tx: &mut RecordTx, id: &RecordId) -> Result<(), AtlantisError> {
-        let record = tx.get(id)?.filter(|r| r.has_label(&self.def.label));
-        let vector = record
-            .as_ref()
-            .and_then(|r| self.vector_of(r.get(&self.def.field)));
-        if let (Some(v), Some(&slot)) = (&vector, self.slots.get(&id.to_string())) {
-            if self.hnsw.get_vector(NodeId(slot)) == Some(v.as_slice()) {
-                // Same vector: only filtered fields may have changed.
-                if let Some(record) = &record {
-                    self.set_columns(slot, record);
-                }
-                return Ok(());
-            }
-        }
-        self.remove(id);
-        if let (Some(vector), Some(record)) = (vector, record) {
-            let slot = self.next;
-            self.next += 1;
-            self.hnsw.insert(NodeId(slot), vector)?;
-            self.records.insert(slot, id.clone());
-            self.slots.insert(id.to_string(), slot);
-            self.set_columns(slot, &record);
-        }
-        Ok(())
-    }
-
-    /// `true` once tombstones outnumber live entries; searching such a
-    /// graph loses recall, so it is rebuilt.
-    fn needs_rebuild(&self) -> bool {
-        self.deleted > 1024.max(self.slots.len())
-    }
-
-    fn score(&self, distance: f32) -> f64 {
-        let d = distance as f64;
-        match self.def.metric {
-            DistanceMetricKind::Cosine => 1.0 - d,
-            DistanceMetricKind::DotProduct => -d,
-            DistanceMetricKind::Euclidean => 1.0 / (1.0 + d),
-        }
-    }
 }
 
 /// One index slot. `None` until the first search has built it; the builder
