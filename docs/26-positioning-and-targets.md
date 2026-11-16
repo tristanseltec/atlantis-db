@@ -174,8 +174,12 @@ Findings:
    updates. **Improved:** with one read-write lock per index, the 8-thread graph-RAG
    query goes from 225 to 3,041 QPS on the same machine, and to 4,168 QPS with lock-free
    link reads. The writer still reaches only 341/s of 2,000 under mixed load: each commit inserts into the graph under the
-   index's write lock (an `ef_construction` search per vector) after its own WAL fsync,
-   so write throughput waits for group commit (F6) and versioned entries applied off the
+   index's write lock (an `ef_construction` search per vector) after its own WAL fsync.
+   **Group commit (F6)** now keeps fsyncs out of the store lock and shares them: on disk,
+   readers under write load go from 801 to 4,695 QPS, and 64 durable single-record
+   writers from 204 to 6,198 commits/s (`2026-11-16-small-dir-group-commit.*`). The
+   single bench writer still pays an fsync plus an index insert per memory, so its rate
+   waits for versioned entries applied off the
    commit path (F4).
 4. **Filtering after the search** returned fewer than k rows for every query at 1%
    selectivity. **Fixed (F3):** the `WHERE` after `YIELD` is pushed into the index,

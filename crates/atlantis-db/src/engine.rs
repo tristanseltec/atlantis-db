@@ -135,7 +135,8 @@ impl Engine {
         Ok(value)
     }
 
-    /// Runs `f` in a read-write transaction with snapshot isolation.
+    /// Runs `f` in a read-write transaction with the configured default
+    /// isolation (`transaction.isolation`, snapshot unless changed).
     ///
     /// If `f` returns `Ok`, all its writes commit atomically; if it returns
     /// `Err`, nothing is written. A commit can fail with
@@ -146,7 +147,7 @@ impl Engine {
     where
         F: FnOnce(&mut Transaction) -> Result<T, AtlantisError>,
     {
-        self.run(TxMode::ReadWrite, Isolation::Snapshot, f)
+        self.run(TxMode::ReadWrite, self.store.default_isolation(), f)
     }
 
     /// Like [`transaction`](Self::transaction) with an explicit isolation
@@ -174,8 +175,9 @@ impl Engine {
     where
         F: FnMut(&mut Transaction) -> Result<T, AtlantisError>,
     {
+        let isolation = self.store.default_isolation();
         retry(max_attempts, || {
-            self.run(TxMode::ReadWrite, Isolation::Snapshot, &mut f)
+            self.run(TxMode::ReadWrite, isolation, &mut f)
         })
     }
 

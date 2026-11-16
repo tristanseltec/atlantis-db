@@ -24,18 +24,20 @@ pub struct EngineConfig {
     pub storage: StorageConfig,
     pub vector: VectorConfig,
     pub checkpoint_interval_secs: u64,
+    pub transaction: TransactionConfig,
 }
 ```
 
 | Field | Default | Effect |
 |---|---|---|
 | `storage.disk_path` | `None` (`Engine::open(path)` sets it) | Database directory; `None` is in-memory only |
-| `storage.sync` | `SyncMode::Every` | When commits are forced to disk |
+| `storage.sync` | `SyncMode::Every` | When commits are forced to disk: `Every` (group commit), `Interval(duration)` (background fsync; must be > 0) or `Never` |
 | `vector.dimensions` | `128` | Default `dimension` of a vector index |
 | `vector.distance_metric` | `Cosine` | Default `metric` of a vector index |
 | `vector.hnsw` | see [HnswParams](#hnswparams) | Default HNSW parameters of a vector index |
 | `vector.build_threads` | `0` | Threads that build a vector index from its records; `0` uses one per available CPU |
 | `checkpoint_interval_secs` | `300` | Period of automatic checkpoints; `0` disables them |
+| `transaction.isolation` | `Isolation::Snapshot` | Isolation of `engine.transaction`, `transaction_with_retry` and Cypher statements |
 
 Every field is used at runtime. The settings `memory_budget_bytes`, `eviction_policy`
 and `compaction_threshold`, and their builder methods, were removed with the legacy
@@ -63,6 +65,7 @@ let config = EngineConfig::builder()
 |---|---|---|
 | `disk_path(path)` | `impl Into<PathBuf>` | `storage.disk_path` |
 | `sync_mode(sync)` | `SyncMode` | `storage.sync` |
+| `default_isolation(isolation)` | `Isolation` | `transaction.isolation` |
 | `vector_dimensions(dims)` | `usize` | `vector.dimensions` |
 | `distance_metric(metric)` | `DistanceMetricKind` | `vector.distance_metric` |
 | `hnsw_params(params)` | `HnswParams` | `vector.hnsw` |

@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
 atlantis-core = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }

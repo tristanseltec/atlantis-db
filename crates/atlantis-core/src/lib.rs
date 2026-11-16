@@ -18,8 +18,8 @@ pub mod temporal;
 pub mod value;
 
 pub use config::{
-    DistanceMetricKind, EngineConfig, EngineConfigBuilder, HnswParams, StorageConfig, SyncMode,
-    VectorConfig,
+    DistanceMetricKind, EngineConfig, EngineConfigBuilder, HnswParams, Isolation, StorageConfig,
+    SyncMode, TransactionConfig, VectorConfig,
 };
 pub use error::AtlantisError;
 /// The target name of the unified error type; an alias for [`AtlantisError`].

@@ -124,13 +124,21 @@ The frame format and the full protocol are documented in
 [`crates/atlantis-kv/src/wal.rs`](../crates/atlantis-kv/src/wal.rs) and
 [`mem.rs`](../crates/atlantis-kv/src/mem.rs). In short:
 
-- **Commit.** After conflict validation, and while holding the store-wide write lock, a
-  commit appends its log record (and, with `SyncMode::Every`, syncs it) before the
-  writes are applied in memory and the commit returns. If the append fails, the commit
-  fails and nothing is applied. Cancelled and conflicting transactions never reach the
-  log.
-- **Checkpoint.** The log is rotated to `records.wal.old` and the latest state copied
-  under the lock; `records.kv` is then written atomically without the lock, and
+- **Commit (group commit).** Under the store-wide write lock a commit is *staged*:
+  validated against visible and staged commits, given the next version, and its log
+  record appended (not synced). The lock is released before any fsync. With
+  `SyncMode::Every` the commit then waits for the log to be synced past its record:
+  the first waiter that finds no sync running leads one for everything appended so far,
+  so concurrent commits share an fsync. Durable commits are applied in memory and made
+  visible strictly in version order, then acknowledged; readers never see a commit a
+  crash could lose and never wait for a sync. With `Interval` and `Never` a commit is
+  visible right after its append. If the append fails, the commit fails and nothing is
+  applied; if a sync fails, the log is marked unusable and staged commits fail.
+  Cancelled and conflicting transactions never reach the log. Catalog entries created
+  on first use are written with `set_idempotent`, so concurrent first writes to a new
+  table do not conflict over identical definitions.
+- **Checkpoint.** Once no commit is staged, the log is rotated to `records.wal.old` and
+  the latest state copied under the lock; `records.kv` is then written atomically without the lock, and
   `records.wal.old` is deleted. Checkpoints run every `checkpoint_interval_secs`
   (default 300) on a background thread, on `Engine::checkpoint()` and
   `Engine::shutdown()`, and when the last `Engine` clone is dropped.

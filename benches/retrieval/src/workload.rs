@@ -93,6 +93,14 @@ pub struct MixedResult {
     pub write_errors: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct IngestResult {
+    pub threads: usize,
+    pub records_per_s: f64,
+    pub commit_latency: Latency,
+    pub errors: u64,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Results {
     pub load: Option<LoadResult>,
@@ -101,6 +109,7 @@ pub struct Results {
     pub graph_rag: Option<Latency>,
     pub graph_rag_concurrent: Option<ConcurrentResult>,
     pub mixed: Option<MixedResult>,
+    pub ingest: Option<IngestResult>,
     /// Fraction of probes where a write was visible to search in its own transaction.
     pub reads_own_writes: Option<f64>,
     pub reopen_s: Option<f64>,
@@ -241,6 +250,55 @@ pub fn concurrent(
         errors,
     });
     Ok((readers, writer))
+}
+
+/// `s.threads` writers each commit one plain record per transaction for
+/// `s.duration`: the durable commit rate without index maintenance.
+pub fn ingest(
+    a: &dyn Adapter,
+    ds: &Dataset,
+    s: &Settings,
+    next_id: &AtomicU64,
+) -> anyhow::Result<IngestResult> {
+    let stop = AtomicBool::new(false);
+    let started = Instant::now();
+    let per_thread: Vec<(Vec<Duration>, u64)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..s.threads.max(1))
+            .map(|t| {
+                let stop = &stop;
+                scope.spawn(move || {
+                    let mut rng = Rng::new(0x1A6E_5700 + t as u64);
+                    let (mut samples, mut errs) = (Vec::new(), 0u64);
+                    while !stop.load(Ordering::Relaxed) {
+                        let src = rng.below(ds.spec.chunks as u64) as usize;
+                        let id = next_id.fetch_add(1, Ordering::Relaxed);
+                        let begin = Instant::now();
+                        // Only successful commits count toward the rate.
+                        match a.ingest_record(id, ds.user[src], &ds.text[src]) {
+                            Ok(()) => samples.push(begin.elapsed()),
+                            Err(_) => errs += 1,
+                        }
+                    }
+                    (samples, errs)
+                })
+            })
+            .collect();
+        std::thread::sleep(s.duration);
+        stop.store(true, Ordering::Relaxed);
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("ingest thread"))
+            .collect()
+    });
+    let elapsed = started.elapsed().as_secs_f64();
+    let errors = per_thread.iter().map(|(_, e)| e).sum();
+    let samples: Vec<Duration> = per_thread.into_iter().flat_map(|(s, _)| s).collect();
+    Ok(IngestResult {
+        threads: s.threads.max(1),
+        records_per_s: samples.len() as f64 / elapsed,
+        commit_latency: Latency::from(samples),
+        errors,
+    })
 }
 
 pub fn reads_own_writes(

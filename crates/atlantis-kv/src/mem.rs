@@ -14,13 +14,23 @@
 //! holding a checkpoint (`records.kv`) and a write-ahead log (`records.wal`,
 //! format in [`crate::wal`]):
 //!
-//! - **Commit.** After conflict validation, and while still holding the
-//!   store-wide write lock, a commit appends one log record with its new
-//!   version and writes (synced first with [`SyncMode::Every`]). Only then
-//!   are the writes applied in memory and the commit acknowledged. If the
-//!   append fails the commit fails, nothing is applied and its snapshot is
-//!   released. Commits without writes log nothing; cancelled or conflicting
-//!   transactions never reach the log.
+//! - **Commit (group commit).** Under the store-wide write lock a commit is
+//!   *staged*: it is validated against both visible and staged commits,
+//!   takes the next version, and appends one log record with its version
+//!   and writes. The lock is then released. With [`SyncMode::Every`] the
+//!   commit waits, without the lock, until the log is synced past its
+//!   record: the first waiter that finds no sync running becomes the
+//!   leader and syncs everything appended so far, so concurrent commits
+//!   share one `fdatasync`. Once durable, staged commits are *published*
+//!   (applied in memory and made visible) strictly in version order, and
+//!   the commit is acknowledged. Readers never see a commit that a crash
+//!   could lose, and never wait for a sync. With [`SyncMode::Interval`]
+//!   and [`SyncMode::Never`] a commit is published right after its append;
+//!   the interval mode syncs on a background thread. If the append fails
+//!   the commit fails, nothing is applied and its snapshot is released; if
+//!   a sync fails the log is marked broken and every staged commit fails
+//!   (its record may or may not be on disk). Commits without writes log
+//!   nothing; cancelled or conflicting transactions never reach the log.
 //! - **Checkpoint.** [`checkpoint_durable`](MemStore::checkpoint_durable)
 //!   (1) under the write lock rotates `records.wal` to `records.wal.old`,
 //!   starts an empty `records.wal` and copies the latest state at version
@@ -46,17 +56,22 @@ use std::io::{self, Write};
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use atlantis_core::AtlantisError;
 
 use crate::keys::KeyRange;
 use crate::kv::{Isolation, KvPair, KvStore, KvTransaction, TxMode, Versionstamp};
-use crate::wal::{self, SyncMode, Wal, WalRecord, CHECKPOINT_FILE, WAL_FILE, WAL_OLD_FILE};
+use crate::wal::{
+    self, SyncHandle, SyncMode, Wal, WalRecord, CHECKPOINT_FILE, WAL_FILE, WAL_OLD_FILE,
+};
 
 /// One committed version: the commit version and the value, or `None` for
 /// a deletion.
 type Version = (u64, Option<Vec<u8>>);
+
+/// A transaction's buffered writes (`None` deletes).
+type Writes = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
 const CHECKPOINT_MAGIC: &[u8; 4] = b"ATKV";
 const CHECKPOINT_FORMAT: u8 = 1;
@@ -73,6 +88,14 @@ struct Inner {
     /// Write-ahead log; `Some` only for stores opened with
     /// [`MemStore::open_durable`].
     wal: Option<Wal>,
+    /// Version of the latest staged commit (`>= version`).
+    staged: u64,
+    /// Staged commits waiting for their log record to be synced, by version.
+    pending: BTreeMap<u64, Writes>,
+    /// Key → version of the staged commit that writes it. A key has at most
+    /// one: a second writer would have a snapshot below the first one's
+    /// version and fail validation.
+    pending_keys: BTreeMap<Vec<u8>, u64>,
 }
 
 impl Inner {
@@ -141,11 +164,155 @@ impl Inner {
         self.version = record.version;
     }
 
+    /// Applies one commit's writes at `version` and makes it visible.
+    fn publish(&mut self, version: u64, writes: Writes) {
+        debug_assert_eq!(version, self.version + 1);
+        self.version = version;
+        let horizon = self.horizon();
+        for (key, value) in writes {
+            if self.pending_keys.get(&key) == Some(&version) {
+                self.pending_keys.remove(&key);
+            }
+            self.data
+                .entry(key.clone())
+                .or_default()
+                .push((version, value));
+            self.prune(&key, horizon);
+        }
+    }
+
+    /// Publishes staged commits, in order, up to `durable`.
+    fn publish_durable(&mut self, durable: u64) {
+        while let Some(entry) = self.pending.first_entry() {
+            let version = *entry.key();
+            if version > durable || version != self.version + 1 {
+                break;
+            }
+            let writes = entry.remove();
+            self.publish(version, writes);
+        }
+    }
+
+    /// The newest value of `key` committed or staged after `snapshot`, if
+    /// any (`Some(None)`: deleted).
+    fn newer_than(&self, key: &[u8], snapshot: u64) -> Option<Option<&Vec<u8>>> {
+        if let Some(v) = self.pending_keys.get(key) {
+            return self
+                .pending
+                .get(v)
+                .and_then(|w| w.get(key))
+                .map(Option::as_ref);
+        }
+        let (version, value) = self.data.get(key)?.last()?;
+        (*version > snapshot).then_some(value.as_ref())
+    }
+
     fn release(&mut self, snapshot: u64) {
         if let Some(count) = self.active.get_mut(&snapshot) {
             *count -= 1;
             if *count == 0 {
                 self.active.remove(&snapshot);
+            }
+        }
+    }
+}
+
+/// Group-commit state: how far the log is appended and synced.
+#[derive(Default)]
+struct SyncState {
+    /// Version of the latest record appended to the log.
+    appended: u64,
+    /// Every record up to this version is synced.
+    synced: u64,
+    /// Number of syncs performed (one per group of commits).
+    syncs: u64,
+    /// A leader is syncing right now.
+    syncing: bool,
+    /// Set once a sync failed; the log is then unusable.
+    failed: Option<String>,
+}
+
+#[derive(Default)]
+struct Durability {
+    state: Mutex<SyncState>,
+    synced: Condvar,
+    /// The log file to sync (`None` for stores without a log).
+    handle: Mutex<Option<SyncHandle>>,
+}
+
+impl Durability {
+    fn lock(&self) -> MutexGuard<'_, SyncState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn note_appended(&self, version: u64) {
+        let mut st = self.lock();
+        st.appended = st.appended.max(version);
+    }
+
+    fn synced(&self) -> u64 {
+        self.lock().synced
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.lock().failed.clone()
+    }
+
+    /// Syncs the log through everything appended so far, as one leader.
+    /// Returns the version synced to.
+    fn sync_once(
+        &self,
+        mut st: MutexGuard<'_, SyncState>,
+    ) -> (MutexGuard<'_, SyncState>, Result<(), String>) {
+        st.syncing = true;
+        let target = st.appended;
+        drop(st);
+        // Read `appended` before taking the file: a rotation swaps the file
+        // only while nothing is staged, so every record up to `target` is in
+        // the file we sync.
+        let file = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let result = match file {
+            Some(f) => f.sync_data().map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        let mut st = self.lock();
+        st.syncing = false;
+        match &result {
+            Ok(()) => {
+                st.synced = st.synced.max(target);
+                st.syncs += 1;
+            }
+            Err(e) => {
+                st.failed
+                    .get_or_insert_with(|| format!("write-ahead log sync failed: {e}"));
+            }
+        }
+        self.synced.notify_all();
+        (st, result)
+    }
+
+    /// Waits until the log is synced through `version`, leading a sync when
+    /// none is running (group commit).
+    fn wait_synced(&self, version: u64) -> Result<(), AtlantisError> {
+        let mut st = self.lock();
+        loop {
+            if let Some(e) = &st.failed {
+                return Err(AtlantisError::Storage(format!(
+                    "commit outcome unknown: {e}; reopen the store"
+                )));
+            }
+            if st.synced >= version {
+                return Ok(());
+            }
+            if st.syncing {
+                st = self.synced.wait(st).unwrap_or_else(|e| e.into_inner());
+            } else {
+                st = self.sync_once(st).0;
             }
         }
     }
@@ -157,6 +324,7 @@ pub struct MemStore {
     inner: Arc<RwLock<Inner>>,
     /// Serializes checkpoints so concurrent calls never interleave writes.
     checkpoint_lock: Arc<Mutex<()>>,
+    durability: Arc<Durability>,
 }
 
 fn poisoned() -> AtlantisError {
@@ -233,10 +401,49 @@ impl MemStore {
         }
     }
 
-    fn from_inner(inner: Inner) -> Self {
-        MemStore {
+    fn from_inner(mut inner: Inner) -> Self {
+        inner.staged = inner.version;
+        let durability = Durability::default();
+        {
+            let mut st = durability.lock();
+            st.appended = inner.version;
+            st.synced = inner.version;
+        }
+        *durability.handle.lock().unwrap_or_else(|e| e.into_inner()) =
+            inner.wal.as_ref().map(Wal::sync_handle);
+        let interval = match inner.wal.as_ref().map(Wal::sync_mode) {
+            Some(SyncMode::Interval(d)) => Some(d),
+            _ => None,
+        };
+        let store = MemStore {
             inner: Arc::new(RwLock::new(inner)),
             checkpoint_lock: Arc::default(),
+            durability: Arc::new(durability),
+        };
+        if let Some(every) = interval {
+            spawn_interval_syncer(Arc::downgrade(&store.durability), every);
+        }
+        store
+    }
+
+    /// Publishes staged commits that are durable. Returns the store lock.
+    fn publish_durable(&self) -> Result<RwLockWriteGuard<'_, Inner>, AtlantisError> {
+        let mut inner = self.write()?;
+        let durable = self.durability.synced();
+        inner.publish_durable(durable);
+        Ok(inner)
+    }
+
+    /// Waits until no commit is staged, and returns the store lock.
+    fn quiesce(&self) -> Result<RwLockWriteGuard<'_, Inner>, AtlantisError> {
+        loop {
+            let inner = self.publish_durable()?;
+            if inner.pending.is_empty() {
+                return Ok(inner);
+            }
+            let target = inner.staged;
+            drop(inner);
+            self.durability.wait_synced(target)?;
         }
     }
 
@@ -295,7 +502,9 @@ impl MemStore {
     pub fn checkpoint_durable(&self) -> Result<(), AtlantisError> {
         let _serialized = self.lock_checkpoints();
         let (dir, version, pairs) = {
-            let mut inner = self.write()?;
+            // Staged commits have records in the active log but are not in
+            // the state being copied; rotating now would drop them.
+            let mut inner = self.quiesce()?;
             let Some(wal) = inner.wal.as_mut() else {
                 return Ok(());
             };
@@ -313,6 +522,12 @@ impl MemStore {
         Ok(())
     }
 
+    /// Number of log syncs so far. With [`SyncMode::Every`] concurrent
+    /// commits share syncs, so this grows slower than the commit count.
+    pub fn sync_count(&self) -> u64 {
+        self.durability.lock().syncs
+    }
+
     /// Bytes currently in the active write-ahead log (0 for non-durable
     /// stores).
     pub fn wal_size(&self) -> u64 {
@@ -320,6 +535,28 @@ impl MemStore {
             .read()
             .map(|inner| inner.wal.as_ref().map_or(0, Wal::size))
             .unwrap_or(0)
+    }
+}
+
+/// Syncs the log every `every` until the store is dropped.
+fn spawn_interval_syncer(durability: Weak<Durability>, every: std::time::Duration) {
+    let spawned = std::thread::Builder::new()
+        .name("atlantis-wal-sync".into())
+        .spawn(move || loop {
+            std::thread::sleep(every);
+            let Some(d) = durability.upgrade() else {
+                return;
+            };
+            let st = d.lock();
+            if st.failed.is_some() {
+                return;
+            }
+            if st.appended > st.synced && !st.syncing {
+                let _ = d.sync_once(st);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the write-ahead log sync thread: {e}");
     }
 }
 
@@ -410,13 +647,23 @@ impl KvStore for MemStore {
         mode: TxMode,
         isolation: Isolation,
     ) -> Result<Box<dyn KvTransaction>, AtlantisError> {
+        Ok(Box::new(self.begin_tx(mode, isolation)?))
+    }
+}
+
+impl MemStore {
+    fn begin_tx(
+        &self,
+        mode: TxMode,
+        isolation: Isolation,
+    ) -> Result<MemTransaction, AtlantisError> {
         let snapshot = {
             let mut inner = self.write()?;
             let snapshot = inner.version;
             *inner.active.entry(snapshot).or_insert(0) += 1;
             snapshot
         };
-        Ok(Box::new(MemTransaction {
+        Ok(MemTransaction {
             store: self.clone(),
             snapshot,
             mode,
@@ -424,8 +671,9 @@ impl KvStore for MemStore {
             writes: BTreeMap::new(),
             reads: HashSet::new(),
             scans: Vec::new(),
+            idempotent: HashSet::new(),
             finished: false,
-        }))
+        })
     }
 }
 
@@ -434,11 +682,13 @@ struct MemTransaction {
     snapshot: u64,
     mode: TxMode,
     isolation: Isolation,
-    writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    writes: Writes,
     /// Keys read (tracked only for serializable transactions).
     reads: HashSet<Vec<u8>>,
     /// Ranges scanned (tracked only for serializable transactions).
     scans: Vec<KeyRange>,
+    /// Keys written with `set_idempotent`.
+    idempotent: HashSet<Vec<u8>>,
     finished: bool,
 }
 
@@ -472,13 +722,92 @@ impl MemTransaction {
             self.writes.clear();
             self.reads.clear();
             self.scans.clear();
+            self.idempotent.clear();
         }
+    }
+
+    /// Validates, takes the next version and appends the log record, under
+    /// the store lock. Returns the version and whether the commit must wait
+    /// for a sync before it is published; otherwise it is published already.
+    /// The transaction is finished either way.
+    fn stage(&mut self, store: &MemStore) -> Result<(u64, bool), AtlantisError> {
+        let mut inner = store.write()?;
+        if let Some(reason) = self.conflict(&inner) {
+            drop(inner);
+            self.finish();
+            return Err(AtlantisError::TxConflict(reason));
+        }
+        // Idempotent writes a newer commit already made are dropped.
+        let redundant: Vec<Vec<u8>> = self
+            .idempotent
+            .iter()
+            .filter(|k| self.redundant(&inner, k))
+            .cloned()
+            .collect();
+        for key in redundant {
+            self.writes.remove(&key);
+        }
+        if self.writes.is_empty() {
+            let snapshot = self.snapshot;
+            drop(inner);
+            self.finish();
+            return Ok((snapshot, false));
+        }
+        let version = inner.staged + 1;
+        let mut wait = false;
+        if let Some(wal) = inner.wal.as_mut() {
+            let logged = match store.durability.failure() {
+                Some(e) => {
+                    wal.mark_broken();
+                    Err(AtlantisError::Storage(e))
+                }
+                None => wal::encode_record(version, &self.writes).and_then(|f| wal.append(&f)),
+            };
+            if let Err(e) = logged {
+                drop(inner);
+                self.finish();
+                return Err(e);
+            }
+            wait = wal.sync_mode() == SyncMode::Every;
+            store.durability.note_appended(version);
+        }
+        inner.staged = version;
+        let writes = std::mem::take(&mut self.writes);
+        // Release our snapshot before publishing so it does not hold back
+        // the pruning horizon.
+        inner.release(self.snapshot);
+        self.finished = true;
+        if wait {
+            for key in writes.keys() {
+                inner.pending_keys.insert(key.clone(), version);
+            }
+            inner.pending.insert(version, writes);
+        } else {
+            inner.publish(version, writes);
+        }
+        Ok((version, wait))
+    }
+
+    /// `true` if `key` was written with `set_idempotent` and a newer commit
+    /// (visible or staged) already holds exactly the value this one writes.
+    fn redundant(&self, inner: &Inner, key: &[u8]) -> bool {
+        self.idempotent.contains(key)
+            && match (inner.newer_than(key, self.snapshot), self.writes.get(key)) {
+                (Some(theirs), Some(ours)) => theirs == ours.as_ref(),
+                _ => false,
+            }
     }
 
     /// Returns a conflict description if a concurrent commit invalidates
     /// this transaction.
     fn conflict(&self, inner: &Inner) -> Option<String> {
-        let changed = |key: &[u8]| inner.latest_version(key).is_some_and(|v| v > self.snapshot);
+        // Staged commits count: they are newer than every open snapshot.
+        // A matching idempotent write does not.
+        let changed = |key: &[u8]| {
+            (inner.latest_version(key).is_some_and(|v| v > self.snapshot)
+                || inner.pending_keys.contains_key(key))
+                && !self.redundant(inner, key)
+        };
         if let Some(key) = self.writes.keys().find(|k| changed(k)) {
             return Some(format!("write-write conflict on key {}", escape(key)));
         }
@@ -496,8 +825,13 @@ impl MemTransaction {
                 );
                 if inner
                     .data
-                    .range::<Vec<u8>, _>(bounds)
+                    .range::<Vec<u8>, _>(bounds.clone())
                     .any(|(_, versions)| versions.last().is_some_and(|(v, _)| *v > self.snapshot))
+                    || inner
+                        .pending_keys
+                        .range::<Vec<u8>, _>(bounds)
+                        .next()
+                        .is_some()
                 {
                     return Some("a range scanned by this transaction changed".into());
                 }
@@ -529,12 +863,21 @@ impl KvTransaction for MemTransaction {
 
     fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), AtlantisError> {
         self.check_writable()?;
+        self.idempotent.remove(&key);
+        self.writes.insert(key, Some(value));
+        Ok(())
+    }
+
+    fn set_idempotent(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), AtlantisError> {
+        self.check_writable()?;
+        self.idempotent.insert(key.clone());
         self.writes.insert(key, Some(value));
         Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<(), AtlantisError> {
         self.check_writable()?;
+        self.idempotent.remove(key);
         self.writes.insert(key.to_vec(), None);
         Ok(())
     }
@@ -589,37 +932,12 @@ impl KvTransaction for MemTransaction {
             return Ok(Versionstamp(snapshot));
         }
         let store = self.store.clone();
-        let mut inner = store.write()?;
-        if let Some(reason) = self.conflict(&inner) {
-            drop(inner);
-            self.finish();
-            return Err(AtlantisError::TxConflict(reason));
+        let version = self.stage(&store)?;
+        if version.1 {
+            store.durability.wait_synced(version.0)?;
+            drop(store.publish_durable()?);
         }
-        let version = inner.version + 1;
-        if let Some(wal) = inner.wal.as_mut() {
-            let logged =
-                wal::encode_record(version, &self.writes).and_then(|frame| wal.append(&frame));
-            if let Err(e) = logged {
-                drop(inner);
-                self.finish();
-                return Err(e);
-            }
-        }
-        inner.version = version;
-        let writes = std::mem::take(&mut self.writes);
-        // Release our snapshot before pruning so it does not hold back the horizon.
-        inner.release(self.snapshot);
-        self.finished = true;
-        let horizon = inner.horizon();
-        for (key, value) in writes {
-            inner
-                .data
-                .entry(key.clone())
-                .or_default()
-                .push((version, value));
-            inner.prune(&key, horizon);
-        }
-        Ok(Versionstamp(version))
+        Ok(Versionstamp(version.0))
     }
 
     fn cancel(&mut self) -> Result<(), AtlantisError> {
@@ -1307,6 +1625,192 @@ mod tests {
         assert_eq!(version(&store), 1);
         assert_eq!(get(&store, b"b"), None);
         assert_eq!(put(&store, b"b", b"3"), 2);
+    }
+
+    #[test]
+    fn staged_commits_are_invisible_and_conflict_until_published() {
+        let dir = TempDir::new();
+        let store = open(&dir);
+        put(&store, b"other", b"0");
+        let mut t1 = store
+            .begin_tx(TxMode::ReadWrite, Isolation::Snapshot)
+            .unwrap();
+        t1.set(b"k".to_vec(), b"1".to_vec()).unwrap();
+        let (v, wait) = t1.stage(&store).unwrap();
+        assert!(wait, "SyncMode::Every waits for the sync");
+        assert_eq!(v, 2);
+
+        // Not visible yet: readers see version 1.
+        assert_eq!(version(&store), 1);
+        assert_eq!(get(&store, b"k"), None);
+
+        // A writer of the same key loses, although the key is not visible.
+        let mut t2 = rw(&store);
+        t2.set(b"k".to_vec(), b"2".to_vec()).unwrap();
+        assert!(matches!(t2.commit(), Err(AtlantisError::TxConflict(_))));
+
+        // A serializable transaction that read the key, or scanned over it,
+        // loses too.
+        let mut t3 = store
+            .begin(TxMode::ReadWrite, Isolation::Serializable)
+            .unwrap();
+        assert_eq!(t3.get(b"k").unwrap(), None);
+        t3.set(b"x".to_vec(), b"1".to_vec()).unwrap();
+        assert!(matches!(t3.commit(), Err(AtlantisError::TxConflict(_))));
+        let mut t4 = store
+            .begin(TxMode::ReadWrite, Isolation::Serializable)
+            .unwrap();
+        t4.scan(&range(b"a", b"z"), None).unwrap();
+        t4.set(b"y".to_vec(), b"1".to_vec()).unwrap();
+        assert!(matches!(t4.commit(), Err(AtlantisError::TxConflict(_))));
+
+        // Another key commits behind it, and both become visible in order.
+        let v_other = put(&store, b"z", b"9");
+        assert_eq!(v_other, 3);
+        assert_eq!(get(&store, b"k"), Some(b"1".to_vec()));
+        assert_eq!(get(&store, b"z"), Some(b"9".to_vec()));
+        assert_eq!(version(&store), 3);
+        assert!(store.read().unwrap().pending.is_empty());
+        assert!(store.read().unwrap().pending_keys.is_empty());
+    }
+
+    #[test]
+    fn idempotent_writes_of_the_same_value_do_not_conflict() {
+        let dir = TempDir::new();
+        let store = open(&dir);
+        // t1 stages the catalog entry; t2 began before and writes the same
+        // bytes, plus its own record.
+        let mut t1 = store
+            .begin_tx(TxMode::ReadWrite, Isolation::Snapshot)
+            .unwrap();
+        let mut t2 = store
+            .begin_tx(TxMode::ReadWrite, Isolation::Serializable)
+            .unwrap();
+        let mut t3 = store
+            .begin_tx(TxMode::ReadWrite, Isolation::Snapshot)
+            .unwrap();
+        t1.set_idempotent(b"cat".to_vec(), b"def".to_vec()).unwrap();
+        t1.set(b"r1".to_vec(), b"1".to_vec()).unwrap();
+        t1.stage(&store).unwrap();
+
+        assert_eq!(t2.get(b"cat").unwrap(), None);
+        t2.set_idempotent(b"cat".to_vec(), b"def".to_vec()).unwrap();
+        t2.set(b"r2".to_vec(), b"2".to_vec()).unwrap();
+        let v2 = t2.commit().unwrap();
+        assert_eq!(
+            v2.0, 2,
+            "staged behind t1, and logged without the catalog key"
+        );
+
+        // A different value still conflicts.
+        t3.set_idempotent(b"cat".to_vec(), b"other".to_vec())
+            .unwrap();
+        assert!(matches!(t3.commit(), Err(AtlantisError::TxConflict(_))));
+
+        // A transaction whose only write is redundant commits as a no-op.
+        let mut t4 = store
+            .begin_tx(TxMode::ReadWrite, Isolation::Snapshot)
+            .unwrap();
+        let mut t5 = store
+            .begin_tx(TxMode::ReadWrite, Isolation::Snapshot)
+            .unwrap();
+        t4.set_idempotent(b"x".to_vec(), b"1".to_vec()).unwrap();
+        t4.commit().unwrap();
+        t5.set_idempotent(b"x".to_vec(), b"1".to_vec()).unwrap();
+        assert_eq!(t5.commit().unwrap().0, 2, "returns its snapshot");
+
+        assert_eq!(get(&store, b"cat"), Some(b"def".to_vec()));
+        assert_eq!(get(&store, b"r1"), Some(b"1".to_vec()));
+        assert_eq!(get(&store, b"r2"), Some(b"2".to_vec()));
+        assert_eq!(version(&store), 3);
+        drop(store);
+        let store = open(&dir);
+        assert_eq!(get(&store, b"r2"), Some(b"2".to_vec()));
+        assert_eq!(version(&store), 3);
+    }
+
+    #[test]
+    fn checkpoint_waits_for_staged_commits() {
+        let dir = TempDir::new();
+        let store = open(&dir);
+        let mut t1 = store
+            .begin_tx(TxMode::ReadWrite, Isolation::Snapshot)
+            .unwrap();
+        t1.set(b"k".to_vec(), b"1".to_vec()).unwrap();
+        t1.stage(&store).unwrap();
+        store.checkpoint_durable().unwrap();
+        assert_eq!(get(&store, b"k"), Some(b"1".to_vec()));
+        drop(store);
+        let store = open(&dir);
+        assert_eq!(get(&store, b"k"), Some(b"1".to_vec()));
+        assert_eq!(version(&store), 1);
+    }
+
+    #[test]
+    fn concurrent_commits_share_syncs_and_survive_reopen() {
+        let dir = TempDir::new();
+        let store = open(&dir);
+        let threads = 8;
+        let per_thread = 100;
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let mut versions = Vec::new();
+                    for i in 0..per_thread {
+                        let key = format!("t{t}-{i}").into_bytes();
+                        versions.push(put(&store, &key, b"v"));
+                    }
+                    versions
+                })
+            })
+            .collect();
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort_unstable();
+        let total = (threads * per_thread) as u64;
+        assert_eq!(
+            all,
+            (1..=total).collect::<Vec<_>>(),
+            "versions are unique and dense"
+        );
+        assert_eq!(version(&store), total);
+        assert!(store.sync_count() <= total);
+        drop(store);
+        let store = open(&dir);
+        assert_eq!(version(&store), total);
+        for t in 0..threads {
+            for i in 0..per_thread {
+                assert!(get(&store, format!("t{t}-{i}").as_bytes()).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn interval_mode_publishes_at_once_and_syncs_in_background() {
+        let dir = TempDir::new();
+        let store = MemStore::open_durable(
+            &dir.0,
+            SyncMode::Interval(std::time::Duration::from_millis(5)),
+        )
+        .unwrap();
+        for i in 0..20u8 {
+            put(&store, &[i], b"v");
+        }
+        assert_eq!(version(&store), 20);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store.durability.synced() < 20 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background sync never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(store);
+        let store = MemStore::open_durable(&dir.0, SyncMode::Never).unwrap();
+        assert_eq!(version(&store), 20);
     }
 
     #[test]

@@ -35,12 +35,39 @@ impl DistanceMetricKind {
 /// When committed transactions are forced to disk.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
 pub enum SyncMode {
-    /// Every commit is fsynced to the write-ahead log before it returns.
+    /// Every commit is fsynced to the write-ahead log before it returns or
+    /// becomes visible. Concurrent commits share one fsync (group commit).
     #[default]
     Every,
+    /// The log is fsynced by a background thread at this interval; commits
+    /// return without waiting. A machine crash can lose the commits of the
+    /// last interval.
+    Interval(std::time::Duration),
     /// Commits are written to the log but left to the OS to flush. A crash
     /// of the machine (not just the process) can lose recent commits.
     Never,
+}
+
+/// Transaction isolation level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Isolation {
+    /// Reads see a consistent snapshot taken at `begin`. A commit fails if
+    /// another transaction committed a write to the same key after the
+    /// snapshot (first committer wins). Write skew is possible.
+    #[default]
+    Snapshot,
+    /// Snapshot isolation plus read validation: a commit also fails if any
+    /// key it read, or any range it scanned, changed after the snapshot.
+    Serializable,
+}
+
+/// Transaction defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransactionConfig {
+    /// Isolation of read-write transactions that do not choose one:
+    /// `Engine::transaction`, `transaction_with_retry` and Cypher statements.
+    #[serde(default)]
+    pub isolation: Isolation,
 }
 
 /// HNSW index parameters.
@@ -136,6 +163,9 @@ pub struct EngineConfig {
     /// Interval in seconds between automatic checkpoints, which fold the
     /// write-ahead log into the checkpoint file. 0 = disabled.
     pub checkpoint_interval_secs: u64,
+    /// Transaction defaults.
+    #[serde(default)]
+    pub transaction: TransactionConfig,
 }
 
 impl Default for EngineConfig {
@@ -144,6 +174,7 @@ impl Default for EngineConfig {
             storage: StorageConfig::default(),
             vector: VectorConfig::default(),
             checkpoint_interval_secs: 300,
+            transaction: TransactionConfig::default(),
         }
     }
 }
@@ -156,6 +187,11 @@ impl EngineConfig {
 
     /// Validates all configuration values.
     pub fn validate(&self) -> Result<(), AtlantisError> {
+        if self.storage.sync == SyncMode::Interval(std::time::Duration::ZERO) {
+            return Err(AtlantisError::Config(
+                "the sync interval must be greater than 0".into(),
+            ));
+        }
         self.vector.validate()
     }
 }
@@ -212,6 +248,12 @@ impl EngineConfigBuilder {
     /// Sets when commits are forced to disk.
     pub fn sync_mode(mut self, sync: SyncMode) -> Self {
         self.config.storage.sync = sync;
+        self
+    }
+
+    /// Sets the isolation of read-write transactions that do not choose one.
+    pub fn default_isolation(mut self, isolation: Isolation) -> Self {
+        self.config.transaction.isolation = isolation;
         self
     }
 

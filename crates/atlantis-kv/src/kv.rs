@@ -16,18 +16,9 @@ pub enum TxMode {
     ReadWrite,
 }
 
-/// Transaction isolation level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Isolation {
-    /// Reads see a consistent snapshot taken at `begin`. A commit fails if
-    /// another transaction committed a write to the same key after the
-    /// snapshot (first committer wins). Write skew is possible.
-    #[default]
-    Snapshot,
-    /// Snapshot isolation plus read validation: a commit also fails if any
-    /// key it read, or any range it scanned, changed after the snapshot.
-    Serializable,
-}
+/// Transaction isolation level (defined in `atlantis-core` so configuration
+/// can name it).
+pub use atlantis_core::Isolation;
 
 /// A totally ordered commit position. Every commit that writes gets a new,
 /// larger versionstamp; change feeds will be keyed by it.
@@ -59,6 +50,16 @@ pub trait KvTransaction: Send {
 
     /// Writes a key.
     fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), AtlantisError>;
+
+    /// Writes a key that concurrent transactions may write with the same
+    /// bytes, such as a catalog entry created on first use. If a commit
+    /// newer than this transaction's snapshot already wrote exactly `value`
+    /// to `key`, that is not a conflict (and a read of `key` by a
+    /// serializable transaction is not invalidated by it); this write is
+    /// then dropped. A different value conflicts as with [`set`](Self::set).
+    fn set_idempotent(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), AtlantisError> {
+        self.set(key, value)
+    }
 
     /// Deletes a key. Deleting a missing key is not an error.
     fn delete(&mut self, key: &[u8]) -> Result<(), AtlantisError>;

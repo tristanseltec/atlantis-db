@@ -1,0 +1,114 @@
+{
+  "bench": "atlantis-retrieval-bench",
+  "version": 1,
+  "date": "2026-11-16",
+  "git_commit": "0e6fe36",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 12
+  },
+  "scale": "small",
+  "spec": {
+    "chunks": 20000,
+    "dim": 768,
+    "users": 100,
+    "clusters": 256,
+    "queries": 300,
+    "seed": 10951255
+  },
+  "edges": 44000,
+  "k": 10,
+  "threads": 8,
+  "duration_s": 5.0,
+  "adapter": "atlantis (embedded, directory)",
+  "capabilities": {
+    "filter_in_search": true,
+    "hybrid_text": false,
+    "search_reads_own_writes": false,
+    "graph_in_query": true,
+    "embedded": true
+  },
+  "adapter_notes": "filtered search = filter pushed into the vector index (YIELD ... WHERE); efSearch default; no BM25 (graph-RAG is vector-only)",
+  "results": {
+    "load": {
+      "items": 67000,
+      "load_s": 2.390572673,
+      "items_per_s": 28026.757252236024,
+      "index_build_s": 5.8094205389999996
+    },
+    "vector": {
+      "latency": {
+        "count": 300,
+        "mean_ms": 0.2792961900000002,
+        "p50_ms": 0.267911,
+        "p95_ms": 0.376033,
+        "p99_ms": 0.438901,
+        "p999_ms": 0.488294,
+        "max_ms": 0.488294
+      },
+      "recall_at_k": 1.0,
+      "short_results": 0
+    },
+    "filtered_vector": null,
+    "graph_rag": null,
+    "graph_rag_concurrent": {
+      "threads": 8,
+      "qps": 5170.989618786663,
+      "latency": {
+        "count": 25862,
+        "mean_ms": 1.546678715141906,
+        "p50_ms": 1.4518849999999999,
+        "p95_ms": 2.048441,
+        "p99_ms": 4.116178,
+        "p999_ms": 10.424114999999999,
+        "max_ms": 196.40827
+      },
+      "errors": 0
+    },
+    "mixed": {
+      "readers": {
+        "threads": 8,
+        "qps": 4725.132771172869,
+        "latency": {
+          "count": 23635,
+          "mean_ms": 1.6924313185106812,
+          "p50_ms": 1.518008,
+          "p95_ms": 2.868354,
+          "p99_ms": 3.895286,
+          "p999_ms": 11.483547,
+          "max_ms": 15.719579000000001
+        },
+        "errors": 0
+      },
+      "target_writes_per_s": 2000,
+      "achieved_writes_per_s": 134.75631591031504,
+      "write_latency": {
+        "count": 674,
+        "mean_ms": 7.420034934718101,
+        "p50_ms": 6.991736,
+        "p95_ms": 9.747489,
+        "p99_ms": 13.123012,
+        "p999_ms": 16.739787,
+        "max_ms": 16.739787
+      },
+      "write_errors": 0
+    },
+    "ingest": {
+      "threads": 8,
+      "records_per_s": 885.5266517285971,
+      "commit_latency": {
+        "count": 4433,
+        "mean_ms": 9.028695224452978,
+        "p50_ms": 9.420138,
+        "p95_ms": 9.937826000000001,
+        "p99_ms": 10.984393,
+        "p999_ms": 13.283593,
+        "max_ms": 13.615604
+      },
+      "errors": 0
+    },
+    "reads_own_writes": null,
+    "reopen_s": null
+  }
+}
