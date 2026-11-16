@@ -34,6 +34,7 @@ pub struct EngineConfig {
 | `vector.dimensions` | `128` | Default `dimension` of a vector index |
 | `vector.distance_metric` | `Cosine` | Default `metric` of a vector index |
 | `vector.hnsw` | see [HnswParams](#hnswparams) | Default HNSW parameters of a vector index |
+| `vector.build_threads` | `0` | Threads that build a vector index from its records; `0` uses one per available CPU |
 | `checkpoint_interval_secs` | `300` | Period of automatic checkpoints; `0` disables them |
 
 Every field is used at runtime. The settings `memory_budget_bytes`, `eviction_policy`
@@ -65,6 +66,7 @@ let config = EngineConfig::builder()
 | `vector_dimensions(dims)` | `usize` | `vector.dimensions` |
 | `distance_metric(metric)` | `DistanceMetricKind` | `vector.distance_metric` |
 | `hnsw_params(params)` | `HnswParams` | `vector.hnsw` |
+| `vector_build_threads(n)` | `usize` | `vector.build_threads` |
 | `checkpoint_interval(secs)` | `u64` | `checkpoint_interval_secs` |
 | `build()` | — | Validates, then returns the config |
 

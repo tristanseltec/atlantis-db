@@ -84,6 +84,16 @@ vector. It follows Malkov & Yashunin (2018), Algorithms 1, 2 and 4.
    Links *to* the neighbour are never removed.
 6. If the new level exceeds the current maximum, the node becomes the entry point.
 
+**Batch insertion** — `insert_batch(items, threads)` validates every item first (an
+error inserts nothing), stores all vectors, norms and levels, links the first 1,024
+nodes of an empty graph on one thread, and links the rest on `threads` threads with the
+same steps 5–6. Link lists are arrays of atomics: searches read them without locks, and
+a write to a node's list happens under that node's lock stripe (1,024 stripes; a thread
+never holds two). A node that raises the top level holds a separate lock for its whole
+insert. A reader racing a writer may see a list mixing old and new ids; every id is a
+valid node, so it only follows a slightly different path. The engine builds indexes this
+way; recall matches inserting one by one (`tests/recall.rs`, `parallel_*`).
+
 **Search** — `search(query, k, ef_search: Option<usize>)` returns `(NodeId, distance)`
 pairs sorted ascending. It descends greedily to layer 1, searches layer 0 best-first with
 `ef = ef_search.unwrap_or(params.ef_search).max(k)` (a min-heap of candidates and a
@@ -213,7 +223,9 @@ Only the definition is stored; the HNSW graph is **derived data** held in memory
 - **Restart.** Nothing but the definition survives a restart; the first search rebuilds
   the graph from records.
 
-Builds and updates run synchronously on the calling task. Each built index has its own
+Builds and updates run synchronously on the calling task; a build links nodes on
+`vector.build_threads` threads (default: one per CPU) and returns when they finish.
+Each built index has its own
 read-write lock: searches of an index run in parallel, a build holds its index's write
 lock (other indexes stay available), and a commit write-locks only the indexes of its
 database while it applies its changes ([16 — Engine Runtime](16-engine-runtime.md)).

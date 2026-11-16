@@ -149,3 +149,65 @@ fn recall_holds_after_deletes() {
         "recall@10 {r:.3} after deleting 30%, expected ≥ 0.90"
     );
 }
+
+fn build_parallel(data: &[Vec<f32>], threads: usize) -> HnswIndex {
+    let mut index = HnswIndex::new(HnswParams::default(), DIM, DistanceMetricKind::Cosine);
+    let items = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (NodeId(i as u64), v.clone()))
+        .collect();
+    index.insert_batch(items, threads).unwrap();
+    index
+}
+
+#[test]
+fn parallel_build_keeps_recall() {
+    let (data, queries) = clustered(6_000, 100, 17);
+    let index = build_parallel(&data, 8);
+    assert_eq!(index.len(), data.len());
+    let r = recall(&index, &data, &queries, &HashSet::new());
+    assert!(
+        r >= 0.95,
+        "recall@10 {r:.3} after a parallel build, expected ≥ 0.95"
+    );
+}
+
+#[test]
+fn parallel_build_reaches_every_node() {
+    let (data, _) = clustered(6_000, 0, 19);
+    let index = build_parallel(&data, 8);
+    let found = data
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| {
+            index
+                .search(v, 1, Some(64))
+                .unwrap()
+                .first()
+                .is_some_and(|(id, d)| id.0 == *i as u64 || *d <= 1e-6)
+        })
+        .count();
+    let share = found as f64 / data.len() as f64;
+    assert!(share >= 0.995, "only {share:.3} of nodes find themselves");
+}
+
+#[test]
+fn parallel_batch_onto_existing_graph() {
+    // A second batch links into a graph that already exists, then
+    // sequential inserts keep working on top of it.
+    let (data, queries) = clustered(5_000, 100, 23);
+    let mut index = build_parallel(&data[..2_000], 8);
+    let items = data[2_000..4_500]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (NodeId((2_000 + i) as u64), v.clone()))
+        .collect();
+    index.insert_batch(items, 8).unwrap();
+    for (i, v) in data.iter().enumerate().skip(4_500) {
+        index.insert(NodeId(i as u64), v.clone()).unwrap();
+    }
+    assert_eq!(index.len(), data.len());
+    let r = recall(&index, &data, &queries, &HashSet::new());
+    assert!(r >= 0.95, "recall@10 {r:.3}, expected ≥ 0.95");
+}

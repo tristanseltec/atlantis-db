@@ -16,12 +16,23 @@
 //! - visited sets are epoch-stamped arrays reused per thread instead of a
 //!   hash set per search.
 //!
+//! Concurrency: link lists are arrays of atomics. Searches read them without
+//! locks; a writer changes a node's list under that node's lock stripe and
+//! never holds two stripes at once. [`HnswIndex::insert_batch`] uses this to
+//! link many nodes on several threads (as hnswlib does): all vectors, norms
+//! and levels are written first, then threads link nodes concurrently. A
+//! reader racing a writer can see a list that mixes old and new ids; every
+//! id in it is a valid node, so the search stays correct and only follows a
+//! slightly different path.
+//!
 //! Ids are dense slot numbers (`NodeId` below `u32::MAX`); the engine
 //! assigns them sequentially.
 
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Mutex, MutexGuard};
 
 use rand::Rng;
 
@@ -33,6 +44,25 @@ use crate::vector_store::VectorStore;
 
 /// `levels[i]` of a slot that holds no node.
 const NO_LEVEL: u8 = u8::MAX;
+
+/// `entry` of an empty index.
+const NO_ENTRY: u64 = u64::MAX;
+
+/// Number of lock stripes guarding link-list writes.
+const LOCK_STRIPES: usize = 1024;
+
+/// Nodes a batch links on one thread before going parallel: threads that
+/// all insert into a tiny graph contend on the same lists and pick poorer
+/// neighbours.
+const SEQUENTIAL_PREFIX: usize = 1024;
+
+fn pack_entry(node: u32, level: usize) -> u64 {
+    ((level as u64) << 32) | node as u64
+}
+
+fn lock(m: &Mutex<()>) -> MutexGuard<'_, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A node and its distance to the current query, ordered by distance
 /// (then id, so equal distances order deterministically).
@@ -114,14 +144,20 @@ pub struct HnswIndex {
     /// Layer-0 links, stride `m0 + 1`: `[count, id_0, .., id_{m0-1}]`.
     /// Links are **directed**: pruning a node's list never removes the links
     /// other nodes hold to it (undirected pruning disconnected nodes).
-    layer0: Vec<u32>,
-    /// Per slot: links at layers `1..=level` (`upper[i][l - 1]`).
-    upper: Vec<Vec<Vec<u32>>>,
+    layer0: Vec<AtomicU32>,
+    /// Per slot: links at layers `1..=level`, stride `m + 1` per layer,
+    /// layer `l` at `(l - 1) * (m + 1)`.
+    upper: Vec<Box<[AtomicU32]>>,
     /// Per slot: tombstoned. Deleted nodes stay in the graph as waypoints.
     deleted: Vec<bool>,
     deleted_count: usize,
-    entry_point: Option<u32>,
-    max_level: usize,
+    /// Entry point (low 32 bits) and top level (high 32 bits), or
+    /// [`NO_ENTRY`].
+    entry: AtomicU64,
+    /// Held for the whole insert of a node that raises the top level.
+    top: Mutex<()>,
+    /// Link-list write locks; node `i` uses stripe `i % LOCK_STRIPES`.
+    stripes: Box<[Mutex<()>]>,
 }
 
 impl HnswIndex {
@@ -144,8 +180,9 @@ impl HnswIndex {
             upper: Vec::new(),
             deleted: Vec::new(),
             deleted_count: 0,
-            entry_point: None,
-            max_level: 0,
+            entry: AtomicU64::new(NO_ENTRY),
+            top: Mutex::new(()),
+            stripes: (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
         }
     }
 
@@ -176,12 +213,12 @@ impl HnswIndex {
 
     /// Returns the entry point node ID, if the index is non-empty.
     pub fn entry_point(&self) -> Option<NodeId> {
-        self.entry_point.map(|e| NodeId(e as u64))
+        self.entry_state().map(|(e, _)| NodeId(e as u64))
     }
 
     /// Returns the current max level of the index.
     pub fn max_level(&self) -> usize {
-        self.max_level
+        self.entry_state().map_or(0, |(_, l)| l)
     }
 
     /// Returns the number of layers the index can have.
@@ -221,81 +258,67 @@ impl HnswIndex {
     /// with the same heuristic when it exceeds its cap (`m0` at layer 0, `m`
     /// above).
     pub fn insert(&mut self, node_id: NodeId, vector: Vec<f32>) -> Result<(), AtlantisError> {
-        if vector.len() != self.vectors.dimensions() {
-            return Err(AtlantisError::DimensionMismatch {
-                expected: self.vectors.dimensions(),
-                actual: vector.len(),
-            });
-        }
-        if node_id.0 >= u32::MAX as u64 {
-            return Err(AtlantisError::InvalidValue(format!(
-                "HNSW node id {} is too large (ids are dense slots below {})",
-                node_id.0,
-                u32::MAX
-            )));
-        }
-        if self.vectors.contains(node_id) {
-            // Links were chosen for the old vector, and other nodes link to
-            // this id; replacing it in place would leave a wrong graph.
-            return Err(AtlantisError::InvalidValue(format!(
-                "HNSW node {} already exists; insert the new vector under a new id",
-                node_id.0
-            )));
-        }
-        let idx = node_id.0 as u32;
-        self.ensure_slot(idx as usize);
-        let inv_norm = inverse_norm(&vector);
-        self.vectors.write(idx as usize, &vector);
-        self.inv_norms[idx as usize] = inv_norm;
-        let level = self.random_level();
-        self.levels[idx as usize] = level as u8;
-        self.upper[idx as usize] = vec![Vec::new(); level];
+        self.check_new(node_id, &vector)?;
+        let idx = self.prepare(node_id, &vector);
+        self.link(idx);
+        Ok(())
+    }
 
-        let Some(entry) = self.entry_point else {
-            self.entry_point = Some(idx);
-            self.max_level = level;
+    /// Inserts many vectors, linking them on up to `threads` threads.
+    ///
+    /// Every item is validated first (dimensions, id range, ids new and
+    /// distinct); on error nothing is inserted. The result is a graph of the
+    /// same quality as inserting the items one by one, in a different order.
+    pub fn insert_batch(
+        &mut self,
+        items: Vec<(NodeId, Vec<f32>)>,
+        threads: usize,
+    ) -> Result<(), AtlantisError> {
+        let mut seen = HashSet::with_capacity(items.len());
+        for (id, v) in &items {
+            self.check_new(*id, v)?;
+            if !seen.insert(id.0) {
+                return Err(AtlantisError::InvalidValue(format!(
+                    "HNSW node {} appears twice in one batch",
+                    id.0
+                )));
+            }
+        }
+        drop(seen);
+        if let Some(max) = items.iter().map(|(id, _)| id.0 as usize).max() {
+            self.reserve((max + 1).saturating_sub(self.levels.len()));
+            self.ensure_slot(max);
+        }
+        let ids: Vec<u32> = items
+            .into_iter()
+            .map(|(id, v)| self.prepare(id, &v))
+            .collect();
+
+        let warmup = if threads <= 1 {
+            ids.len()
+        } else {
+            SEQUENTIAL_PREFIX
+                .saturating_sub(self.len() - ids.len())
+                .min(ids.len())
+        };
+        for &idx in &ids[..warmup] {
+            self.link(idx);
+        }
+        let rest = &ids[warmup..];
+        if rest.is_empty() {
             return Ok(());
-        };
-
-        let query = Query {
-            v: &vector,
-            inv_norm,
-        };
-        let mut entry_points = vec![Scored {
-            dist: self.dist_to(&query, entry),
-            id: entry,
-        }];
-        for l in (level + 1..=self.max_level).rev() {
-            entry_points = self.search_layer(&query, &entry_points, 1, l, true);
         }
-
-        for l in (0..=level.min(self.max_level)).rev() {
-            let found =
-                self.search_layer(&query, &entry_points, self.params.ef_construction, l, true);
-            let candidates: Vec<Scored> = found
-                .iter()
-                .copied()
-                .filter(|c| c.id != idx && !self.deleted[c.id as usize])
-                .collect();
-            let neighbors = self.select_neighbors(&candidates, self.params.m);
-            self.set_links(idx, l, &neighbors);
-
-            let cap = if l == 0 {
-                self.params.m0
-            } else {
-                self.params.m
-            };
-            for &neighbor in &neighbors {
-                self.add_link(neighbor, idx, l, cap);
+        let next = AtomicUsize::new(0);
+        let this = &*self;
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(rest.len()) {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    let Some(&idx) = rest.get(i) else { break };
+                    this.link(idx);
+                });
             }
-            if !found.is_empty() {
-                entry_points = found;
-            }
-        }
-        if level > self.max_level {
-            self.max_level = level;
-            self.entry_point = Some(idx);
-        }
+        });
         Ok(())
     }
 
@@ -315,7 +338,7 @@ impl HnswIndex {
                 actual: query.len(),
             });
         }
-        let Some(entry) = self.entry_point else {
+        let Some((entry, max_level)) = self.entry_state() else {
             return Ok(Vec::new());
         };
         let ef = ef_search.unwrap_or(self.params.ef_search).max(k);
@@ -328,7 +351,7 @@ impl HnswIndex {
             dist: self.dist_to(&query, entry),
             id: entry,
         }];
-        for l in (1..=self.max_level).rev() {
+        for l in (1..=max_level).rev() {
             entry_points = self.search_layer(&query, &entry_points, 1, l, true);
         }
         let mut results: Vec<(NodeId, f32)> = self
@@ -381,12 +404,60 @@ impl HnswIndex {
 
     // ---- Internal methods ----
 
+    fn entry_state(&self) -> Option<(u32, usize)> {
+        match self.entry.load(Relaxed) {
+            NO_ENTRY => None,
+            e => Some((e as u32, (e >> 32) as usize)),
+        }
+    }
+
     fn is_deleted(&self, id: u64) -> bool {
         usize::try_from(id)
             .ok()
             .and_then(|i| self.deleted.get(i))
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Rejects a vector that cannot be inserted under `node_id`.
+    fn check_new(&self, node_id: NodeId, vector: &[f32]) -> Result<(), AtlantisError> {
+        if vector.len() != self.vectors.dimensions() {
+            return Err(AtlantisError::DimensionMismatch {
+                expected: self.vectors.dimensions(),
+                actual: vector.len(),
+            });
+        }
+        if node_id.0 >= u32::MAX as u64 {
+            return Err(AtlantisError::InvalidValue(format!(
+                "HNSW node id {} is too large (ids are dense slots below {})",
+                node_id.0,
+                u32::MAX
+            )));
+        }
+        if self.vectors.contains(node_id) {
+            // Links were chosen for the old vector, and other nodes link to
+            // this id; replacing it in place would leave a wrong graph.
+            return Err(AtlantisError::InvalidValue(format!(
+                "HNSW node {} already exists; insert the new vector under a new id",
+                node_id.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stores a checked vector with its norm, level and empty link lists.
+    /// The node is not reachable until [`link`](Self::link) runs.
+    fn prepare(&mut self, node_id: NodeId, vector: &[f32]) -> u32 {
+        let idx = node_id.0 as usize;
+        self.ensure_slot(idx);
+        self.vectors.write(idx, vector);
+        self.inv_norms[idx] = inverse_norm(vector);
+        let level = self.random_level();
+        self.levels[idx] = level as u8;
+        self.upper[idx] = (0..level * (self.params.m + 1))
+            .map(|_| AtomicU32::new(0))
+            .collect();
+        idx as u32
     }
 
     fn ensure_slot(&mut self, idx: usize) {
@@ -396,8 +467,9 @@ impl HnswIndex {
         let n = idx + 1;
         self.inv_norms.resize(n, 0.0);
         self.levels.resize(n, NO_LEVEL);
-        self.layer0.resize(n * (self.params.m0 + 1), 0);
-        self.upper.resize_with(n, Vec::new);
+        self.layer0
+            .resize_with(n * (self.params.m0 + 1), || AtomicU32::new(0));
+        self.upper.resize_with(n, || Vec::new().into_boxed_slice());
         self.deleted.resize(n, false);
     }
 
@@ -410,53 +482,137 @@ impl HnswIndex {
         level.min(self.params.max_level).min(NO_LEVEL as usize - 1)
     }
 
-    /// The links of `node` at `layer`.
-    #[inline]
-    fn links(&self, node: u32, layer: usize) -> &[u32] {
-        let i = node as usize;
+    /// Links a prepared node into the graph. Takes `&self`: several threads
+    /// may link different nodes at once.
+    fn link(&self, idx: u32) {
+        let level = self.levels[idx as usize] as usize;
+        let mut state = self.entry_state();
+        // A node that becomes the new top holds `top` for its whole insert,
+        // so two such nodes do not race to replace the entry point.
+        let mut top_guard = None;
+        if state.is_none_or(|(_, max)| level > max) {
+            top_guard = Some(lock(&self.top));
+            state = self.entry_state();
+            if state.is_some_and(|(_, max)| level <= max) {
+                top_guard = None;
+            }
+        }
+        let Some((entry, max_level)) = state else {
+            self.entry.store(pack_entry(idx, level), Relaxed);
+            return;
+        };
+
+        let query = Query {
+            v: self.vectors.slot(idx as usize),
+            inv_norm: self.inv_norms[idx as usize],
+        };
+        let mut entry_points = vec![Scored {
+            dist: self.dist_to(&query, entry),
+            id: entry,
+        }];
+        for l in (level + 1..=max_level).rev() {
+            entry_points = self.search_layer(&query, &entry_points, 1, l, true);
+        }
+        for l in (0..=level.min(max_level)).rev() {
+            let found =
+                self.search_layer(&query, &entry_points, self.params.ef_construction, l, true);
+            let candidates: Vec<Scored> = found
+                .iter()
+                .copied()
+                .filter(|c| c.id != idx && !self.deleted[c.id as usize])
+                .collect();
+            let neighbors = self.select_neighbors(&candidates, self.params.m);
+            let cap = self.cap(l);
+            self.merge_links(idx, l, &neighbors, cap);
+            for &neighbor in &neighbors {
+                self.merge_links(neighbor, l, &[idx], cap);
+            }
+            if !found.is_empty() {
+                entry_points = found;
+            }
+        }
+        if level > max_level {
+            self.entry.store(pack_entry(idx, level), Relaxed);
+        }
+        drop(top_guard);
+    }
+
+    fn cap(&self, layer: usize) -> usize {
         if layer == 0 {
-            let base = i * (self.params.m0 + 1);
-            let count = self.layer0[base] as usize;
-            &self.layer0[base + 1..base + 1 + count]
+            self.params.m0
         } else {
-            self.upper[i]
-                .get(layer - 1)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[])
+            self.params.m
         }
     }
 
-    fn set_links(&mut self, node: u32, layer: usize, links: &[u32]) {
+    /// The link slots of `node` at `layer`: the count, then `cap` ids.
+    fn link_slots(&self, node: u32, layer: usize) -> &[AtomicU32] {
         let i = node as usize;
+        match self.levels.get(i) {
+            Some(&lvl) if lvl != NO_LEVEL && layer <= lvl as usize => {}
+            _ => return &[],
+        }
         if layer == 0 {
             let stride = self.params.m0 + 1;
-            debug_assert!(links.len() <= self.params.m0);
-            let base = i * stride;
-            self.layer0[base] = links.len() as u32;
-            self.layer0[base + 1..base + 1 + links.len()].copy_from_slice(links);
-        } else if let Some(list) = self.upper[i].get_mut(layer - 1) {
-            list.clear();
-            list.extend_from_slice(links);
+            &self.layer0[i * stride..(i + 1) * stride]
+        } else {
+            let stride = self.params.m + 1;
+            &self.upper[i][(layer - 1) * stride..layer * stride]
         }
     }
 
-    /// Adds the link `node -> new` at `layer`, shrinking `node`'s list to
-    /// `cap` with the heuristic when it is full. Only `node`'s list changes.
-    fn add_link(&mut self, node: u32, new: u32, layer: usize, cap: usize) {
-        let current = self.links(node, layer);
-        if current.contains(&new) {
-            return;
-        }
-        if current.len() < cap {
-            let mut list = current.to_vec();
-            list.push(new);
-            self.set_links(node, layer, &list);
-            return;
-        }
-        let mut scored: Vec<Scored> = current
+    /// The links of `node` at `layer`, as atomics to load.
+    #[inline]
+    fn links(&self, node: u32, layer: usize) -> &[AtomicU32] {
+        let slots = self.link_slots(node, layer);
+        let Some((count, ids)) = slots.split_first() else {
+            return &[];
+        };
+        let n = (count.load(Relaxed) as usize).min(ids.len());
+        &ids[..n]
+    }
+
+    fn link_ids(&self, node: u32, layer: usize) -> Vec<u32> {
+        self.links(node, layer)
             .iter()
-            .copied()
-            .chain(std::iter::once(new))
+            .map(|a| a.load(Relaxed))
+            .collect()
+    }
+
+    /// Writes `node`'s list at `layer`. The caller holds `node`'s stripe.
+    fn store_links(&self, node: u32, layer: usize, links: &[u32]) {
+        let slots = self.link_slots(node, layer);
+        let Some((count, ids)) = slots.split_first() else {
+            return;
+        };
+        let n = links.len().min(ids.len());
+        for (slot, &id) in ids.iter().zip(&links[..n]) {
+            slot.store(id, Relaxed);
+        }
+        count.store(n as u32, Relaxed);
+    }
+
+    /// Adds `new` links to `node`'s list at `layer`, shrinking it to `cap`
+    /// with the heuristic when it overflows. Only `node`'s list changes, and
+    /// links that other threads added meanwhile are kept as candidates.
+    fn merge_links(&self, node: u32, layer: usize, new: &[u32], cap: usize) {
+        let _guard = lock(&self.stripes[node as usize % LOCK_STRIPES]);
+        let mut list = self.link_ids(node, layer);
+        let before = list.len();
+        for &n in new {
+            if n != node && !list.contains(&n) {
+                list.push(n);
+            }
+        }
+        if list.len() == before {
+            return;
+        }
+        if list.len() <= cap {
+            self.store_links(node, layer, &list);
+            return;
+        }
+        let mut scored: Vec<Scored> = list
+            .into_iter()
             .filter(|&n| !self.deleted[n as usize])
             .map(|n| Scored {
                 dist: self.dist_between(node, n),
@@ -465,7 +621,7 @@ impl HnswIndex {
             .collect();
         scored.sort_unstable();
         let kept = self.select_neighbors(&scored, cap);
-        self.set_links(node, layer, &kept);
+        self.store_links(node, layer, &kept);
     }
 
     /// Best-first search of one layer from `entry_points`, keeping the `ef`
@@ -529,11 +685,12 @@ impl HnswIndex {
                 break;
             }
             let links = self.links(current.id, layer);
-            for (j, &neighbor) in links.iter().enumerate() {
-                if let Some(&next) = links.get(j + 1) {
-                    self.prefetch(next);
+            for (j, slot) in links.iter().enumerate() {
+                let neighbor = slot.load(Relaxed);
+                if let Some(next) = links.get(j + 1) {
+                    self.prefetch(next.load(Relaxed));
                 }
-                if !visited.insert(neighbor) || self.levels[neighbor as usize] == NO_LEVEL {
+                if self.levels[neighbor as usize] == NO_LEVEL || !visited.insert(neighbor) {
                     continue;
                 }
                 let dist = self.dist_to(query, neighbor);
@@ -839,7 +996,7 @@ mod tests {
                 } else {
                     index.params.m
                 };
-                let links = index.links(node, l);
+                let links = index.link_ids(node, l);
                 assert!(
                     links.len() <= cap,
                     "node {node} has {} links at layer {l}",
@@ -916,6 +1073,37 @@ mod metric_tests {
         let hits = index.search(&[1.0, 0.0], 1, Some(64)).unwrap();
         assert_eq!(hits[0].0, NodeId(19));
         assert!((hits[0].1 + 19.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rejected_batch_inserts_nothing() {
+        let mut index = HnswIndex::new(params(), 2, DistanceMetricKind::Cosine);
+        index.insert(NodeId(0), vec![1.0, 0.0]).unwrap();
+        // Duplicate inside the batch.
+        let dup = vec![(NodeId(1), vec![0.0, 1.0]), (NodeId(1), vec![1.0, 1.0])];
+        index.insert_batch(dup, 4).unwrap_err();
+        // Id already present.
+        let present = vec![(NodeId(2), vec![0.0, 1.0]), (NodeId(0), vec![1.0, 1.0])];
+        index.insert_batch(present, 4).unwrap_err();
+        // Wrong dimension in the last item.
+        let short = vec![(NodeId(3), vec![0.0, 1.0]), (NodeId(4), vec![1.0])];
+        index.insert_batch(short, 4).unwrap_err();
+        assert_eq!(index.len(), 1);
+        assert!(index.get_vector(NodeId(1)).is_none());
+        assert!(index.get_vector(NodeId(3)).is_none());
+    }
+
+    #[test]
+    fn small_batch_into_empty_index() {
+        let mut index = HnswIndex::new(params(), 2, DistanceMetricKind::Euclidean);
+        index.insert_batch(Vec::new(), 4).unwrap();
+        assert!(index.entry_point().is_none());
+        let items = (0..10u64)
+            .map(|i| (NodeId(i), vec![i as f32, 0.0]))
+            .collect();
+        index.insert_batch(items, 4).unwrap();
+        assert_eq!(index.len(), 10);
+        assert_eq!(index.search(&[7.2, 0.0], 1, None).unwrap()[0].0, NodeId(7));
     }
 
     #[test]

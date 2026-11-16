@@ -162,12 +162,18 @@ Findings:
    flat layer-0 links, epoch-stamped visited arrays and AVX2/FMA kernels bring the build
    to 21 s (about 1 ms per vector) and top-10 search to p50 0.27 ms / p99 0.63 ms at
    recall@10 1.000 (`benches/results/2026-11-16-small-mem-f2-core.*`; measured on the
-   working tree on top of `ff0273a`, which the report names). Parallel build is next.
+   working tree on top of `ff0273a`, which the report names). A parallel build on 12
+   CPUs (`insert_batch`) then takes it to **5.0 s**, with recall@10 still 1.000
+   (`benches/results/2026-11-16-small-mem-parallel-build.*`). At 100,000 × 768 the
+   build takes 27 s, top-10 p50 is 0.24 ms at recall 1.000, and the 8-thread graph-RAG
+   query runs at 5,017 QPS (`2026-11-16-medium-mem-parallel-build.*`). Rebuilding 1M
+   vectors on open will still take minutes; the < 1 s open target needs the index
+   image (F4), not a faster build.
 3. **No concurrency.** Eight threads gave 2–3x one thread, and a writer at 2,000/s
    achieved 97/s, consistent with the single mutex shared by vector search and index
    updates. **Improved:** with one read-write lock per index, the 8-thread graph-RAG
-   query goes from 225 to 3,041 QPS on the same machine. The writer still reaches only
-   162/s of 2,000 under mixed load: each commit inserts into the graph under the
+   query goes from 225 to 3,041 QPS on the same machine, and to 4,168 QPS with lock-free
+   link reads. The writer still reaches only 341/s of 2,000 under mixed load: each commit inserts into the graph under the
    index's write lock (an `ef_construction` search per vector) after its own WAL fsync,
    so write throughput waits for group commit (F6) and versioned entries applied off the
    commit path (F4).
