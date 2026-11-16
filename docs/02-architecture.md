@@ -425,7 +425,7 @@ See [Engine Runtime](16-engine-runtime.md) for the details.
 | Traversal by prefix scans of adjacency keys | Plus an in-memory adjacency cache rebuilt from `g/` keys | 1 (open) |
 | HNSW rebuilt in memory from records on first search | Checkpointed index image plus replay of later commits; `vx/` keys for the distributed backend | Focus track |
 | Per-index read-write locks; search sees the latest commit | Versioned entries and a transaction overlay for snapshot-consistent, read-your-writes search | Focus track |
-| `WHERE` after `YIELD` filters the `k` hits | Predicate pushed into a filtered HNSW and BM25 search | Focus track |
+| Field comparisons after `YIELD` pushed into a filtered HNSW search | Also labels, nested fields and `OR`; pushed into BM25 search too | Focus track |
 | Clause-by-clause interpreter | Planner and cost-based optimizer with index selection and join ordering | 2 |
 | Embedded `Engine` only | Same `Engine` API over `mem://`, `rocksdb://`, `ws://`, `http://`, `tikv://` | 1, 5–7 |
 

@@ -73,11 +73,12 @@ built in the open, and this is the best time to shape them.
 
 | Works today | In progress (focus track) |
 |---|---|
-| Embedded engine, in memory or on disk with a write-ahead log and crash recovery | Filtered HNSW (filter inside the search) |
-| MVCC transactions: snapshot and serializable isolation, retry on conflict | BM25 full-text and `db.search.hybrid` with rank fusion |
-| Cypher: `MATCH` (multi-hop, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation, `BEGIN`/`COMMIT` | Snapshot-consistent, read-your-writes search |
-| Record model: namespaces, tables, documents, record links, edge tables | Faster vector core: quantization, persisted indexes |
-| HNSW vector index (SIMD kernels, parallel build, per-index locks) with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package |
+| Embedded engine, in memory or on disk with a write-ahead log and crash recovery | Snapshot-consistent, read-your-writes search (F4) |
+| MVCC transactions: snapshot and serializable isolation, retry on conflict | Persisted index images: open 1M vectors in under a second (F4) |
+| Cypher: `MATCH` (multi-hop, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation, `BEGIN`/`COMMIT` | BM25 full-text and `db.search.hybrid` with rank fusion (F5) |
+| Record model: namespaces, tables, documents, record links, edge tables | Group commit (F6) |
+| HNSW vector index (SIMD kernels, parallel build, per-index locks) with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package (F7) |
+| Filtered vector search: `YIELD ... WHERE node.field = $x` runs inside the index, recall@10 1.00 at 1% selectivity | Faster vector core: SQ8 quantization, AVX-512 and NEON |
 | Retrieval Bench harness with exact ground truth | Competitor adapters for the benchmark |
 
 The full plan is in the [Implementation Roadmap](docs/25-implementation-roadmap.md).
@@ -183,7 +184,12 @@ Reports: [`f2-core`](benches/results/2026-11-16-small-mem-f2-core.md),
 
 </details>
 
-What's left before the targets below: filtered search (F3), persisted index images,
+Filtered search (F3) then moved the filter into the index. When 1% of the records match
+(one user out of 100), filtering an over-fetched result reached recall@10 **0.09**, with
+every query short of 10 rows. With the `WHERE` pushed into the search it is **1.00**, at
+p50 0.15 ms ([report](benches/results/2026-11-16-small-mem-f3-filtered.md)).
+
+What's left before the targets below: persisted index images,
 and getting writes off the search path (F4, F6).
 
 | Target (1M chunks × 768, 1% filter, 8 threads under write load) | Goal |
@@ -202,15 +208,15 @@ Current numbers and the gaps between them and the targets are tracked in
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/roadmap.dark.svg">
-  <img alt="Focus track: F1 Retrieval Bench and F2 vector core partly done; F3 filtered search next; F4 consistent search, F5 BM25 and fusion, F6 group commit, F7 Python package and F8 publish results designed." src="docs/assets/roadmap.light.svg" width="100%">
+  <img alt="Focus track: F1 Retrieval Bench and F2 vector core partly done; F3 filtered search done; F4 consistent search next; F5 BM25 and fusion, F6 group commit, F7 Python package and F8 publish results designed." src="docs/assets/roadmap.light.svg" width="100%">
 </picture>
 
 | Step | What | Status |
 |---|---|---|
 | **F1** | Retrieval Bench: corpus, ground truth, workloads, report | Done for Atlantis; competitor adapters open |
 | **F2** | Vector core: HNSW correctness, SIMD, contiguous storage, per-index locks, SQ8 | Correctness, SIMD, arena, locks and parallel build done (7× faster search, 37× faster build); SQ8 open |
-| **F3** | Filtered search inside HNSW, with predicate pushdown from Cypher | Next |
-| **F4** | Versioned index entries, transaction overlay, persisted index images | Designed |
+| **F3** | Filtered search inside HNSW, with predicate pushdown from Cypher | Done: filtered recall@10 0.09 → 1.00 at 1% selectivity |
+| **F4** | Versioned index entries, transaction overlay, persisted index images | Next |
 | **F5** | BM25 (`atlantis-text`) and `db.search.hybrid` | Designed |
 | **F6** | Group commit | Designed |
 | **F7** | Embedded Python package (PyO3) | Designed |
@@ -232,7 +238,7 @@ contributions shape the core.
 | Area | Good first steps | You'll enjoy this if you like |
 |---|---|---|
 | **Vector search** (`atlantis-vector`) | AVX-512 and NEON kernels, SQ8 quantization with re-ranking, a query worker pool | Performance engineering, ANN algorithms |
-| **Filtered search** (F3) | Allow-set bitmaps; exact, filtered-traversal and post-filter strategies chosen per query | Algorithms, research papers made real |
+| **Filtered search** | Push down labels, nested fields and `OR`; property indexes behind allow sets | Algorithms, research papers made real |
 | **Full-text** (`atlantis-text`, new crate) | Analyzers, inverted index, BM25, rank fusion | Information retrieval |
 | **Query engine** (`atlantis-cypher`, `atlantis-engine`) | Predicate pushdown, a first planner, batched execution, `EXPLAIN` | Compilers, query optimization |
 | **Storage** (`atlantis-kv`) | RocksDB backend, group commit, versioned index entries | Transactions, durability, MVCC |

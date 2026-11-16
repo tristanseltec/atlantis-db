@@ -196,7 +196,7 @@ The owning chapter holds the full grammar and semantics. The phase refers to
 | `CREATE INDEX`, `CREATE CONSTRAINT` (Neo4j 5 forms) | `CREATE INDEX person_email FOR (p:Person) ON (p.email);` | [07](07-schema-ddl.md), [08](08-document-relational.md) | Phase 2 |
 | Nested document paths in `SET` and `REMOVE` | `SET p.address.city = 'Hue'` | [08](08-document-relational.md) | Implemented |
 | `CREATE TABLE ... TYPE TIMESERIES` | `CREATE TABLE Reading TYPE TIMESERIES KEY (sensor, ts) RETENTION 30d;` | [13](13-key-value-time-series.md) | Phase 3 |
-| `CREATE VECTOR INDEX`, `DROP INDEX` | `... OPTIONS {dimension: 1536, metric: 'cosine'}` | [10](10-vector-index.md) | Implemented (pre- and post-filtering, quantization Phase 3) |
+| `CREATE VECTOR INDEX`, `DROP INDEX` | `... OPTIONS {dimension: 1536, metric: 'cosine'}` | [10](10-vector-index.md) | Implemented (filtered search via `YIELD ... WHERE`; quantization Phase 3) |
 | `CREATE FULLTEXT INDEX`, `CREATE ANALYZER` | `CREATE ANALYZER english TOKENIZER unicode FILTERS [lowercase, ascii, snowball('english')];` | [11](11-full-text-search.md) | Phase 3 |
 | `CREATE POINT INDEX` | `CREATE POINT INDEX place_location FOR (p:Place) ON (p.location);` | [12](12-geospatial.md) | Phase 3 |
 | `ALTER TABLE ... CHANGEFEED` | `ALTER TABLE Person CHANGEFEED 7d;` | [14](14-live-queries-events.md) | Phase 4 |

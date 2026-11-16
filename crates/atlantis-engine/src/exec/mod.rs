@@ -6,20 +6,20 @@
 //! one loads the record inside the same transaction, so a query sees its own
 //! writes. `RETURN` turns variables bound to records into documents.
 
-mod eval;
+pub(crate) mod eval;
 mod pattern;
 
 use std::collections::{HashMap, HashSet};
 
 use atlantis_core::{AtlantisError, Object, RecordId, Value};
 use atlantis_cypher::ast::{
-    Clause, CreateVectorIndex, Expression, Projection, Query, QueryUnion, RemoveItem, SetItem,
-    Statement, YieldItem,
+    BinaryOp, Clause, CreateVectorIndex, Expression, Projection, Query, QueryUnion, RemoveItem,
+    SetItem, Statement, YieldItem,
 };
 use atlantis_storage::{RecordStore, RecordTx, VectorIndexDef};
 
-use crate::vector_index::VectorIndexes;
-use eval::{as_vector, group_key, invalid, is_true, order_cmp};
+use crate::vector_index::{FieldFilter, VectorIndexes};
+use eval::{as_vector, group_key, invalid, is_comparison, is_true, order_cmp};
 use pattern::pattern_variables;
 
 /// Variable bindings of one row.
@@ -282,12 +282,34 @@ impl<'a> Exec<'a> {
                 } => {
                     let mut out = Vec::new();
                     let mut columns_seen = None;
+                    // Conditions of the WHERE that the procedure can apply
+                    // itself (vector search filters inside the index). The
+                    // whole WHERE still runs on every row below.
+                    let pushed = match where_clause {
+                        Some(w) if procedure.eq_ignore_ascii_case("db.vector.search") => {
+                            pushable_conditions(w, yields.as_ref())
+                        }
+                        _ => Vec::new(),
+                    };
                     for row in &rows {
                         let arg_values: Vec<Value> = args
                             .iter()
                             .map(|a| self.eval(a, row))
                             .collect::<Result<_, _>>()?;
-                        let (columns, results) = self.call_procedure(procedure, arg_values)?;
+                        let mut filter = Vec::with_capacity(pushed.len());
+                        for cond in &pushed {
+                            // A value that fails to evaluate is left to WHERE.
+                            if let Ok(value) = self.eval(cond.value, row) {
+                                filter.push(FieldFilter {
+                                    field: cond.field.clone(),
+                                    op: cond.op,
+                                    value,
+                                    field_on_left: cond.field_on_left,
+                                });
+                            }
+                        }
+                        let (columns, results) =
+                            self.call_procedure(procedure, arg_values, filter)?;
                         let bindings = yield_bindings(&columns, yields.as_ref())?;
                         columns_seen = Some(
                             bindings
@@ -829,10 +851,13 @@ impl<'a> Exec<'a> {
 
     // ---- procedures --------------------------------------------------------
 
+    /// Runs a procedure. `filter` holds conditions pushed down from the
+    /// `YIELD ... WHERE` (only `db.vector.search` receives any).
     fn call_procedure(
         &mut self,
         name: &str,
         args: Vec<Value>,
+        filter: Vec<FieldFilter>,
     ) -> Result<(Vec<String>, Vec<Vec<Value>>), AtlantisError> {
         let cols = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         match name.to_ascii_lowercase().as_str() {
@@ -897,6 +922,7 @@ impl<'a> Exec<'a> {
                     k,
                     ef_search: ef,
                     threshold,
+                    filter,
                 };
                 let hits = self.vectors.search(self.store, &db, &def, &request)?;
                 Ok((
@@ -972,6 +998,186 @@ fn collect_delete_targets(target: Value, out: &mut Vec<RecordId>) -> Result<(), 
             }
         }
         other => Err(invalid(format!("cannot delete a {}", other.type_name()))),
+    }
+}
+
+/// A `WHERE` condition the vector search can apply inside the index:
+/// `node.field op value`, where `value` does not depend on the yielded row.
+struct PushedCondition<'q> {
+    field: String,
+    op: BinaryOp,
+    value: &'q Expression,
+    field_on_left: bool,
+}
+
+/// The conjuncts of `where_clause` that `db.vector.search` can evaluate
+/// itself: comparisons between a top-level field of the yielded `node` and
+/// an expression that mentions no yielded column and is deterministic.
+fn pushable_conditions<'q>(
+    where_clause: &'q Expression,
+    yields: Option<&Vec<YieldItem>>,
+) -> Vec<PushedCondition<'q>> {
+    let yielded: Vec<String> = match yields {
+        None => vec!["node".into(), "score".into()],
+        Some(items) => items
+            .iter()
+            .map(|y| y.alias.clone().unwrap_or_else(|| y.column.clone()))
+            .collect(),
+    };
+    let node = match yields {
+        None => Some("node".to_string()),
+        Some(items) => items
+            .iter()
+            .find(|y| y.column == "node")
+            .map(|y| y.alias.clone().unwrap_or_else(|| y.column.clone())),
+    };
+    let Some(node) = node else {
+        return Vec::new();
+    };
+    let field_of = |e: &Expression| match e {
+        Expression::Property(base, key) if key != "id" => match base.as_ref() {
+            Expression::Variable(v) if *v == node => Some(key.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let constant = |e: &Expression| !mentions_any(e, &yielded) && deterministic(e);
+    let mut conjuncts = Vec::new();
+    split_and(where_clause, &mut conjuncts);
+    conjuncts
+        .into_iter()
+        .filter_map(|c| match c {
+            Expression::Binary(l, op, r) if is_comparison(*op) => {
+                if let (Some(field), true) = (field_of(l), constant(r)) {
+                    Some(PushedCondition {
+                        field,
+                        op: *op,
+                        value: r,
+                        field_on_left: true,
+                    })
+                } else if let (Some(field), true) = (field_of(r), constant(l)) {
+                    Some(PushedCondition {
+                        field,
+                        op: *op,
+                        value: l,
+                        field_on_left: false,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn split_and<'q>(e: &'q Expression, out: &mut Vec<&'q Expression>) {
+    match e {
+        Expression::Binary(l, BinaryOp::And, r) => {
+            split_and(l, out);
+            split_and(r, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// `true` if `e` refers to any of `names` (conservatively: any variable of
+/// that name, even one a list comprehension rebinds).
+fn mentions_any(e: &Expression, names: &[String]) -> bool {
+    match e {
+        Expression::Variable(v) => names.contains(v),
+        Expression::Literal(_) | Expression::Parameter(_) | Expression::CountStar => false,
+        Expression::Property(b, _) | Expression::HasLabels(b, _) | Expression::Unary(_, b) => {
+            mentions_any(b, names)
+        }
+        Expression::IsNull(b, _) => mentions_any(b, names),
+        Expression::Index(a, b) | Expression::Binary(a, _, b) => {
+            mentions_any(a, names) || mentions_any(b, names)
+        }
+        Expression::Slice(a, b, c) => {
+            mentions_any(a, names)
+                || b.as_deref().is_some_and(|x| mentions_any(x, names))
+                || c.as_deref().is_some_and(|x| mentions_any(x, names))
+        }
+        Expression::List(items) | Expression::Function { args: items, .. } => {
+            items.iter().any(|x| mentions_any(x, names))
+        }
+        Expression::Map(entries) => entries.iter().any(|(_, v)| mentions_any(v, names)),
+        Expression::Case {
+            operand,
+            whens,
+            default,
+        } => {
+            operand.as_deref().is_some_and(|x| mentions_any(x, names))
+                || whens
+                    .iter()
+                    .any(|(a, b)| mentions_any(a, names) || mentions_any(b, names))
+                || default.as_deref().is_some_and(|x| mentions_any(x, names))
+        }
+        Expression::ListComprehension {
+            variable,
+            list,
+            predicate,
+            map,
+        } => {
+            names.contains(variable)
+                || mentions_any(list, names)
+                || predicate.as_deref().is_some_and(|x| mentions_any(x, names))
+                || map.as_deref().is_some_and(|x| mentions_any(x, names))
+        }
+    }
+}
+
+/// `false` if `e` calls a function whose result changes between calls, so
+/// evaluating it once for the push-down could disagree with `WHERE`.
+fn deterministic(e: &Expression) -> bool {
+    match e {
+        Expression::Function { name, args, .. } => {
+            let n = name.to_ascii_lowercase();
+            let volatile = matches!(n.as_str(), "rand" | "randomuuid" | "timestamp")
+                || (args.is_empty()
+                    && matches!(n.as_str(), "datetime" | "date" | "time" | "localdatetime"));
+            !volatile && args.iter().all(deterministic)
+        }
+        Expression::Property(b, _)
+        | Expression::HasLabels(b, _)
+        | Expression::Unary(_, b)
+        | Expression::IsNull(b, _) => deterministic(b),
+        Expression::Index(a, b) | Expression::Binary(a, _, b) => {
+            deterministic(a) && deterministic(b)
+        }
+        Expression::Slice(a, b, c) => {
+            deterministic(a)
+                && b.as_deref().is_none_or(deterministic)
+                && c.as_deref().is_none_or(deterministic)
+        }
+        Expression::List(items) => items.iter().all(deterministic),
+        Expression::Map(entries) => entries.iter().all(|(_, v)| deterministic(v)),
+        Expression::Case {
+            operand,
+            whens,
+            default,
+        } => {
+            operand.as_deref().is_none_or(deterministic)
+                && whens
+                    .iter()
+                    .all(|(a, b)| deterministic(a) && deterministic(b))
+                && default.as_deref().is_none_or(deterministic)
+        }
+        Expression::ListComprehension {
+            list,
+            predicate,
+            map,
+            ..
+        } => {
+            deterministic(list)
+                && predicate.as_deref().is_none_or(deterministic)
+                && map.as_deref().is_none_or(deterministic)
+        }
+        Expression::Literal(_)
+        | Expression::Parameter(_)
+        | Expression::Variable(_)
+        | Expression::CountStar => true,
     }
 }
 
