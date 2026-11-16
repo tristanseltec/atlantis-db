@@ -11,7 +11,7 @@ Cypher and the Rust record API share one store and one transaction mechanism. Th
 
 ## Implemented today
 
-Every Cypher statement and every Rust record transaction runs as a transaction on `atlantis-kv` with the `mem` backend ([`crates/atlantis-kv/src/mem.rs`](../crates/atlantis-kv/src/mem.rs)), on the calling task.
+Every Cypher statement and every Rust record transaction runs as a transaction on `atlantis-kv` with the `mem` backend ([`crates/atlantis-kv/src/mem/`](../crates/atlantis-kv/src/mem/)), on the calling task.
 
 | Property | Today |
 |---|---|

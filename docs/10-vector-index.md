@@ -54,7 +54,7 @@ distances squared internally (the square root is taken only on results).
 
 ### HNSW Index
 
-**File:** [`crates/atlantis-vector/src/hnsw.rs`](../crates/atlantis-vector/src/hnsw.rs)
+**File:** [`crates/atlantis-vector/src/hnsw/`](../crates/atlantis-vector/src/hnsw/)
 
 `HnswIndex` is laid out for the search loop. Node ids are dense slots (below
 `u32::MAX`; the engine assigns them sequentially). Vectors live in one contiguous `f32`
@@ -142,7 +142,7 @@ options override `m` (with `m0 = 2 * m`) and `efConstruction` per index.
 Tuning: raise `ef_search` (100–200) and `m` (24–48) for recall; lower `ef_search` for
 latency; lower `ef_construction` for faster ingest; lower `m` (8–12) to save memory.
 
-The crate's recall tests compare HNSW against brute force. `test_recall` in `hnsw.rs`
+The crate's recall tests compare HNSW against brute force. `test_recall` in `hnsw/tests.rs`
 uses 500 random 32-dimensional vectors. `crates/atlantis-vector/tests/recall.rs` uses
 4,000 clustered vectors with a low intrinsic dimension, like real embeddings, where
 connectivity bugs show: it requires recall@10 ≥ 0.95, that ≥ 99.5% of nodes find
@@ -175,7 +175,7 @@ exists fails unless `IF NOT EXISTS` is given; dropping a missing one fails unles
 a secondary label, whose property holds a `Vector` or a list of numbers. The definition
 (`VectorIndexDef`) is stored in the catalog, in the same transaction as other writes;
 `CALL db.indexes()` lists the definitions. The option parser is `create_vector_index` in
-[`crates/atlantis-engine/src/exec/mod.rs`](../crates/atlantis-engine/src/exec/mod.rs).
+[`crates/atlantis-engine/src/exec/ddl.rs`](../crates/atlantis-engine/src/exec/ddl.rs).
 
 ### Search Procedure
 
@@ -206,7 +206,7 @@ RETURN node, score;
 
 ### How the Index Is Maintained
 
-**File:** [`crates/atlantis-engine/src/vector_index.rs`](../crates/atlantis-engine/src/vector_index.rs)
+**File:** [`crates/atlantis-engine/src/vector_index/`](../crates/atlantis-engine/src/vector_index/)
 
 Only the definition is stored; the HNSW graph is **derived data** held in memory:
 

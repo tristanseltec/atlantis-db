@@ -11,7 +11,7 @@ Implemented today: the `Geometry` variant of `Value` with WGS84 validation
 (`crates/atlantis-core/src/geometry.rs`); in Cypher, `point({longitude, latitude})`
 (or `{x, y}`), the accessors `p.longitude`/`p.latitude` (`p.x`/`p.y`), and
 `point.distance(a, b)` (alias `distance`), evaluated in
-`crates/atlantis-engine/src/exec/eval.rs`. A distance filter scans the label. Sections
+`crates/atlantis-engine/src/exec/eval/functions/spatial.rs`. A distance filter scans the label. Sections
 marked Planned are target design.
 
 ## Geometry Types (Implemented; DDL field types Phase 2)
