@@ -275,8 +275,8 @@ def bench(mode: str) -> None:
 ROADMAP = [
     ("F1", "Retrieval", "Bench", "partial"),
     ("F2", "Vector", "core", "partial"),
-    ("F3", "Filtered", "search", "next"),
-    ("F4", "Consistent", "search", "designed"),
+    ("F3", "Filtered", "search", "done"),
+    ("F4", "Consistent", "search", "next"),
     ("F5", "BM25 +", "fusion", "designed"),
     ("F6", "Group", "commit", "designed"),
     ("F7", "Python", "package", "designed"),
@@ -284,6 +284,7 @@ ROADMAP = [
 ]
 
 STATE_LABEL = {
+    "done": "Done",
     "partial": "Partly done",
     "next": "Next",
     "designed": "Designed",
@@ -293,7 +294,13 @@ STATE_LABEL = {
 def glyph(s: Svg, cx: float, cy: float, state: str) -> None:
     t = s.t
     r = 13
-    if state == "partial":
+    if state == "done":
+        s.add(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{t["blue"]}"/>')
+        s.add(
+            f'<path d="M{cx - 5.5},{cy + 0.5} L{cx - 1.5},{cy + 4.5} L{cx + 6},{cy - 4}" fill="none" '
+            f'stroke="{t["surface"]}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>'
+        )
+    elif state == "partial":
         s.add(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{t["surface"]}" stroke="{t["blue"]}" stroke-width="2.5"/>')
         s.add(
             f'<path d="M{cx},{cy - r + 4} A{r - 4},{r - 4} 0 0 1 {cx},{cy + r - 4} Z" fill="{t["blue"]}"/>'
@@ -319,7 +326,7 @@ def roadmap(mode: str) -> None:
     step = (right - left) / (len(ROADMAP) - 1)
     for i in range(len(ROADMAP) - 1):
         x1, x2 = left + i * step + 15, left + (i + 1) * step - 15
-        done = ROADMAP[i + 1][3] in ("partial", "next")
+        done = ROADMAP[i + 1][3] in ("done", "partial", "next")
         s.line(x1, cy, x2, cy, stroke="blue" if done else "axis", sw=2)
     for i, (k, a, b, st) in enumerate(ROADMAP):
         cx = left + i * step
@@ -329,7 +336,7 @@ def roadmap(mode: str) -> None:
         s.text(cx, cy + 72, b, 13, "ink2", anchor="middle")
     # Legend.
     lx, ly = 28, H - 22
-    for st in ("partial", "next", "designed"):
+    for st in ("done", "partial", "next", "designed"):
         glyph(s, lx + 10, ly - 5, st)
         s.text(lx + 30, ly, STATE_LABEL[st], 13, "ink2")
         lx += 30 + len(STATE_LABEL[st]) * 7.2 + 28

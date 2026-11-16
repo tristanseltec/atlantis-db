@@ -116,8 +116,10 @@ ORDER BY score DESC LIMIT 5
 ```
 
 Several embedding models become several vector fields with one index each
-(`embedding_small`, `embedding_large`). A `WHERE` after `YIELD` filters the `k` hits, so
-ask for more than you return; index-aware filtering is Phase 3.
+(`embedding_small`, `embedding_large`). Field comparisons in the `WHERE` after `YIELD`
+(`node.user = $user`, `node.lang IN $langs`, `node.createdAt > $since`) are applied inside
+the index, so the search returns the `k` nearest matching chunks; other conditions filter
+those `k` afterwards ([10 — Vector Index](10-vector-index.md)).
 
 ## Pattern 4: Hybrid text + vector retrieval (Phase 3)
 

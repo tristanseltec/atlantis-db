@@ -9,14 +9,25 @@
 //! Locking: a short-lived mutex guards the map of built indexes; each index
 //! has its own read-write lock. Searches of one index run in parallel, and
 //! a commit blocks only the indexes of its database while it updates them.
+//!
+//! Filtered search: a [`FieldFilter`] (pushed down from `YIELD ... WHERE`)
+//! is evaluated over a *column*, a per-slot copy of one record field that the
+//! index keeps next to the graph. A column is built on first use and kept
+//! current by the same per-commit refresh as the vectors; equality and `IN`
+//! use a value → slots map, other operators scan the column. The resulting
+//! allow set drives [`HnswIndex::search_filtered`].
 
 use std::collections::HashMap;
+
+use atlantis_cypher::ast::BinaryOp;
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use atlantis_core::{AtlantisError, DatabaseRef, DistanceMetricKind, NodeId, RecordId, Value};
 use atlantis_kv::{Isolation, TxMode};
 use atlantis_storage::{RecordStore, RecordTx, VectorIndexDef};
-use atlantis_vector::{HnswIndex, HnswParams};
+use atlantis_vector::{AllowSet, HnswIndex, HnswParams};
+
+use crate::exec::eval::{compare_op, group_key, is_true};
 
 /// A nearest-neighbour search request.
 #[derive(Debug, Clone)]
@@ -28,6 +39,100 @@ pub struct VectorQuery {
     pub ef_search: Option<usize>,
     /// Minimum score a hit must reach.
     pub threshold: Option<f64>,
+    /// Conditions every hit must meet (a conjunction); empty for none.
+    pub filter: Vec<FieldFilter>,
+}
+
+/// One condition on a top-level record field: `field op value` (or
+/// `value op field` when `field_on_left` is false). Evaluated with the same
+/// comparison semantics as `WHERE`.
+#[derive(Debug, Clone)]
+pub struct FieldFilter {
+    pub field: String,
+    pub op: BinaryOp,
+    pub value: Value,
+    pub field_on_left: bool,
+}
+
+impl FieldFilter {
+    fn admits(&self, field_value: &Value) -> bool {
+        let r = if self.field_on_left {
+            compare_op(field_value, self.op, &self.value)
+        } else {
+            compare_op(&self.value, self.op, field_value)
+        };
+        r.is_ok_and(|v| is_true(&v))
+    }
+
+    /// The equality-map keys that can satisfy this condition, when it is an
+    /// equality or `field IN [...]` (`None`: scan the column instead).
+    fn lookup_keys(&self) -> Option<Vec<String>> {
+        match (self.op, self.field_on_left, &self.value) {
+            (BinaryOp::Eq, _, v) => Some(vec![group_key(std::slice::from_ref(v))]),
+            (BinaryOp::In, true, Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|v| group_key(std::slice::from_ref(v)))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// A per-slot copy of one record field, kept for filtered search.
+#[derive(Default)]
+struct Column {
+    /// Slot → field value (`Null` when absent or the slot was removed).
+    values: Vec<Value>,
+    /// Value key → slots that had that value when written. Entries of
+    /// removed or changed slots go stale; candidates are re-checked against
+    /// `values`.
+    eq: HashMap<String, Vec<u32>>,
+}
+
+impl Column {
+    fn set(&mut self, slot: u64, value: Value) {
+        let i = slot as usize;
+        if self.values.len() <= i {
+            self.values.resize(i + 1, Value::Null);
+        }
+        if !value.is_null() {
+            self.eq
+                .entry(group_key(std::slice::from_ref(&value)))
+                .or_default()
+                .push(slot as u32);
+        }
+        self.values[i] = value;
+    }
+
+    fn get(&self, slot: u32) -> &Value {
+        self.values.get(slot as usize).unwrap_or(&Value::Null)
+    }
+
+    /// Slots whose value meets `filter`.
+    fn matching(&self, filter: &FieldFilter) -> AllowSet {
+        let mut set = AllowSet::with_capacity(self.values.len());
+        match filter.lookup_keys() {
+            Some(keys) => {
+                for key in keys {
+                    for &slot in self.eq.get(&key).into_iter().flatten() {
+                        if filter.admits(self.get(slot)) {
+                            set.insert(slot);
+                        }
+                    }
+                }
+            }
+            None => {
+                for (slot, v) in self.values.iter().enumerate() {
+                    if filter.admits(v) {
+                        set.insert(slot as u32);
+                    }
+                }
+            }
+        }
+        set
+    }
 }
 
 /// One search hit.
@@ -49,6 +154,8 @@ struct Built {
     next: u64,
     /// Removed entries still present as HNSW tombstones.
     deleted: usize,
+    /// Field name → column, for filtered search.
+    columns: HashMap<String, Column>,
 }
 
 impl Built {
@@ -67,7 +174,60 @@ impl Built {
             slots: HashMap::new(),
             next: 0,
             deleted: 0,
+            columns: HashMap::new(),
         }
+    }
+
+    /// Records `record`'s fields in the columns for `slot`.
+    fn set_columns(&mut self, slot: u64, record: &atlantis_core::Record) {
+        for (field, column) in self.columns.iter_mut() {
+            column.set(slot, record.get(field).cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    /// Builds the columns for `fields` that do not exist yet, from the
+    /// records of the index's label.
+    fn add_columns(&mut self, tx: &mut RecordTx, fields: &[&str]) -> Result<(), AtlantisError> {
+        let missing: Vec<String> = fields
+            .iter()
+            .filter(|f| !self.columns.contains_key(**f))
+            .map(|f| f.to_string())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut built: Vec<(String, Column)> = missing
+            .into_iter()
+            .map(|f| (f, Column::default()))
+            .collect();
+        for record in tx.with_label(&self.def.label)? {
+            let Some(&slot) = self.slots.get(&record.id.to_string()) else {
+                continue;
+            };
+            for (field, column) in &mut built {
+                column.set(slot, record.get(field).cloned().unwrap_or(Value::Null));
+            }
+        }
+        self.columns.extend(built);
+        Ok(())
+    }
+
+    /// The live slots that meet every filter.
+    fn allow_set(&self, filters: &[FieldFilter]) -> AllowSet {
+        let mut sets = filters.iter().map(|f| {
+            self.columns
+                .get(&f.field)
+                .map(|c| c.matching(f))
+                .unwrap_or_default()
+        });
+        let mut allow = sets.next().unwrap_or_default();
+        for s in sets {
+            if allow.is_empty() {
+                break;
+            }
+            allow.intersect(&s);
+        }
+        allow
     }
 
     fn vector_of(&self, value: Option<&Value>) -> Option<Vec<f32>> {
@@ -87,30 +247,38 @@ impl Built {
             self.hnsw.remove(NodeId(slot));
             self.records.remove(&slot);
             self.deleted += 1;
+            for column in self.columns.values_mut() {
+                if let Some(v) = column.values.get_mut(slot as usize) {
+                    *v = Value::Null;
+                }
+            }
         }
     }
 
     /// Re-reads one record and updates its entry. An unchanged vector is
     /// left in place, so writes to other fields do not churn the graph.
     fn refresh(&mut self, tx: &mut RecordTx, id: &RecordId) -> Result<(), AtlantisError> {
-        let vector = match tx.get(id)? {
-            Some(record) if record.has_label(&self.def.label) => {
-                self.vector_of(record.get(&self.def.field))
-            }
-            _ => None,
-        };
-        if let (Some(v), Some(slot)) = (&vector, self.slots.get(&id.to_string())) {
-            if self.hnsw.get_vector(NodeId(*slot)) == Some(v.as_slice()) {
+        let record = tx.get(id)?.filter(|r| r.has_label(&self.def.label));
+        let vector = record
+            .as_ref()
+            .and_then(|r| self.vector_of(r.get(&self.def.field)));
+        if let (Some(v), Some(&slot)) = (&vector, self.slots.get(&id.to_string())) {
+            if self.hnsw.get_vector(NodeId(slot)) == Some(v.as_slice()) {
+                // Same vector: only filtered fields may have changed.
+                if let Some(record) = &record {
+                    self.set_columns(slot, record);
+                }
                 return Ok(());
             }
         }
         self.remove(id);
-        if let Some(vector) = vector {
+        if let (Some(vector), Some(record)) = (vector, record) {
             let slot = self.next;
             self.next += 1;
             self.hnsw.insert(NodeId(slot), vector)?;
             self.records.insert(slot, id.clone());
             self.slots.insert(id.to_string(), slot);
+            self.set_columns(slot, &record);
         }
         Ok(())
     }
@@ -177,8 +345,8 @@ impl VectorIndexes {
         def: &VectorIndexDef,
         query: &VectorQuery,
     ) -> Result<Vec<VectorHit>, AtlantisError> {
-        let (k, ef_search, threshold) = (query.k, query.ef_search, query.threshold);
-        let query = query.vector.as_slice();
+        let request = query;
+        let query = request.vector.as_slice();
         if query.len() != def.dimension {
             return Err(AtlantisError::DimensionMismatch {
                 expected: def.dimension,
@@ -192,7 +360,20 @@ impl VectorIndexes {
                 let guard = read(&slot);
                 match guard.as_ref() {
                     Some(index) if index.def == *def => {
-                        return Self::search_built(index, query, k, ef_search, threshold);
+                        let fields: Vec<&str> = request
+                            .filter
+                            .iter()
+                            .map(|f| f.field.as_str())
+                            .filter(|f| !index.columns.contains_key(*f))
+                            .collect();
+                        if fields.is_empty() {
+                            return Self::search_built(index, request);
+                        }
+                        // Build the missing columns under the write lock,
+                        // then search again.
+                        drop(guard);
+                        self.add_columns(store, db, def, &slot, &request.filter)?;
+                        continue;
                     }
                     // A failed build left the slot empty; build again.
                     None => {}
@@ -203,21 +384,24 @@ impl VectorIndexes {
             if let Some(result) = self.build(store, &key, def)? {
                 let guard = read(&result);
                 if let Some(index) = guard.as_ref().filter(|i| i.def == *def) {
-                    return Self::search_built(index, query, k, ef_search, threshold);
+                    if request.filter.is_empty() {
+                        return Self::search_built(index, request);
+                    }
                 }
             }
             // Another thread replaced the slot meanwhile; look again.
         }
     }
 
-    fn search_built(
-        index: &Built,
-        query: &[f32],
-        k: usize,
-        ef_search: Option<usize>,
-        threshold: Option<f64>,
-    ) -> Result<Vec<VectorHit>, AtlantisError> {
-        let hits = index.hnsw.search(query, k, ef_search)?;
+    fn search_built(index: &Built, request: &VectorQuery) -> Result<Vec<VectorHit>, AtlantisError> {
+        let (query, k, ef_search) = (request.vector.as_slice(), request.k, request.ef_search);
+        let threshold = request.threshold;
+        let hits = if request.filter.is_empty() {
+            index.hnsw.search(query, k, ef_search)?
+        } else {
+            let allow = index.allow_set(&request.filter);
+            index.hnsw.search_filtered(query, k, ef_search, &allow)?
+        };
         Ok(hits
             .into_iter()
             .filter_map(|(slot, distance)| {
@@ -229,6 +413,24 @@ impl VectorIndexes {
             })
             .filter(|hit| threshold.is_none_or(|t| hit.score >= t))
             .collect())
+    }
+
+    /// Adds the columns `filters` need to the built index in `slot`.
+    fn add_columns(
+        &self,
+        store: &RecordStore,
+        db: &DatabaseRef,
+        def: &VectorIndexDef,
+        slot: &Slot,
+        filters: &[FieldFilter],
+    ) -> Result<(), AtlantisError> {
+        let mut guard = write(slot);
+        let Some(index) = guard.as_mut().filter(|i| i.def == *def) else {
+            return Ok(());
+        };
+        let fields: Vec<&str> = filters.iter().map(|f| f.field.as_str()).collect();
+        let mut tx = store.begin(db.clone(), TxMode::ReadOnly, Isolation::Snapshot)?;
+        index.add_columns(&mut tx, &fields)
     }
 
     /// Builds the index for `key` from the records, publishing a new slot.

@@ -39,7 +39,7 @@ struct Args {
     spec: Spec,
     scale: String,
     settings: Settings,
-    overfetch: usize,
+    overfetch: Option<usize>,
     ef_search: Option<usize>,
     dir: Option<PathBuf>,
     out: Option<PathBuf>,
@@ -72,7 +72,7 @@ fn parse_args() -> anyhow::Result<Args> {
         write_rate: 2_000,
         freshness_probes: 20,
     };
-    let (mut overfetch, mut ef_search, mut dir, mut out) = (10, None, None, None);
+    let (mut overfetch, mut ef_search, mut dir, mut out) = (None, None, None, None);
     let mut workloads: Vec<String> = WORKLOADS.iter().map(|s| s.to_string()).collect();
     let mut it = raw.iter();
     while let Some(flag) = it.next() {
@@ -86,7 +86,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--users" => spec.users = value()?.parse()?,
             "--queries" => spec.queries = value()?.parse()?,
             "--k" => settings.k = value()?.parse()?,
-            "--overfetch" => overfetch = value()?.parse()?,
+            "--overfetch" => overfetch = Some(value()?.parse()?),
             "--ef-search" => ef_search = Some(value()?.parse()?),
             "--threads" => settings.threads = value()?.parse()?,
             "--duration" => settings.duration = Duration::from_secs_f64(value()?.parse()?),
@@ -255,10 +255,13 @@ fn main() -> anyhow::Result<()> {
         adapter: a.name(),
         capabilities: a.capabilities(),
         adapter_notes: format!(
-            "filtered search = vector top-{}×{} then WHERE; efSearch {}; no BM25 (graph-RAG is vector-only)",
-            s.k,
-            args.overfetch,
-            args.ef_search.map_or("default".to_string(), |e| e.to_string())
+            "filtered search = {}; efSearch {}; no BM25 (graph-RAG is vector-only)",
+            match args.overfetch {
+                None => "filter pushed into the vector index (YIELD ... WHERE)".to_string(),
+                Some(f) => format!("vector top-{}×{f} then WHERE", s.k),
+            },
+            args.ef_search
+                .map_or("default".to_string(), |e| e.to_string())
         ),
         results: &r,
     };

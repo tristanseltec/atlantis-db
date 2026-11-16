@@ -177,8 +177,14 @@ Findings:
    index's write lock (an `ef_construction` search per vector) after its own WAL fsync,
    so write throughput waits for group commit (F6) and versioned entries applied off the
    commit path (F4).
-4. **Filtering after the search** returns fewer than k rows for every query at 1%
-   selectivity; F3 removes it.
+4. **Filtering after the search** returned fewer than k rows for every query at 1%
+   selectivity. **Fixed (F3):** the `WHERE` after `YIELD` is pushed into the index,
+   which searches exactly over the allowed records when they are few and walks the
+   graph admitting only allowed records otherwise. Filtered recall@10 is **1.000** with
+   no short results, at p50 0.15 ms / p99 0.33 ms, against 0.092 and 1.11 / 2.49 ms for
+   the 10× over-fetch on the same machine; the 8-thread graph-RAG query (which now
+   expands 10 filtered hits instead of about one) runs at 4,895 QPS against 3,610
+   (`benches/results/2026-11-16-small-mem-f3-filtered.*` and `-f3-postfilter.*`).
 
 ## What's Next
 

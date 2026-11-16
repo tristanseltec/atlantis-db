@@ -165,6 +165,78 @@ fn compare(a: &Value, b: &Value, op: BinaryOp) -> Value {
     })
 }
 
+/// `true` for the operators [`compare_op`] evaluates.
+pub(crate) fn is_comparison(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::In
+            | BinaryOp::StartsWith
+            | BinaryOp::EndsWith
+            | BinaryOp::Contains
+    )
+}
+
+/// Evaluates `a op b` for a comparison operator ([`is_comparison`]), with
+/// Cypher's three-valued logic. `WHERE` and the vector-search filter
+/// pushdown both use it, so a pushed-down filter admits exactly the rows
+/// the `WHERE` keeps.
+pub(crate) fn compare_op(a: &Value, op: BinaryOp, b: &Value) -> Result<Value, AtlantisError> {
+    Ok(match op {
+        BinaryOp::Eq => cypher_eq(a, b),
+        BinaryOp::NotEq => match cypher_eq(a, b) {
+            Value::Bool(x) => Value::Bool(!x),
+            other => other,
+        },
+        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => compare(a, b, op),
+        BinaryOp::In => match b {
+            Value::Null => Value::Null,
+            Value::Array(items) => {
+                if a.is_null() {
+                    return Ok(if items.is_empty() {
+                        Value::Bool(false)
+                    } else {
+                        Value::Null
+                    });
+                }
+                let mut saw_null = false;
+                for item in items {
+                    match cypher_eq(a, item) {
+                        Value::Bool(true) => return Ok(Value::Bool(true)),
+                        Value::Null => saw_null = true,
+                        _ => {}
+                    }
+                }
+                if saw_null {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                }
+            }
+            other => {
+                return Err(invalid(format!(
+                    "IN expects a list, got {}",
+                    other.type_name()
+                )))
+            }
+        },
+        BinaryOp::StartsWith | BinaryOp::EndsWith | BinaryOp::Contains => match (a, b) {
+            (Value::String(x), Value::String(y)) => Value::Bool(match op {
+                BinaryOp::StartsWith => x.starts_with(y.as_str()),
+                BinaryOp::EndsWith => x.ends_with(y.as_str()),
+                _ => x.contains(y.as_str()),
+            }),
+            _ => Value::Null,
+        },
+        other => return Err(invalid(format!("{other:?} is not a comparison"))),
+    })
+}
+
 fn arithmetic(a: Value, op: BinaryOp, b: Value) -> Result<Value, AtlantisError> {
     use Value::*;
     if a.is_null() || b.is_null() {
@@ -561,51 +633,16 @@ impl Exec<'_> {
                 (Some(x), Some(y)) => Value::Bool(x != y),
                 _ => Value::Null,
             },
-            BinaryOp::Eq => cypher_eq(&a, &b),
-            BinaryOp::NotEq => match cypher_eq(&a, &b) {
-                Value::Bool(x) => Value::Bool(!x),
-                other => other,
-            },
-            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => compare(&a, &b, op),
-            BinaryOp::In => match b {
-                Value::Null => Value::Null,
-                Value::Array(items) => {
-                    if a.is_null() {
-                        return Ok(if items.is_empty() {
-                            Value::Bool(false)
-                        } else {
-                            Value::Null
-                        });
-                    }
-                    let mut saw_null = false;
-                    for item in &items {
-                        match cypher_eq(&a, item) {
-                            Value::Bool(true) => return Ok(Value::Bool(true)),
-                            Value::Null => saw_null = true,
-                            _ => {}
-                        }
-                    }
-                    if saw_null {
-                        Value::Null
-                    } else {
-                        Value::Bool(false)
-                    }
-                }
-                other => {
-                    return Err(invalid(format!(
-                        "IN expects a list, got {}",
-                        other.type_name()
-                    )))
-                }
-            },
-            BinaryOp::StartsWith | BinaryOp::EndsWith | BinaryOp::Contains => match (&a, &b) {
-                (Value::String(x), Value::String(y)) => Value::Bool(match op {
-                    BinaryOp::StartsWith => x.starts_with(y.as_str()),
-                    BinaryOp::EndsWith => x.ends_with(y.as_str()),
-                    _ => x.contains(y.as_str()),
-                }),
-                _ => Value::Null,
-            },
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::In
+            | BinaryOp::StartsWith
+            | BinaryOp::EndsWith
+            | BinaryOp::Contains => compare_op(&a, op, &b)?,
             BinaryOp::RegexMatch => match (&a, &b) {
                 (Value::String(x), Value::String(pattern)) => {
                     if !self.regexes.contains_key(pattern) {

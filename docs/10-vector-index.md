@@ -114,9 +114,9 @@ tombstones outnumber its live entries.
 **Files:** [`vector_store.rs`](../crates/atlantis-vector/src/vector_store.rs),
 [`params.rs`](../crates/atlantis-vector/src/params.rs)
 
-`VectorStore` keeps `Vec<Vec<f32>>` with a fixed dimensionality. `insert` appends and
-returns a sequential `NodeId`; `insert_at` writes a specific slot (used by
-`HnswIndex::insert`); `remove` clears a slot; `contains` and `len` ignore empty slots.
+`VectorStore` keeps every vector in one contiguous `f32` arena with a fixed
+dimensionality. `insert` appends and returns a sequential `NodeId`; `insert_at` writes a
+specific slot; `remove` marks a slot empty; `contains` and `len` ignore empty slots.
 
 `SearchParams { k, ef_search: Option<usize>, score_threshold: Option<f32> }` defaults to
 `k = 10` and has a builder:
@@ -250,25 +250,55 @@ WHERE c.lang = 'en' AND c:Published AND c.createdAt > $since
 RETURN c, score;
 ```
 
-The index is already scoped to one table, so the table label is an implicit filter.
-For the remaining predicates the optimizer chooses one of two strategies
-(see [15 — Query Planner & Executor](15-query-planner-executor.md)):
+The index is already scoped to one label, so the label is an implicit filter.
+
+**Implemented: push-down of field comparisons.** The executor splits the `WHERE` after
+`YIELD` into `AND`-ed conditions and hands the search every condition of the form
+`node.field op value` (either operand order) where:
+
+- `node` is the yielded `node` column (under its alias, if any) and `field` is a
+  top-level field other than `id`;
+- `op` is `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `STARTS WITH`, `ENDS WITH` or
+  `CONTAINS`;
+- `value` mentions no yielded column and calls no volatile function (`rand()`,
+  `randomUUID()`, `timestamp()`, `datetime()` without arguments). It may use
+  parameters and variables of the incoming row, and is evaluated once per row.
+
+The search then returns the `k` nearest records that meet those conditions. The whole
+`WHERE` still runs afterwards on every hit, so conditions that are not pushed down
+(on `score`, on two fields of the node, nested fields, labels, `OR`) filter the `k`
+rows as before and can leave fewer than `k`. Pushed and evaluated conditions use the same
+comparison function, so a pushed condition never drops a row that `WHERE` would keep.
+In the example above, `c.lang = 'en'` and `c.createdAt > $since` are pushed down and
+`c:Published` filters afterwards.
+
+**Columns and allow sets.** For each filtered field the built index keeps a *column*:
+the field's value per slot, plus a value → slots map for `=` and `IN`. A column is
+built on the first query that filters on the field (one scan of the label's records,
+about 0.1 s at 20,000 records) and kept current by the per-commit refresh, including
+changes to the field alone. Each condition yields an allow set (a bitmap of slots,
+`AllowSet`); the conditions are intersected.
+
+**Strategy.** `HnswIndex::search_filtered` picks one per query:
 
 | Strategy | When | How |
 |---|---|---|
-| **Pre-filter** | The predicate is selective and answerable from a secondary index or the secondary-label set | Build an allow-set of record keys first, then run HNSW traversal that only admits allowed nodes into the result heap while still walking through others for connectivity. If the allow-set is very small, skip HNSW and compute exact distances over it. |
-| **Post-filter** | The predicate is broad or not indexable | Search with an enlarged candidate pool (`k × overfetch`, growing until `k` rows survive or the index is exhausted), then evaluate `WHERE`. |
+| **Exact** | Few nodes allowed: `allowed ≤ 10 · ef / selectivity` | Distances to every allowed node; exact top `k`. At 20,000 nodes and `ef = 50` this covers selectivities up to about 16%. |
+| **Filtered traversal** | Broad filters | The usual layer-0 search, but every node is a waypoint and only allowed, live nodes enter the result heap; the walk continues until `ef` allowed nodes are found. |
 
-Both strategies return at most `k` rows that satisfy the predicate. Today a `WHERE`
-after `YIELD` filters the `k` hits after the search, so fewer than `k` rows can remain.
+Both return only allowed, live nodes, ordered by distance. A separate post-filter
+strategy is not needed: at high selectivity filtered traversal costs about as much as
+an unfiltered search. On the Retrieval Bench (20,000 × 768, 1% of records match),
+filtered recall@10 goes from 0.09 with a 10× over-fetch to 1.00, at p50 0.15 ms
+(`benches/results/2026-11-16-small-mem-f3-*`).
 
 ### Persistence Through `atlantis-kv` (Planned — Phase 3)
 
 > **Revised 2026-11-16.** On local backends (`mem`, `rocksdb`) the focus-track design
 > replaces per-insert `vx/` writes with a checkpointed index image plus replay, and
 > adds versioned entries and a transaction overlay for snapshot-consistent,
-> read-your-writes search. Filtering is chosen per query between exact, filtered
-> traversal and post-filter. See
+> read-your-writes search. Filtering is chosen per query between exact and filtered
+> traversal (implemented, above). See
 > [02 — Architecture § Hybrid Retrieval Path](02-architecture.md#hybrid-retrieval-path-focus).
 > The `vx/` layout below stays the design for the distributed backend (Phase 7).
 

@@ -11,7 +11,7 @@ use std::collections::HashSet;
 
 use atlantis_core::{DistanceMetricKind, NodeId};
 use atlantis_vector::distance::{CosineDistance, DistanceMetric};
-use atlantis_vector::{HnswIndex, HnswParams};
+use atlantis_vector::{AllowSet, FilterStrategy, HnswIndex, HnswParams};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -210,4 +210,99 @@ fn parallel_batch_onto_existing_graph() {
     assert_eq!(index.len(), data.len());
     let r = recall(&index, &data, &queries, &HashSet::new());
     assert!(r >= 0.95, "recall@10 {r:.3}, expected ≥ 0.95");
+}
+
+/// Mean recall@10 of a filtered search against exact filtered ground truth;
+/// also checks every hit is allowed.
+fn filtered_recall(
+    index: &HnswIndex,
+    data: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    allow: &AllowSet,
+) -> f64 {
+    let k = 10;
+    let skip: HashSet<u64> = (0..data.len() as u64)
+        .filter(|i| !allow.contains(*i as u32))
+        .collect();
+    let mut total = 0.0;
+    for q in queries {
+        let truth = exact(data, q, k, &skip);
+        let hits = index.search_filtered(q, k, Some(64), allow).unwrap();
+        assert!(hits.iter().all(|(id, _)| allow.contains(id.0 as u32)));
+        assert_eq!(hits.len(), truth.len().min(k), "short result");
+        let got: HashSet<u64> = hits.into_iter().map(|(id, _)| id.0).collect();
+        total +=
+            truth.iter().filter(|t| got.contains(t)).count() as f64 / truth.len().max(1) as f64;
+    }
+    total / queries.len() as f64
+}
+
+fn random_allow(n: usize, share: f64, seed: u64) -> AllowSet {
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..n as u32).filter(|_| rng.gen_bool(share)).collect()
+}
+
+#[test]
+fn filtered_search_at_one_percent() {
+    let (data, queries) = clustered(10_000, 100, 29);
+    let index = build_parallel(&data, 8);
+    let allow = random_allow(data.len(), 0.01, 1);
+    assert_eq!(
+        index.filter_strategy(allow.len(), 64),
+        FilterStrategy::Exact
+    );
+    let r = filtered_recall(&index, &data, &queries, &allow);
+    assert!(r >= 0.999, "filtered recall@10 {r:.3} at 1%");
+}
+
+#[test]
+fn filtered_search_at_half() {
+    let (data, queries) = clustered(10_000, 100, 31);
+    let index = build_parallel(&data, 8);
+    let allow = random_allow(data.len(), 0.5, 2);
+    assert_eq!(
+        index.filter_strategy(allow.len(), 64),
+        FilterStrategy::Traversal
+    );
+    let r = filtered_recall(&index, &data, &queries, &allow);
+    assert!(r >= 0.95, "filtered recall@10 {r:.3} at 50%");
+}
+
+#[test]
+fn filtered_search_with_correlated_filter() {
+    // Allowed nodes sit on one side of a hyperplane, so for half the queries
+    // every allowed node is far away and the walk must cross disallowed
+    // regions to reach them.
+    let (data, queries) = clustered(10_000, 100, 37);
+    let index = build_parallel(&data, 8);
+    let allow: AllowSet = (0..data.len() as u32)
+        .filter(|&i| data[i as usize][0] > 0.05)
+        .collect();
+    let share = allow.len() as f64 / data.len() as f64;
+    assert!((0.2..0.8).contains(&share), "share {share}");
+    let r = filtered_recall(&index, &data, &queries, &allow);
+    assert!(
+        r >= 0.95,
+        "filtered recall@10 {r:.3} with a correlated filter"
+    );
+}
+
+#[test]
+fn filtered_search_skips_deleted_and_handles_empty() {
+    let (data, queries) = clustered(3_000, 20, 41);
+    let mut index = build(&data);
+    let allow = random_allow(data.len(), 0.3, 3);
+    let victims: Vec<u32> = allow.iter().step_by(2).collect();
+    for &v in &victims {
+        index.remove(NodeId(v as u64));
+    }
+    for q in &queries {
+        let hits = index.search_filtered(q, 10, None, &allow).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|(id, _)| !victims.contains(&(id.0 as u32))));
+    }
+    assert!(index
+        .search_filtered(&queries[0], 10, None, &AllowSet::new())
+        .unwrap()
+        .is_empty());
 }

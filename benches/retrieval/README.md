@@ -44,7 +44,7 @@ Deterministic (seeded SplitMix64; the same corpus on every machine):
 | `reopen` | With `--dir`: close, reopen, time to the first answer (index rebuild included) |
 
 Options: `--chunks --dim --users --queries` override the preset, `--k` (10),
-`--overfetch` (10), `--threads` (8), `--duration` (10 s), `--write-rate` (2000),
+`--overfetch F` (filter after an unfiltered top-`k × F` search instead of inside the index; for comparison), `--threads` (8), `--duration` (10 s), `--write-rate` (2000),
 `--probes` (20), `--dir PATH` (persistent engine; must be empty), `--out DIR` (writes
 `<date>-<scale>-<mem|dir>.json` and `.md`), `--workloads a,b,c`.
 
@@ -57,7 +57,7 @@ part of the workload outside the database is never compared silently.
 
 | Adapter | Status |
 |---|---|
-| Atlantis DB, embedded (in-memory or `--dir`) | Implemented. Filtering today is over-fetch (`k × overfetch`) then `WHERE`; no BM25. |
+| Atlantis DB, embedded (in-memory or `--dir`) | Implemented. Filters run inside the vector index (`YIELD ... WHERE`); `--overfetch F` measures the old over-fetch-then-filter path. No BM25 yet. |
 | SurrealDB (embedded) | Planned |
 | LadybugDB (embedded) | Planned |
 | FalkorDB (server) | Planned |

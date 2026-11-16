@@ -64,8 +64,11 @@ projection, `pattern.rs` matching and creation, `eval.rs` expressions and functi
 
 `db.vector.search` resolves the index definition in the transaction, then searches the
 in-memory HNSW graph derived from records, building it on first use. It yields the hit's
-record id and a metric-aware score ([10 — Vector Index](10-vector-index.md)). A `WHERE`
-after `YIELD` filters the `k` hits after the search.
+record id and a metric-aware score ([10 — Vector Index](10-vector-index.md)). Field
+comparisons in the `WHERE` after `YIELD` (`node.field op value`) are pushed into the
+search, which returns the `k` nearest matching records by exact or filtered-traversal
+search; the whole `WHERE` then runs on the hits, so other conditions still filter
+afterwards ([10 — Vector Index § Filtering](10-vector-index.md)).
 
 ### Current limits
 

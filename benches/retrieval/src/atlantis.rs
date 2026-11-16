@@ -1,10 +1,10 @@
 //! The Atlantis DB adapter: embedded engine, Cypher for queries, the record
 //! API for bulk loading.
 //!
-//! Today's engine has no filter inside the vector search, so the filtered
-//! workloads over-fetch `k × overfetch` hits and filter them with `WHERE`.
-//! That is what an application must do today, and the report shows the
-//! recall it gets.
+//! Filtered workloads put the filter in `YIELD ... WHERE`, which the engine
+//! pushes into the vector index (filtered HNSW, F3). With `--overfetch F`
+//! the adapter instead fetches `k × F` unfiltered hits and filters them with
+//! `WITH ... WHERE`, the only option before F3, to compare the two.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -25,7 +25,9 @@ pub struct Atlantis {
     engine: RwLock<Option<Engine>>,
     dir: Option<PathBuf>,
     dim: usize,
-    overfetch: usize,
+    /// `Some(f)`: filter after an unfiltered search for `k × f` hits.
+    /// `None`: push the filter into the search.
+    overfetch: Option<usize>,
     /// `efSearch` for every search; `None` uses the index default.
     ef_search: Option<usize>,
 }
@@ -52,7 +54,7 @@ impl Atlantis {
     pub fn open(
         dir: Option<PathBuf>,
         dim: usize,
-        overfetch: usize,
+        overfetch: Option<usize>,
         ef_search: Option<usize>,
     ) -> anyhow::Result<Self> {
         let engine = match &dir {
@@ -70,7 +72,7 @@ impl Atlantis {
             engine: RwLock::new(Some(engine)),
             dir,
             dim,
-            overfetch: overfetch.max(1),
+            overfetch: overfetch.map(|f| f.max(1)),
             ef_search,
         })
     }
@@ -95,12 +97,26 @@ impl Atlantis {
         }
     }
 
+    /// The search clause filtered to the query's user, as `node, score`
+    /// rows, at most `k`.
+    fn filtered(&self, k: usize) -> String {
+        match self.overfetch {
+            None => format!(
+                "{} YIELD node, score WHERE node.user = $u",
+                self.search_call(k)
+            ),
+            Some(f) => format!(
+                "{} YIELD node, score WITH node, score WHERE node.user = $u \
+                 WITH node, score ORDER BY score DESC LIMIT {k}",
+                self.search_call(k * f)
+            ),
+        }
+    }
+
     fn filtered_search(&self, k: usize) -> String {
         format!(
-            "{} YIELD node, score \
-             WITH node, score WHERE node.user = $u \
-             RETURN id(node) AS id, score ORDER BY score DESC LIMIT {k}",
-            self.search_call(k * self.overfetch)
+            "{} RETURN id(node) AS id, score ORDER BY score DESC LIMIT {k}",
+            self.filtered(k)
         )
     }
 }
@@ -146,7 +162,7 @@ impl Adapter for Atlantis {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            filter_in_search: false,
+            filter_in_search: self.overfetch.is_none(),
             hybrid_text: false,
             search_reads_own_writes: false,
             graph_in_query: true,
@@ -247,14 +263,12 @@ impl Adapter for Atlantis {
         // No BM25 yet: the text half of the hybrid query is skipped (reported
         // through `hybrid_text: false`).
         let cypher = format!(
-            "{} YIELD node, score \
-             WITH node, score WHERE node.user = $u \
-             WITH node, score ORDER BY score DESC LIMIT {k} \
+            "{} WITH node, score \
              MATCH (node)-[:PART_OF]->(d:Doc) \
              OPTIONAL MATCH (node)-[:MENTIONS]->(:Entity)-[:RELATED]->(r:Entity) \
              RETURN id(node) AS id, d.title AS title, node.text AS text, score, \
                     collect(DISTINCT r.name) AS context",
-            self.search_call(k * self.overfetch)
+            self.filtered(k)
         );
         let rs = block_on(self.engine().execute(&cypher, &params(q)))?;
         Ok(rs.row_count())
