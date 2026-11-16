@@ -10,7 +10,7 @@ use crate::keys::KeyRange;
 use crate::kv::{Isolation, KvPair, KvStore, KvTransaction, TxMode, Versionstamp};
 use crate::wal::{self, SyncMode};
 
-use super::inner::{visible_at, Inner};
+use super::inner::Inner;
 use super::store::MemStore;
 use super::Writes;
 
@@ -68,6 +68,7 @@ pub(super) struct MemTransaction {
 }
 
 impl MemTransaction {
+    #[inline]
     fn check_open(&self) -> Result<(), AtlantisError> {
         if self.finished {
             Err(AtlantisError::TxFinished)
@@ -84,6 +85,7 @@ impl MemTransaction {
         Ok(())
     }
 
+    #[inline]
     fn tracks_reads(&self) -> bool {
         self.isolation == Isolation::Serializable && self.mode == TxMode::ReadWrite
     }
@@ -194,12 +196,19 @@ impl MemTransaction {
                 ));
             }
             for range in &self.scans {
-                let bounds = key_bounds(range);
+                let bounds = (
+                    Bound::Included(range.start.clone()),
+                    Bound::Excluded(range.end.clone()),
+                );
                 if inner
                     .data
-                    .range::<[u8], _>(bounds)
+                    .range::<Vec<u8>, _>(bounds.clone())
                     .any(|(_, versions)| versions.last().is_some_and(|(v, _)| *v > self.snapshot))
-                    || inner.pending_keys.range::<[u8], _>(bounds).next().is_some()
+                    || inner
+                        .pending_keys
+                        .range::<Vec<u8>, _>(bounds)
+                        .next()
+                        .is_some()
                 {
                     return Some("a range scanned by this transaction changed".into());
                 }
@@ -207,15 +216,6 @@ impl MemTransaction {
         }
         None
     }
-}
-
-/// The half-open bounds `[start, end)` of `range`, borrowed so that range
-/// lookups need not copy the keys.
-fn key_bounds(range: &KeyRange) -> (Bound<&[u8]>, Bound<&[u8]>) {
-    (
-        Bound::Included(range.start.as_slice()),
-        Bound::Excluded(range.end.as_slice()),
-    )
 }
 
 fn escape(key: &[u8]) -> String {
@@ -231,7 +231,7 @@ impl KvTransaction for MemTransaction {
         if let Some(local) = self.writes.get(key) {
             return Ok(local.clone());
         }
-        if self.tracks_reads() && !self.reads.contains(key) {
+        if self.tracks_reads() {
             self.reads.insert(key.to_vec());
         }
         let inner = self.store.read()?;
@@ -275,13 +275,21 @@ impl KvTransaction for MemTransaction {
             let inner = self.store.read()?;
             inner
                 .data
-                .range::<[u8], _>(key_bounds(range))
-                .filter_map(|(k, versions)| {
-                    visible_at(versions, self.snapshot).map(|v| (k.clone(), v.clone()))
+                .range::<Vec<u8>, _>((
+                    Bound::Included(range.start.clone()),
+                    Bound::Excluded(range.end.clone()),
+                ))
+                .filter_map(|(k, _)| {
+                    inner
+                        .read_at(k, self.snapshot)
+                        .map(|v| (k.clone(), v.clone()))
                 })
                 .collect()
         };
-        let local = self.writes.range::<[u8], _>(key_bounds(range));
+        let local = self.writes.range::<Vec<u8>, _>((
+            Bound::Included(range.start.clone()),
+            Bound::Excluded(range.end.clone()),
+        ));
         for (k, v) in local {
             match v {
                 Some(v) => merged.insert(k.clone(), v.clone()),

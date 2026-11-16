@@ -33,10 +33,12 @@ impl MemStore {
         Self::default()
     }
 
+    #[inline]
     pub(super) fn read(&self) -> Result<RwLockReadGuard<'_, Inner>, AtlantisError> {
         self.inner.read().map_err(|_| poisoned())
     }
 
+    #[inline]
     pub(super) fn write(&self) -> Result<RwLockWriteGuard<'_, Inner>, AtlantisError> {
         self.inner.write().map_err(|_| poisoned())
     }

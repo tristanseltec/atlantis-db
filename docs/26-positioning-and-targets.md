@@ -143,7 +143,7 @@ Findings:
 
 1. **HNSW recall collapses with size — fixed.** Recall@10 was 1.00 at 5,000 × 768 but
    0.22 at 20,000 × 768, and raising `efSearch` did not help while latency fell: search
-   visited fewer nodes as the index grew. Causes in `crates/atlantis-vector/src/hnsw.rs`:
+   visited fewer nodes as the index grew. Causes in `crates/atlantis-vector/src/hnsw/`:
    edges were stored undirected and pruning removed both directions, so nodes lost all
    links; neighbours were chosen without the diversity heuristic, which cut links
    between clusters; the insert-time descent compared neighbours with the current node

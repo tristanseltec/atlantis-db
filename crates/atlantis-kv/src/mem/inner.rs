@@ -1,7 +1,6 @@
 //! [`Inner`]: the versioned data, open snapshots and staged commits behind
 //! a [`MemStore`](super::MemStore), and its MVCC operations.
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use crate::kv::KvPair;
@@ -30,6 +29,7 @@ pub(super) struct Inner {
 }
 
 impl Inner {
+    #[inline]
     pub(super) fn latest_version(&self, key: &[u8]) -> Option<u64> {
         self.data
             .get(key)
@@ -37,11 +37,19 @@ impl Inner {
             .map(|(v, _)| *v)
     }
 
+    #[inline]
     pub(super) fn read_at(&self, key: &[u8], snapshot: u64) -> Option<&Vec<u8>> {
-        visible_at(self.data.get(key)?, snapshot)
+        let versions = self.data.get(key)?;
+        versions
+            .iter()
+            .rev()
+            .find(|(v, _)| *v <= snapshot)?
+            .1
+            .as_ref()
     }
 
     /// Oldest version any open transaction may still read.
+    #[inline]
     pub(super) fn horizon(&self) -> u64 {
         self.active.keys().next().copied().unwrap_or(self.version)
     }
@@ -51,7 +59,11 @@ impl Inner {
         let Some(versions) = self.data.get_mut(key) else {
             return;
         };
-        if prune_versions(versions, horizon) {
+        // Keep the newest version at or below the horizon and everything newer.
+        if let Some(keep_from) = versions.iter().rposition(|(v, _)| *v <= horizon) {
+            versions.drain(..keep_from);
+        }
+        if versions.len() == 1 && versions[0].1.is_none() && versions[0].0 <= horizon {
             self.data.remove(key);
         }
     }
@@ -94,22 +106,11 @@ impl Inner {
             if self.pending_keys.get(&key) == Some(&version) {
                 self.pending_keys.remove(&key);
             }
-            // Same as push-then-`prune`, without cloning the key or looking
-            // it up a second time.
-            match self.data.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().push((version, value));
-                    if prune_versions(entry.get_mut(), horizon) {
-                        entry.remove();
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    let mut versions = vec![(version, value)];
-                    if !prune_versions(&mut versions, horizon) {
-                        entry.insert(versions);
-                    }
-                }
-            }
+            self.data
+                .entry(key.clone())
+                .or_default()
+                .push((version, value));
+            self.prune(&key, horizon);
         }
     }
 
@@ -127,6 +128,7 @@ impl Inner {
 
     /// The newest value of `key` committed or staged after `snapshot`, if
     /// any (`Some(None)`: deleted).
+    #[inline]
     pub(super) fn newer_than(&self, key: &[u8], snapshot: u64) -> Option<Option<&Vec<u8>>> {
         if let Some(v) = self.pending_keys.get(key) {
             return self
@@ -147,27 +149,4 @@ impl Inner {
             }
         }
     }
-}
-
-/// The value a snapshot at `snapshot` sees among one key's `versions`:
-/// the newest version at or below it (`None` if there is none, or if it is
-/// a deletion).
-pub(super) fn visible_at(versions: &[Version], snapshot: u64) -> Option<&Vec<u8>> {
-    versions
-        .iter()
-        .rev()
-        .find(|(v, _)| *v <= snapshot)?
-        .1
-        .as_ref()
-}
-
-/// Drops the versions in `versions` that no snapshot at or after `horizon`
-/// can see: keeps the newest version at or below the horizon and everything
-/// newer. Returns `true` if what is left is a single deletion that no
-/// snapshot needs, so the key itself can be removed.
-fn prune_versions(versions: &mut Vec<Version>, horizon: u64) -> bool {
-    if let Some(keep_from) = versions.iter().rposition(|(v, _)| *v <= horizon) {
-        versions.drain(..keep_from);
-    }
-    versions.len() == 1 && versions[0].1.is_none() && versions[0].0 <= horizon
 }

@@ -85,7 +85,7 @@ Record keys are built from a `RecordId` (`table` + `key`); see [03 — Data Mode
 
 ### Record store and edge store (Implemented — schema and indexes Phase 2)
 
-`RecordStore` and `RecordTx` ([`crates/atlantis-storage/src/records.rs`](../crates/atlantis-storage/src/records.rs)) store records and edges on `atlantis-kv`. A `RecordTx` works in one namespace and database. Its method list is in [21 — API Reference](21-api-reference.md#record-transactions).
+`RecordStore` and `RecordTx` ([`crates/atlantis-storage/src/records/`](../crates/atlantis-storage/src/records/)) store records and edges on `atlantis-kv`. A `RecordTx` works in one namespace and database. Its method list is in [21 — API Reference](21-api-reference.md#record-transactions).
 
 - **Tables.** A table is created implicitly, schemaless, on its first write, or explicitly with `define_table`. A table is either `Normal` or `Edge { from, to }`, where non-empty `from` / `to` lists restrict the endpoint tables. Field schemas are Phase 2 ([07 — Schema & DDL](07-schema-ddl.md)).
 - **Nodes.** A node is a record under `r/` in the table named by its first label. A node without labels goes into the reserved table `_default`. Secondary labels are stored with the record and get one `lb/` entry each, so a label lookup is a prefix scan. `set_labels` adds and removes secondary labels; a record's table label cannot be removed.
@@ -105,7 +105,7 @@ Cypher runs on this layout today. Generalising it to typed fields and secondary 
 | `rocksdb` | `rocksdb://path` | Default persistent backend, embedded and single-node server | Phase 1 |
 | `tikv` | `tikv://pd1:2379,pd2:2379` | Distributed cluster of stateless compute nodes | Phase 7 |
 
-- **`mem`** ([`crates/atlantis-kv/src/mem.rs`](../crates/atlantis-kv/src/mem.rs)) keeps an ordered in-memory map with MVCC versions and prunes versions that no open snapshot can read. An engine with a `disk_path` opens it durably with a write-ahead log (next section); an in-memory engine writes nothing to disk.
+- **`mem`** ([`crates/atlantis-kv/src/mem/`](../crates/atlantis-kv/src/mem/)) keeps an ordered in-memory map with MVCC versions and prunes versions that no open snapshot can read. An engine with a `disk_path` opens it durably with a write-ahead log (next section); an in-memory engine writes nothing to disk.
 - **`rocksdb`** is an LSM-tree with its own write-ahead log. Its sync mode controls the durability window ([05 — Transactions & Consistency](05-transactions-consistency.md)).
 - **`tikv`** provides Raft replication and distributed transactions; see [20 — Distributed Architecture](20-distributed-architecture.md).
 
@@ -122,7 +122,7 @@ A database directory holds:
 
 The frame format and the full protocol are documented in
 [`crates/atlantis-kv/src/wal.rs`](../crates/atlantis-kv/src/wal.rs) and
-[`mem.rs`](../crates/atlantis-kv/src/mem.rs). In short:
+[`mem/`](../crates/atlantis-kv/src/mem/). In short:
 
 - **Commit (group commit).** Under the store-wide write lock a commit is *staged*:
   validated against visible and staged commits, given the next version, and its log

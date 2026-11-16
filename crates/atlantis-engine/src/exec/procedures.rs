@@ -88,30 +88,31 @@ impl Exec<'_> {
                 "db.vector.search: the first argument is an index name",
             ));
         };
-        let def =
-            match self.tx.vector_index(target)? {
-                Some(def) => def,
-                // A label is accepted when exactly one index covers it.
-                None => {
-                    let matching: Vec<VectorIndexDef> = self
-                        .tx
-                        .vector_indexes()?
-                        .into_iter()
-                        .filter(|d| &d.label == target)
-                        .collect();
-                    match matching.as_slice() {
-                        [one] => one.clone(),
-                        [] => return Err(invalid(format!(
+        let def = match self.tx.vector_index(target)? {
+            Some(def) => def,
+            // A label is accepted when exactly one index covers it.
+            None => {
+                let matching: Vec<VectorIndexDef> = self
+                    .tx
+                    .vector_indexes()?
+                    .into_iter()
+                    .filter(|d| &d.label == target)
+                    .collect();
+                match matching.as_slice() {
+                    [one] => one.clone(),
+                    [] => {
+                        return Err(invalid(format!(
                             "no vector index named {target} (create one with CREATE VECTOR INDEX)"
-                        ))),
-                        _ => {
-                            return Err(invalid(format!(
-                                "several vector indexes cover label {target}; use the index name"
-                            )))
-                        }
+                        )))
+                    }
+                    _ => {
+                        return Err(invalid(format!(
+                            "several vector indexes cover label {target}; use the index name"
+                        )))
                     }
                 }
-            };
+            }
+        };
         let query = as_vector(&args[1])
             .ok_or_else(|| invalid("db.vector.search: the second argument must be a vector"))?;
         let k = match &args[2] {

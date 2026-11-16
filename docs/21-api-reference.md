@@ -77,7 +77,7 @@ the `RecordId` ([06 — Query Language](06-query-language.md#results)).
 ### Transactions
 
 **Files:** [`crates/atlantis-db/src/engine.rs`](../crates/atlantis-db/src/engine.rs),
-[`crates/atlantis-storage/src/records.rs`](../crates/atlantis-storage/src/records.rs)
+[`crates/atlantis-storage/src/records/`](../crates/atlantis-storage/src/records/)
 
 The closure passed to `transaction`, `transaction_with_retry` or `read` receives a
 `&mut Transaction` scoped to the handle's current database. `Transaction` dereferences
@@ -101,7 +101,7 @@ has a retry example.
 
 ### Record transactions
 
-**File:** [`crates/atlantis-storage/src/records.rs`](../crates/atlantis-storage/src/records.rs)
+**File:** [`crates/atlantis-storage/src/records/`](../crates/atlantis-storage/src/records/)
 
 The `RecordTx` methods, reached through `Transaction`, are synchronous and return
 `Result<_, AtlantisError>`. The storage layout behind these methods is in

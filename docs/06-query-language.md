@@ -84,7 +84,7 @@ and a script that ends inside an open `BEGIN` is rolled back with an error.
 | `CASE` (simple and searched) | Implemented |
 | List comprehension `[x IN list WHERE p \| expr]` | Implemented |
 | Aggregates `count`, `count(*)`, `sum`, `avg`, `min`, `max`, `collect`, `stdev`, with `DISTINCT` | Implemented, with implicit grouping by the non-aggregate items |
-| Scalar functions | Implemented; the list is `call_function` in `crates/atlantis-engine/src/exec/eval.rs` |
+| Scalar functions | Implemented; the list is `call_function` in `crates/atlantis-engine/src/exec/eval/functions/` |
 
 Function names are case-insensitive and may be dotted (`db.vector.similarity`). Today's
 functions cover identity and structure (`id`, `elementId`, `rid`, `labels`, `type`,
