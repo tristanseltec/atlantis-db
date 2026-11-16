@@ -80,11 +80,14 @@ phase that delivers it.
 
 | # | Chapter | What it covers | Status |
 |---|---|---|---|
-| 25 | [Implementation Roadmap](25-implementation-roadmap.md) | Current status per crate and the phased plan to multi-model | — |
+| 25 | [Implementation Roadmap](25-implementation-roadmap.md) | Current status per crate, the focus-track priorities and the phased plan to multi-model | — |
+| 26 | [Positioning & Performance Targets](26-positioning-and-targets.md) | The killer feature, competitors, scope decisions, the retrieval benchmark, targets and today's baseline | Strategy |
+| 27 | [Commerce](27-commerce.md) | The first vertical: B2B and B2C, humans and agents; reference model, agent protocols, engine requirements, targets, stages | Strategy (C0–C4) |
 
 ## Reading Paths
 
 **Evaluating Atlantis DB.** [Getting Started](01-getting-started.md) →
+[Positioning & Performance Targets](26-positioning-and-targets.md) →
 [Architecture](02-architecture.md) → [Implementation Roadmap](25-implementation-roadmap.md).
 This shows what runs today and what is still a design.
 

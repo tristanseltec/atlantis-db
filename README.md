@@ -2,7 +2,9 @@
 
 # Atlantis DB
 
-**A multi-model database for AI-native applications, built in Rust, queried with one language: Atlantis Cypher.**
+**The embedded Cypher database for agent memory and GraphRAG, built in Rust.**
+
+Filtered vector search, full-text ranking and graph expansion in one query, on one ACID snapshot, in your process.
 
 </div>
 
@@ -39,6 +41,56 @@ languages. Atlantis DB keeps all of it in one transactional store with one query
 language, so a single query can find semantically similar chunks, rank them with
 full-text relevance, follow graph relationships and filter on document fields.
 
+### The focus: transactional hybrid retrieval
+
+Agents write and read memory in tight loops, under per-user filters, and need the graph
+context around what they find. Atlantis DB is built to answer that one query better
+than anything else:
+
+1. **Filtered vector search** where the filter (user, tenant, ACL, time) is applied
+   *during* the HNSW search, so recall holds even when 1% of the data matches.
+2. **BM25 full-text search**, fused with the vector hits by reciprocal rank fusion.
+3. **Graph expansion** of one to three hops from the fused hits.
+4. **One MVCC snapshot with read-your-writes**: a memory written in a transaction can be
+   retrieved in that same transaction.
+
+Unfiltered vector search and graph expansion work today; filtering inside the search,
+BM25, fusion and read-your-writes search are the focus track. All of it runs embedded,
+from Rust and, through a planned package, from Python. See the
+[roadmap priorities](docs/25-implementation-roadmap.md#priorities).
+
+### How it compares
+
+| | Atlantis DB | SurrealDB | LadybugDB (Kuzu fork) | HelixDB | FalkorDB | Neo4j |
+|---|---|---|---|---|---|---|
+| Embedded library | Yes | Yes | Yes | No | No | No |
+| Standard Cypher | Yes | No (SurrealQL; GQL experimental) | Yes | No (HelixQL) | Yes | Yes |
+| Vector + full-text + graph in one query | Target | Yes | Via extensions | — | Yes | Yes |
+| Search visible in the writing transaction | Target | — | — | — | — | — |
+
+"—" means not verified yet; the benchmark harness checks each one. The full landscape,
+scope decisions and the benchmark are in
+[Positioning & Performance Targets](docs/26-positioning-and-targets.md).
+
+### First vertical: commerce for humans and agents
+
+Every commerce interaction asks one question: *what is the right thing for this buyer,
+under their constraints, and is it truly available at this price now?* Shoppers ask it
+through search; agents ask it through tool calls. Atlantis answers it in one
+transaction: semantic and part-number search, filtered to the buyer's contract and
+region, expanded through compatibility and substitution graphs, priced from the
+contract, with stock reserved on the same snapshot the answer came from.
+
+- **B2B first**, where per-account entitlements, exact part numbers and contract
+  pricing make filtered, transactional retrieval essential, and where procurement
+  agents are arriving.
+- **B2C next** on the same engine: visual search, buyer memory, the same agent gateway.
+- **Agents** connect through an MCP tool gateway, with ACP and UCP adapters on top.
+  An agent never quotes a price or stock level the database would not commit.
+
+Atlantis sits beside the platform of record (Shopify, commercetools, SAP, an ERP); it
+does not replace it. See [Commerce](docs/27-commerce.md).
+
 ## Capabilities
 
 | Capability | Status |
@@ -49,13 +101,15 @@ full-text relevance, follow graph relationships and filter on document fields.
 | Transactions: Rust closures (`engine.transaction`, `read`, retry on conflict) with Cypher inside, and `BEGIN` / `COMMIT` scripts | Implemented |
 | Record model: namespaces, databases, tables, `RecordId`, nested documents, record links, edge tables, label index, extended value types | Implemented (`Decimal`, `Range` Phase 2) |
 | HNSW vector index: `CREATE VECTOR INDEX`, `db.vector.search` | Implemented (derived from records; filtering and quantization Phase 3) |
-| RocksDB backend, connection URLs, commit sequencer, query timeouts | Phase 1 |
+| **Hybrid retrieval:** filtered HNSW, BM25 full-text, `db.search.hybrid`, snapshot-consistent and read-your-writes search, persisted indexes, embedded Python package | **Focus track** (Phases 1–3) |
+| **Commerce engine features:** `Decimal`, bitmap facets, escrow stock reservations, multi-vector fusion, unique SKU constraints, MCP tool gateway | Commerce stages C1–C2 |
+| RocksDB backend, connection URLs, commit sequencer with group commit, query timeouts | Phase 1 |
 | Schema DDL, secondary indexes, constraints, cost-based optimizer | Phase 2 |
-| Full-text search, geospatial indexes, key-value API, time-series tables, shortest paths, graph algorithms | Phase 3 |
+| Shortest paths, graph algorithms | Phase 3 |
 | Change feeds, events, live queries | Phase 4 |
 | `atlantis` server, HTTP, WebSocket RPC, users, roles, permissions | Phase 5 |
-| SDKs (Rust remote, Python, JavaScript/TypeScript + WASM, Go, Java), optional Bolt | Phase 6 |
-| Distributed cluster over TiKV | Phase 7 |
+| Remote SDKs (Rust, Python, JavaScript/TypeScript + WASM) | Phase 6 |
+| Geospatial indexes, key-value API, time-series tables, Go and Java SDKs, Bolt, distributed cluster over TiKV | Deferred (designed, unscheduled) |
 
 ## Quick Start (Embedded)
 
@@ -149,11 +203,16 @@ RETURN node.text, score;
 CREATE TABLE Person SCHEMAFULL;
 CREATE FIELD email ON Person TYPE string ASSERT value =~ '.+@.+';
 
-// Phase 3 — hybrid full-text + vector search, then graph traversal
-CALL db.search.hybrid({text: 'doc_text', vector: 'chunk_embedding'},
-                      'graph database', $vec, 10) YIELD node, score
-MATCH (node)-[:PART_OF]->(d:Doc)
-RETURN d.title, score;
+// Focus track — write a memory, then retrieve it in the same transaction:
+// filtered hybrid search (filter pushed into the search), then graph context
+BEGIN;
+CREATE (:Memory {user: $user, text: $text, embedding: $vec});
+CALL db.search.hybrid({text: 'memory_text', vector: 'memory_vec'}, $q, $qvec, 10)
+  YIELD node, score
+  WHERE node.user = $user
+MATCH (node)-[:ABOUT]->(e:Entity)-[:RELATED*1..2]->(ctx)
+RETURN node.text, score, collect(DISTINCT ctx.name) AS context;
+COMMIT;
 
 // Phase 4 — live query
 LIVE MATCH (o:Order) WHERE o.status = 'open' RETURN o;
@@ -167,7 +226,7 @@ atlantis start --bind 0.0.0.0:7700 --user root --pass "$ATLANTIS_PASS" rocksdb:/
 ## Architecture
 
 ```
- Clients: Rust embedded | SDKs | CLI | HTTP | WebSocket RPC | Bolt
+ Clients: Rust embedded | Python embedded (planned) | SDKs | CLI | HTTP | WebSocket RPC
                          │
  atlantis-server (planned)      protocols, sessions, auth
  atlantis-engine                transactions, permissions, execution, live queries
@@ -184,17 +243,34 @@ modes and request flow are in [Architecture](docs/02-architecture.md).
 
 ## Performance Targets
 
-These are design targets, not measured results.
+Targets are measured by the planned **Atlantis Retrieval Bench**: 1M chunks with
+768-dimension embeddings, a 2M-edge graph, a per-user filter with 1% selectivity, and
+queries on 8 threads while 2,000 memories per second are written. Competitors run in the
+same harness on the same machine before any comparison is claimed.
 
-| Operation | Target |
+| Metric | Target |
 |---|---|
-| Point lookup (hot data) | < 1ms |
-| Graph traversal (hot data) | < 1ms |
-| Vector search (top-10 over 1M vectors) | < 10ms |
-| Vector ingestion | 100k+ vectors/sec |
-| Recall (HNSW, ef=200) | > 95% |
+| Hybrid query (filtered vector + BM25 + 2-hop expansion), p50 / p99 | ≤ 3 ms / ≤ 8 ms, and p99 at least 2x better than the best embedded competitor |
+| Filtered recall@10 at 1% selectivity | ≥ 0.95 |
+| Write → searchable | Same transaction |
+| Unfiltered vector top-10, 1M × 768 | ≤ 2 ms p50, recall@10 ≥ 0.95 |
+| Durable ingest (record + embedding + edges) | ≥ 50,000 records/s |
+| Open a 1M-vector database | < 1 s |
 
-Criterion benchmarks live in `benches/` and run with `cargo bench`.
+Baseline today (in-memory engine, 12-core Linux machine, short Criterion runs):
+
+| Benchmark | Mean |
+|---|---|
+| Record lookup by id | 1.5 µs |
+| Outgoing neighbours | 3.8 µs |
+| Cypher match by id | 9.3 µs |
+| Cypher two-hop traversal | 23.8 µs |
+| Cypher scan + filter + aggregate, 10k rows | 39.8 ms |
+| Vector top-10, 5k × 128 | 562 µs |
+
+Single-record paths are ready; vector search and scans are the gaps the focus track
+closes. Criterion benchmarks live in `benches/` and run with `cargo bench`. Details are
+in [Positioning & Performance Targets](docs/26-positioning-and-targets.md).
 
 ## Documentation
 
@@ -205,6 +281,26 @@ Start at the [documentation index](docs/README.md). Useful entry points:
 - [Data Model](docs/03-data-model.md)
 - [Query Language](docs/06-query-language.md)
 - [Implementation Roadmap](docs/25-implementation-roadmap.md)
+- [Positioning & Performance Targets](docs/26-positioning-and-targets.md)
+- [Commerce](docs/27-commerce.md)
+
+## Editions
+
+Atlantis DB is open core. **Everything in this repository is Apache-2.0 and stays that
+way**, including filtered hybrid search with read-your-writes and every engine feature
+the commerce product relies on.
+
+| | Community (this repository) | Enterprise and Commerce (planned, commercial) |
+|---|---|---|
+| Engine | Embedded Rust and Python, Cypher, transactions, vector, full-text, hybrid search, graph, single-node server | Replication and high availability, larger-than-memory vector indexes, tiered storage |
+| Security and data safety | Users and roles, write-ahead log, manual backup | SSO, SCIM, audit export, customer-managed keys, point-in-time recovery |
+| AI and operations | `EXPLAIN`, metrics endpoint | Managed embedding pipelines, relevance evaluation lab, agent memory service, query profiler, console |
+| Commerce | Reference schema, example queries | `commerce.*` procedures, platform connectors, ACP/UCP adapters, merchandising, analytics, agent audit trail |
+| Support | Community | SLAs, services, training |
+
+Paid features plug into open extension traits from a separate repository, so the core
+never carries licence checks, and data moves between editions without migration. See
+[Architecture § Editions](docs/02-architecture.md#editions-and-extension-points-planned).
 
 ## Contributing
 

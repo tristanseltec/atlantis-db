@@ -16,7 +16,7 @@ edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["Atlantis DB Contributors"]
-repository = "https://github.com/atlantis-db/atlantis-db"
+repository = "https://github.com/tristanseltec/atlantis-db"
 
 [workspace.dependencies]
 # Core dependencies

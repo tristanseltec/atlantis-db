@@ -99,6 +99,40 @@ plus re-exports of the record and transaction types (see
 | [20](20-distributed-architecture.md) | Phase 7 | Phase 7 |
 | [21](21-api-reference.md), [22](22-configuration.md), [23](23-query-cookbook.md), [24](24-rag-patterns.md) | Partial | Grow with every phase |
 
+## Priorities
+
+> Set 2026-11-16. Rationale and targets: [26 — Positioning & Performance Targets](26-positioning-and-targets.md).
+> Design: [02 — Architecture § Hybrid Retrieval Path](02-architecture.md#hybrid-retrieval-path-focus).
+
+The phases below stay the map, but work follows a **focus track** that cuts across
+them: the transactional hybrid retrieval path. In order:
+
+| # | Step | Draws from | Exit measure |
+|---|---|---|---|
+| F1 | **Atlantis Retrieval Bench**: dataset generator, exact filtered ground truth, adapters for SurrealDB (embedded), LadybugDB, FalkorDB, Neo4j and Qdrant + Neo4j; record the Atlantis baseline | — | Baseline committed; every later step reports against it |
+| F2 | **Vector core**: contiguous `f32` arena, SIMD distances, per-index locks, search on a query worker pool, SQ8 with re-rank | Phase 1, Phase 3 | Unfiltered top-10 over 1M × 768 ≤ 2 ms p50 at recall@10 ≥ 0.95 |
+| F3 | **Filtered search**: allow-set bitmaps, exact / filtered-traversal / post-filter strategies, `WHERE`-after-`YIELD` pushdown | Phase 2 (planner), Phase 3 | recall@10 ≥ 0.95 at 1% selectivity |
+| F4 | **Consistent search**: versioned index entries, transaction overlay (read-your-writes), index image at checkpoint | Phase 1, Phase 3 | A write is searchable in its own transaction; open of 1M vectors < 1 s |
+| F5 | **BM25 and fusion**: `atlantis-text`, `db.text.search`, `db.search.hybrid` with RRF, on the same snapshot | Phase 3 | Hybrid p50 / p99 ≤ 3 ms / ≤ 8 ms under mixed load |
+| F6 | **Group commit** in the commit sequencer | Phase 1 | Durable ingest ≥ 50,000 records/s |
+| F7 | **`atlantis-py`**: embedded Python package (PyO3, NumPy buffers, GIL released) | Ahead of Phase 6 | The RAG patterns in [24](24-rag-patterns.md) run from Python |
+| F8 | **Publish** the benchmark and results | — | Reproducible by a third party |
+
+The largest risk is F2: today's search is 5–10x off comparable HNSW libraries, so it is
+prototyped first after the harness.
+
+**Commerce stages** run alongside and after the focus track
+([27 — Commerce](27-commerce.md#stages)): C0 (dataset and labelled queries, with
+F1–F5), C1 read path (`Decimal`, bitmap facets, multi-vector fusion, unique
+constraints, read-only `atlantis-mcp`), C2 write path (escrow reservations, quotes,
+connectors, change feeds), C3 agent protocols and buyer memory, C4 design partners.
+Engine features they need land in the open core; the commercial crates are described in
+[02 — Architecture § Editions](02-architecture.md#editions-and-extension-points-planned).
+
+**Deferred (designed, unscheduled):** `atlantis-geo` and spatial indexes, the
+key-value API, time-series tables, the Go and Java SDKs, Bolt, and Phase 7. Their
+chapters stay as design; they are off the critical path until the focus track exits.
+
 ## Phased roadmap
 
 ### Dependency graph

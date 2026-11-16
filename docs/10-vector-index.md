@@ -227,6 +227,14 @@ after `YIELD` filters the `k` hits after the search, so fewer than `k` rows can 
 
 ### Persistence Through `atlantis-kv` (Planned — Phase 3)
 
+> **Revised 2026-11-16.** On local backends (`mem`, `rocksdb`) the focus-track design
+> replaces per-insert `vx/` writes with a checkpointed index image plus replay, and
+> adds versioned entries and a transaction overlay for snapshot-consistent,
+> read-your-writes search. Filtering is chosen per query between exact, filtered
+> traversal and post-filter. See
+> [02 — Architecture § Hybrid Retrieval Path](02-architecture.md#hybrid-retrieval-path-focus).
+> The `vx/` layout below stays the design for the distributed backend (Phase 7).
+
 Today each process rebuilds the graph from records. In the target design each named
 index stores its graph under the `vx/` prefix of its table in `atlantis-kv`
 ([04 — Storage Engine](04-storage-engine.md)):
