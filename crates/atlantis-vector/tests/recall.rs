@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 
-use atlantis_core::NodeId;
+use atlantis_core::{DistanceMetricKind, NodeId};
 use atlantis_vector::distance::{CosineDistance, DistanceMetric};
 use atlantis_vector::{HnswIndex, HnswParams};
 use rand::rngs::StdRng;
@@ -67,7 +67,7 @@ fn clustered(n: usize, queries: usize, seed: u64) -> (Vec<Vec<f32>>, Vec<Vec<f32
 }
 
 fn build(data: &[Vec<f32>]) -> HnswIndex {
-    let mut index = HnswIndex::new(HnswParams::default(), DIM, Box::new(CosineDistance));
+    let mut index = HnswIndex::new(HnswParams::default(), DIM, DistanceMetricKind::Cosine);
     for (i, v) in data.iter().enumerate() {
         index.insert(NodeId(i as u64), v.clone()).unwrap();
     }

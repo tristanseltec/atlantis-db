@@ -156,11 +156,21 @@ Findings:
    0.09, the ceiling for filtering after a 10× over-fetch at 1% selectivity
    (`benches/results/2026-11-16-small-mem-hnsw-fix.*`). The early exit had made the old
    search look fast; latency and build time (now 177 s) are the next F2 work.
-2. **Index build is about 4 ms per vector** at 768 dimensions, with cosine norms
-   recomputed on every distance call.
-3. **No concurrency.** Eight threads give 2–3x one thread, and a writer at 2,000/s
-   achieves 97/s, consistent with the single mutex shared by vector search and
-   index updates.
+2. **Index build was about 9 ms per vector** at 768 dimensions, with cosine norms
+   recomputed on every distance call, hash maps for links and visited sets, and scalar
+   distance loops. **Improved:** precomputed inverse norms, a contiguous vector arena,
+   flat layer-0 links, epoch-stamped visited arrays and AVX2/FMA kernels bring the build
+   to 21 s (about 1 ms per vector) and top-10 search to p50 0.27 ms / p99 0.63 ms at
+   recall@10 1.000 (`benches/results/2026-11-16-small-mem-f2-core.*`; measured on the
+   working tree on top of `ff0273a`, which the report names). Parallel build is next.
+3. **No concurrency.** Eight threads gave 2–3x one thread, and a writer at 2,000/s
+   achieved 97/s, consistent with the single mutex shared by vector search and index
+   updates. **Improved:** with one read-write lock per index, the 8-thread graph-RAG
+   query goes from 225 to 3,041 QPS on the same machine. The writer still reaches only
+   162/s of 2,000 under mixed load: each commit inserts into the graph under the
+   index's write lock (an `ef_construction` search per vector) after its own WAL fsync,
+   so write throughput waits for group commit (F6) and versioned entries applied off the
+   commit path (F4).
 4. **Filtering after the search** returns fewer than k rows for every query at 1%
    selectivity; F3 removes it.
 

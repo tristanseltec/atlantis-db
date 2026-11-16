@@ -1,16 +1,19 @@
-//! Compact vector storage for HNSW index.
+//! Compact vector storage for the HNSW index.
 
 use serde::{Deserialize, Serialize};
 
 use atlantis_core::{AtlantisError, NodeId};
 
-/// Compact storage for vectors with pre-allocation.
+/// Vectors of one dimensionality in a single contiguous `f32` arena.
 ///
-/// All vectors share the same dimensionality. Vectors are stored in a
-/// contiguous `Vec<Vec<f32>>` for cache-friendly access during HNSW search.
+/// Slot `i` occupies `data[i * dim .. (i + 1) * dim]`, so a graph search reads
+/// neighbouring vectors without chasing a pointer per vector. Ids are slot
+/// numbers; inserting at a sparse id leaves empty slots before it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VectorStore {
-    vectors: Vec<Vec<f32>>,
+    data: Vec<f32>,
+    present: Vec<bool>,
+    live: usize,
     dimensions: usize,
 }
 
@@ -18,78 +21,103 @@ impl VectorStore {
     /// Creates a new vector store with the given dimensionality.
     pub fn new(dimensions: usize) -> Self {
         VectorStore {
-            vectors: Vec::new(),
             dimensions,
+            ..Default::default()
         }
     }
 
-    /// Creates a new vector store with pre-allocated capacity.
+    /// Creates a new vector store with room for `capacity` vectors.
     pub fn with_capacity(dimensions: usize, capacity: usize) -> Self {
         VectorStore {
-            vectors: Vec::with_capacity(capacity),
+            data: Vec::with_capacity(dimensions * capacity),
+            present: Vec::with_capacity(capacity),
+            live: 0,
             dimensions,
         }
     }
 
-    /// Inserts a vector, returning its ID (sequential).
-    ///
-    /// Returns an error if the vector dimensionality doesn't match.
-    pub fn insert(&mut self, vector: Vec<f32>) -> Result<NodeId, AtlantisError> {
+    fn check(&self, vector: &[f32]) -> Result<(), AtlantisError> {
         if vector.len() != self.dimensions {
             return Err(AtlantisError::DimensionMismatch {
                 expected: self.dimensions,
                 actual: vector.len(),
             });
         }
-        let id = NodeId(self.vectors.len() as u64);
-        self.vectors.push(vector);
-        Ok(id)
-    }
-
-    /// Inserts a vector at a specific ID (for restoring from persistence).
-    pub fn insert_at(&mut self, id: NodeId, vector: Vec<f32>) -> Result<(), AtlantisError> {
-        if vector.len() != self.dimensions {
-            return Err(AtlantisError::DimensionMismatch {
-                expected: self.dimensions,
-                actual: vector.len(),
-            });
-        }
-        let idx = id.0 as usize;
-        if idx >= self.vectors.len() {
-            self.vectors.resize(idx + 1, Vec::new());
-        }
-        self.vectors[idx] = vector;
         Ok(())
     }
 
-    /// Returns the vector with the given ID.
-    pub fn get(&self, id: NodeId) -> Option<&[f32]> {
-        self.vectors.get(id.0 as usize).map(|v| v.as_slice())
+    /// Inserts a vector, returning its ID (the next slot).
+    ///
+    /// Returns an error if the vector dimensionality doesn't match.
+    pub fn insert(&mut self, vector: Vec<f32>) -> Result<NodeId, AtlantisError> {
+        self.check(&vector)?;
+        let id = NodeId(self.present.len() as u64);
+        self.write(id.0 as usize, &vector);
+        Ok(id)
     }
 
-    /// Removes a vector (sets to empty for tombstone-based deletion).
-    pub fn remove(&mut self, id: NodeId) {
-        if let Some(slot) = self.vectors.get_mut(id.0 as usize) {
-            slot.clear();
+    /// Inserts (or overwrites) a vector at a specific ID.
+    pub fn insert_at(&mut self, id: NodeId, vector: Vec<f32>) -> Result<(), AtlantisError> {
+        self.check(&vector)?;
+        self.write(id.0 as usize, &vector);
+        Ok(())
+    }
+
+    pub(crate) fn write(&mut self, idx: usize, vector: &[f32]) {
+        if idx >= self.present.len() {
+            self.present.resize(idx + 1, false);
+            self.data.resize((idx + 1) * self.dimensions, 0.0);
+        }
+        let d = self.dimensions;
+        self.data[idx * d..(idx + 1) * d].copy_from_slice(vector);
+        if !self.present[idx] {
+            self.present[idx] = true;
+            self.live += 1;
         }
     }
 
-    /// Returns `true` if the vector at this ID exists and is non-empty.
-    pub fn contains(&self, id: NodeId) -> bool {
-        self.vectors
-            .get(id.0 as usize)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
+    /// Returns the vector with the given ID.
+    #[inline]
+    pub fn get(&self, id: NodeId) -> Option<&[f32]> {
+        let idx = id.0 as usize;
+        if !*self.present.get(idx)? {
+            return None;
+        }
+        Some(self.slot(idx))
     }
 
-    /// Returns the number of active (non-empty) vectors.
+    /// The vector in slot `idx`, present or not (an empty slot reads as
+    /// zeros). For callers that already know the slot is present.
+    #[inline]
+    pub(crate) fn slot(&self, idx: usize) -> &[f32] {
+        let d = self.dimensions;
+        &self.data[idx * d..(idx + 1) * d]
+    }
+
+    /// Removes a vector; its slot stays allocated and reads as absent.
+    pub fn remove(&mut self, id: NodeId) {
+        if let Some(p) = self.present.get_mut(id.0 as usize) {
+            if *p {
+                *p = false;
+                self.live -= 1;
+            }
+        }
+    }
+
+    /// Returns `true` if a vector is stored under this ID.
+    #[inline]
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.present.get(id.0 as usize).copied().unwrap_or(false)
+    }
+
+    /// Returns the number of stored vectors.
     pub fn len(&self) -> usize {
-        self.vectors.iter().filter(|v| !v.is_empty()).count()
+        self.live
     }
 
     /// Returns `true` if there are no vectors.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.live == 0
     }
 
     /// Returns the dimensionality of stored vectors.
@@ -97,9 +125,9 @@ impl VectorStore {
         self.dimensions
     }
 
-    /// Returns the total capacity (including empty slots).
+    /// Returns the number of slots (including empty ones).
     pub fn capacity(&self) -> usize {
-        self.vectors.len()
+        self.present.len()
     }
 }
 

@@ -5,14 +5,18 @@
 //! that carry the index's label, and kept current after every commit by
 //! re-reading the records the commit changed. Searches see committed data
 //! only, not a transaction's own uncommitted writes.
+//!
+//! Locking: a short-lived mutex guards the map of built indexes; each index
+//! has its own read-write lock. Searches of one index run in parallel, and
+//! a commit blocks only the indexes of its database while it updates them.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use atlantis_core::{AtlantisError, DatabaseRef, DistanceMetricKind, NodeId, RecordId, Value};
 use atlantis_kv::{Isolation, TxMode};
 use atlantis_storage::{RecordStore, RecordTx, VectorIndexDef};
-use atlantis_vector::{distance::from_kind, HnswIndex, HnswParams};
+use atlantis_vector::{HnswIndex, HnswParams};
 
 /// A nearest-neighbour search request.
 #[derive(Debug, Clone)]
@@ -55,7 +59,7 @@ impl Built {
             ef_construction: def.ef_construction,
             ..defaults.clone()
         };
-        let hnsw = HnswIndex::new(params, def.dimension, from_kind(def.metric));
+        let hnsw = HnswIndex::new(params, def.dimension, def.metric);
         Built {
             def,
             hnsw,
@@ -127,10 +131,23 @@ impl Built {
     }
 }
 
+/// One index slot. `None` until the first search has built it; the builder
+/// holds the write lock from before the slot is published until the build
+/// is done, so no one sees a half-built index.
+type Slot = Arc<RwLock<Option<Built>>>;
+
+fn read(slot: &Slot) -> RwLockReadGuard<'_, Option<Built>> {
+    slot.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write(slot: &Slot) -> RwLockWriteGuard<'_, Option<Built>> {
+    slot.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// All built vector indexes of a datastore.
 pub struct VectorIndexes {
     defaults: HnswParams,
-    built: Mutex<HashMap<(DatabaseRef, String), Built>>,
+    built: Mutex<HashMap<(DatabaseRef, String), Slot>>,
 }
 
 impl VectorIndexes {
@@ -141,7 +158,7 @@ impl VectorIndexes {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(DatabaseRef, String), Built>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(DatabaseRef, String), Slot>> {
         self.built.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -165,25 +182,38 @@ impl VectorIndexes {
                 actual: query.len(),
             });
         }
-        let mut built = self.lock();
         let key = (db.clone(), def.name.clone());
-        if built.get(&key).is_none_or(|b| b.def != *def) {
-            // Build while holding the lock, so commits applied concurrently
-            // wait and then re-read the latest state.
-            let mut index = Built::new(def.clone(), &self.defaults);
-            let mut tx = store.begin(db.clone(), TxMode::ReadOnly, Isolation::Snapshot)?;
-            for record in tx.with_label(&def.label)? {
-                if let Some(vector) = index.vector_of(record.get(&def.field)) {
-                    let slot = index.next;
-                    index.next += 1;
-                    index.hnsw.insert(NodeId(slot), vector)?;
-                    index.slots.insert(record.id.to_string(), slot);
-                    index.records.insert(slot, record.id);
+        loop {
+            let slot = self.lock().get(&key).cloned();
+            if let Some(slot) = slot {
+                let guard = read(&slot);
+                match guard.as_ref() {
+                    Some(index) if index.def == *def => {
+                        return Self::search_built(index, query, k, ef_search, threshold);
+                    }
+                    // A failed build left the slot empty; build again.
+                    None => {}
+                    // Redefined: rebuild below.
+                    Some(_) => {}
                 }
             }
-            built.insert(key.clone(), index);
+            if let Some(result) = self.build(store, &key, def)? {
+                let guard = read(&result);
+                if let Some(index) = guard.as_ref().filter(|i| i.def == *def) {
+                    return Self::search_built(index, query, k, ef_search, threshold);
+                }
+            }
+            // Another thread replaced the slot meanwhile; look again.
         }
-        let index = built.get(&key).expect("just built");
+    }
+
+    fn search_built(
+        index: &Built,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+        threshold: Option<f64>,
+    ) -> Result<Vec<VectorHit>, AtlantisError> {
         let hits = index.hnsw.search(query, k, ef_search)?;
         Ok(hits
             .into_iter()
@@ -198,6 +228,77 @@ impl VectorIndexes {
             .collect())
     }
 
+    /// Builds the index for `key` from the records, publishing a new slot.
+    ///
+    /// The new slot is write-locked before it is published (under the map
+    /// lock), so a commit applied concurrently waits for the build and then
+    /// re-reads the records it changed; a commit that finished before the
+    /// build's snapshot is already in it. Returns the slot, or `None` if
+    /// another thread published a matching index first.
+    fn build(
+        &self,
+        store: &RecordStore,
+        key: &(DatabaseRef, String),
+        def: &VectorIndexDef,
+    ) -> Result<Option<Slot>, AtlantisError> {
+        let slot: Slot = Arc::new(RwLock::new(None));
+        let mut guard = write(&slot);
+        {
+            let mut map = self.lock();
+            if let Some(existing) = map.get(key).cloned() {
+                // Someone else may have built it while we waited.
+                let current = match existing.try_read() {
+                    Ok(g) => Some(g.as_ref().is_some_and(|b| b.def == *def)),
+                    Err(_) => None,
+                };
+                match current {
+                    Some(true) => return Ok(Some(existing)),
+                    // Outdated or failed: replace it below.
+                    Some(false) => {}
+                    // Being built or updated right now: wait for it.
+                    None => {
+                        drop(map);
+                        drop(guard);
+                        let ok = read(&existing).as_ref().is_some_and(|b| b.def == *def);
+                        return Ok(ok.then_some(existing));
+                    }
+                }
+            }
+            map.insert(key.clone(), slot.clone());
+        }
+        let mut index = Built::new(def.clone(), &self.defaults);
+        let built = (|| {
+            let mut tx = store.begin(key.0.clone(), TxMode::ReadOnly, Isolation::Snapshot)?;
+            let records = tx.with_label(&def.label)?;
+            index.hnsw.reserve(records.len());
+            for record in records {
+                if let Some(vector) = index.vector_of(record.get(&def.field)) {
+                    let slot = index.next;
+                    index.next += 1;
+                    index.hnsw.insert(NodeId(slot), vector)?;
+                    index.slots.insert(record.id.to_string(), slot);
+                    index.records.insert(slot, record.id);
+                }
+            }
+            Ok::<(), AtlantisError>(())
+        })();
+        match built {
+            Ok(()) => {
+                *guard = Some(index);
+                drop(guard);
+                Ok(Some(slot))
+            }
+            Err(e) => {
+                drop(guard);
+                let mut map = self.lock();
+                if map.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
+                    map.remove(key);
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Updates built indexes of `db` after a commit changed `changed`.
     pub fn apply(
         &self,
@@ -208,28 +309,50 @@ impl VectorIndexes {
         if changed.is_empty() {
             return Ok(());
         }
-        let mut built = self.lock();
-        if !built.keys().any(|(d, _)| d == db) {
+        let slots: Vec<((DatabaseRef, String), Slot)> = self
+            .lock()
+            .iter()
+            .filter(|((d, _), _)| d == db)
+            .map(|(k, s)| (k.clone(), s.clone()))
+            .collect();
+        if slots.is_empty() {
             return Ok(());
         }
-        let result = (|| {
-            let mut tx = store.begin(db.clone(), TxMode::ReadOnly, Isolation::Snapshot)?;
-            for ((d, _), index) in built.iter_mut() {
-                if d != db {
-                    continue;
-                }
-                for id in changed {
-                    index.refresh(&mut tx, id)?;
-                }
+        let mut tx = match store.begin(db.clone(), TxMode::ReadOnly, Isolation::Snapshot) {
+            Ok(tx) => tx,
+            Err(e) => {
+                self.forget(&slots);
+                return Err(e);
             }
-            Ok::<(), AtlantisError>(())
-        })();
-        // Stale or degraded indexes are dropped and rebuilt on next search.
-        match result {
-            Ok(()) => built.retain(|(d, _), index| d != db || !index.needs_rebuild()),
-            Err(_) => built.retain(|(d, _), _| d != db),
+        };
+        let mut stale = Vec::new();
+        let mut first_err = None;
+        for (key, slot) in &slots {
+            let mut guard = write(slot);
+            let Some(index) = guard.as_mut() else {
+                continue;
+            };
+            let result = changed.iter().try_for_each(|id| index.refresh(&mut tx, id));
+            // Stale or degraded indexes are dropped and rebuilt on next search.
+            if result.is_err() || index.needs_rebuild() {
+                stale.push((key.clone(), slot.clone()));
+            }
+            if let Err(e) = result {
+                first_err.get_or_insert(e);
+            }
         }
-        result
+        self.forget(&stale);
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// Drops the given slots from the map, unless they were replaced.
+    fn forget(&self, slots: &[((DatabaseRef, String), Slot)]) {
+        let mut map = self.lock();
+        for (key, slot) in slots {
+            if map.get(key).is_some_and(|s| Arc::ptr_eq(s, slot)) {
+                map.remove(key);
+            }
+        }
     }
 
     /// Forgets a built index (after it was dropped or redefined).

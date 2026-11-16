@@ -52,8 +52,8 @@ There is no actor, no command channel and no tokio task of its own.
   store-wide lock in `MemStore`.
 - **The async API is synchronous inside.** The `async` methods of `Engine` do their work
   on the calling task before returning: query execution, the WAL fsync of every commit,
-  and the first-search build of a vector index, which holds the mutex shared by all
-  vector indexes. A heavy call therefore blocks its tokio worker thread. For large
+  and the first-search build of a vector index, which holds that index's write lock
+  (searches of the index wait for it; other indexes do not). A heavy call therefore blocks its tokio worker thread. For large
   workloads, call the engine from `tokio::task::spawn_blocking` or from a dedicated
   runtime. Moving this work off the async executor is planned.
 - **No query limits.** There are no per-query row or time limits; unbounded
