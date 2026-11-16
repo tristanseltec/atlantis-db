@@ -39,6 +39,11 @@ them and three permission models. **Atlantis DB makes it one query, one transact
 one library.** The query above is the target design; [what runs today](#status) is
 listed below.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/one-query.dark.svg">
+  <img alt="Today: an agent queries a vector store, a search engine and a graph database over the network, with sync jobs between them. With Atlantis DB: one Cypher query runs vector, keyword and graph retrieval on one MVCC snapshot inside your process." src="docs/assets/one-query.light.svg" width="100%">
+</picture>
+
 ## Why Atlantis DB
 
 | | |
@@ -71,8 +76,8 @@ built in the open, and this is the best time to shape them.
 | Embedded engine, in memory or on disk with a write-ahead log and crash recovery | Filtered HNSW (filter inside the search) |
 | MVCC transactions: snapshot and serializable isolation, retry on conflict | BM25 full-text and `db.search.hybrid` with rank fusion |
 | Cypher: `MATCH` (multi-hop, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation, `BEGIN`/`COMMIT` | Snapshot-consistent, read-your-writes search |
-| Record model: namespaces, tables, documents, record links, edge tables | Fast vector core: SIMD, contiguous storage, quantization, persisted indexes |
-| HNSW vector index with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package |
+| Record model: namespaces, tables, documents, record links, edge tables | Faster vector core: parallel build, quantization, persisted indexes |
+| HNSW vector index (SIMD kernels, per-index locks) with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package |
 | Retrieval Bench harness with exact ground truth | Competitor adapters for the benchmark |
 
 The full plan is in the [Implementation Roadmap](docs/25-implementation-roadmap.md).
@@ -152,7 +157,31 @@ cargo run --release -p atlantis-retrieval-bench -- --scale small --out benches/r
 
 It has already earned its keep. The first run found HNSW recall@10 of **0.22** at
 20,000 × 768. The cause was a graph-connectivity bug, now fixed and pinned by
-regression tests: **recall@10 is 1.00**.
+regression tests: **recall@10 is 1.00**. The next step (F2) made the vector core fast
+without giving any of that recall back:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/bench-f2.dark.svg">
+  <img alt="F2 vector core, before and after, at 20,000 × 768: index build 185.8 s to 20.9 s (8.9× faster); vector top-10 p50 1.87 ms to 0.27 ms (6.9× faster); graph-RAG on 8 threads 225 to 3,041 QPS (13.5×). Recall@10 stays 1.000." src="docs/assets/bench-f2.light.svg" width="100%">
+</picture>
+
+<details>
+<summary>The numbers as a table</summary>
+
+| Retrieval Bench, small (20,000 × 768), in memory | Before (`8a66a87`) | After (F2) |
+|---|---|---|
+| Index build | 185.8 s | 20.9 s |
+| Vector top-10, p50 / p99 | 1.87 / 2.90 ms | 0.27 / 0.63 ms |
+| Recall@10 | 1.000 | 1.000 |
+| Graph-RAG, 8 threads | 225 QPS | 3,041 QPS |
+| Graph-RAG, 8 threads + writes | 167 QPS | 1,411 QPS |
+
+Full report: [`benches/results/2026-11-16-small-mem-f2-core.md`](benches/results/2026-11-16-small-mem-f2-core.md).
+
+</details>
+
+What's left before the targets below: parallel index build, filtered search (F3),
+and getting writes off the search path (F4, F6).
 
 | Target (1M chunks × 768, 1% filter, 8 threads under write load) | Goal |
 |---|---|
@@ -167,6 +196,11 @@ Current numbers and the gaps between them and the targets are tracked in
 [docs/26](docs/26-positioning-and-targets.md#retrieval-bench-baseline-2026-11-16).
 
 ## Roadmap
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/roadmap.dark.svg">
+  <img alt="Focus track: F1 Retrieval Bench and F2 vector core partly done; F3 filtered search next; F4 consistent search, F5 BM25 and fusion, F6 group commit, F7 Python package and F8 publish results designed." src="docs/assets/roadmap.light.svg" width="100%">
+</picture>
 
 | Step | What | Status |
 |---|---|---|
@@ -227,16 +261,10 @@ and want a say in what gets built, open an issue and tell us about your workload
 
 ## Architecture at a glance
 
-```
- Rust embedded · Python embedded (planned) · server and SDKs (planned)
-                              │
- atlantis-engine    transactions, execution, derived indexes
- atlantis-cypher    hand-written parser; planner (planned)
- index layer        atlantis-vector (HNSW) · atlantis-text (BM25, planned)
- atlantis-storage   records, edges, adjacency
- atlantis-kv        ordered transactional KV, MVCC, write-ahead log
- atlantis-core      values, record ids, errors, config
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture.dark.svg">
+  <img alt="Layers, top to bottom: Rust embedded API (Python and server planned); atlantis-engine; atlantis-cypher; atlantis-vector and atlantis-text (planned); atlantis-storage; atlantis-kv; atlantis-core." src="docs/assets/architecture.light.svg" width="100%">
+</picture>
 
 The design (hybrid retrieval path, commerce layer, editions) is in
 [Architecture](docs/02-architecture.md). All documentation starts at the
