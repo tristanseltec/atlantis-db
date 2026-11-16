@@ -269,9 +269,9 @@ Baseline today (in-memory engine, 12-core Linux machine, short Criterion runs):
 | Vector top-10, 5k × 128 | 562 µs |
 
 The first [Retrieval Bench](benches/retrieval/README.md) run (20,000 chunks × 768)
-found HNSW recall@10 of 0.22, filtered recall@10 of 0.04, an 85 s index build and no
-write throughput under concurrent search: a graph-connectivity bug and the missing
-filtered search are the first fixes. Single-record paths are ready; vector search and
+found HNSW recall@10 of 0.22 from a graph-connectivity bug; with the fix it is 1.00 at
+1.5 ms p50. Filtered recall (0.09, filtering after the search), index build time and
+write throughput under concurrent search are the next gaps. Single-record paths are ready; vector search and
 scans are the gaps the focus track closes. Criterion benchmarks live in `benches/` and run with `cargo bench`. Details are
 in [Positioning & Performance Targets](docs/26-positioning-and-targets.md).
 

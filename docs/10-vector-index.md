@@ -49,33 +49,42 @@ identical vectors give 0.0, orthogonal 1.0, opposite 2.0. A zero vector gives 1.
 
 **File:** [`crates/atlantis-vector/src/hnsw.rs`](../crates/atlantis-vector/src/hnsw.rs)
 
-`HnswIndex` holds one adjacency map per layer (`HashMap<NodeId, Vec<NodeId>>`), a
-`VectorStore`, the entry point (the node with the highest level), the current maximum
-level, the distance metric, and a `deleted` tombstone set.
+`HnswIndex` holds one adjacency map per layer (`HashMap<NodeId, Vec<NodeId>>`) of
+**directed** links, a `VectorStore`, the entry point (the node with the highest level),
+the current maximum level, the distance metric, and a `deleted` tombstone set. It
+follows Malkov & Yashunin (2018), Algorithms 1, 2 and 4.
 
 **Insertion** — `insert(node_id, vector)`. The caller supplies the ID.
 
-1. Validate dimensions against the index (`AtlantisError::DimensionMismatch`).
+1. Validate dimensions against the index (`AtlantisError::DimensionMismatch`). An ID
+   already in the index is rejected (`AtlantisError::InvalidValue`); the engine always
+   inserts a changed vector under a new slot.
 2. Store the vector at `node_id` in the `VectorStore`.
 3. Draw a level `floor(-ln(uniform(0,1)) * mL)` with `mL = 1/ln(m)`, capped at `max_level`.
 4. The first insert becomes the entry point.
-5. Otherwise, greedy-descend from the top layer to `level + 1`, then at each layer from
-   `level` down to 0 search with an `ef_construction` candidate pool, connect to `m`
-   neighbors (`m0` at layer 0) bidirectionally, and prune neighbors that exceed the limit.
+5. Otherwise, descend greedily (a layer search with `ef = 1` toward the new vector) from
+   the top layer to `level + 1`. At each layer from `level` down to 0, search with an
+   `ef_construction` pool and link to `m` neighbours chosen by the **diversity
+   heuristic**: a candidate is kept only if it is closer to the new node than to every
+   neighbour already kept, and free slots are filled with the closest discarded
+   candidates. Each chosen neighbour gets a reverse link; when its list exceeds its cap
+   (`m0` at layer 0, `m` above), that list alone is shrunk with the same heuristic.
+   Links *to* the neighbour are never removed.
 6. If the new level exceeds the current maximum, the node becomes the entry point.
 
 **Search** — `search(query, k, ef_search: Option<usize>)` returns `(NodeId, distance)`
-pairs sorted ascending. It greedy-descends to layer 1, searches layer 0 with
-`ef = ef_search.unwrap_or(params.ef_search).max(k)`, drops tombstoned and empty slots,
-then truncates to `k`.
+pairs sorted ascending. It descends greedily to layer 1, searches layer 0 best-first with
+`ef = ef_search.unwrap_or(params.ef_search).max(k)` (a min-heap of candidates and a
+max-heap of results), and truncates to `k`.
 
 **Threshold search** — `search_with_params(query, &SearchParams)` runs `search` and, when
 `score_threshold` is set, keeps results where `1.0 - distance >= threshold`. The engine
 does not use it: `db.vector.search` applies its threshold to a metric-aware score
 (below).
 
-**Deletion** — `remove(node_id)` adds a tombstone. Search filters tombstones; the vector
-and its edges stay in memory. The engine rebuilds an index from records once its
+**Deletion** — `remove(node_id)` adds a tombstone. The node stays in the graph as a
+waypoint: searches and inserts traverse it, so paths through it keep working, but it is
+never returned and never chosen as a new neighbour. Its vector and edges stay in memory. The engine rebuilds an index from records once its
 tombstones outnumber its live entries.
 
 ### VectorStore and SearchParams
@@ -111,9 +120,12 @@ options override `m` (with `m0 = 2 * m`) and `efConstruction` per index.
 Tuning: raise `ef_search` (100–200) and `m` (24–48) for recall; lower `ef_search` for
 latency; lower `ef_construction` for faster ingest; lower `m` (8–12) to save memory.
 
-The crate's recall test (`test_recall` in `hnsw.rs`) compares HNSW against brute force
-on 500 random 32-dimensional vectors with `ef_search = 100` and asserts average recall
-above 80%. No larger benchmark exists in the repository.
+The crate's recall tests compare HNSW against brute force. `test_recall` in `hnsw.rs`
+uses 500 random 32-dimensional vectors. `crates/atlantis-vector/tests/recall.rs` uses
+4,000 clustered vectors with a low intrinsic dimension, like real embeddings, where
+connectivity bugs show: it requires recall@10 ≥ 0.95, that ≥ 99.5% of nodes find
+themselves, and recall@10 ≥ 0.90 after deleting 30%. End-to-end recall and latency at
+larger scales come from the [Retrieval Bench](../benches/retrieval/README.md).
 
 ### Vector Index DDL
 

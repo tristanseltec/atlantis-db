@@ -141,13 +141,21 @@ results: `benches/results/2026-11-16-small-mem.{json,md}`.
 
 Findings:
 
-1. **HNSW recall collapses with size.** Recall@10 is 1.00 at 5,000 × 768 but 0.22 at
-   20,000 × 768 (0.84 at 20,000 × 64), and raising `efSearch` to 200 does not help
-   while latency falls. Search visits fewer nodes as the index grows, which points at
-   graph connectivity, not approximation: edges are stored undirected and pruning
-   removes both directions (`crates/atlantis-vector/src/hnsw.rs`, `prune_connections`),
-   and neighbours are chosen without the diversity heuristic, which fragments clustered
-   data. Fixing this is the first F2 task.
+1. **HNSW recall collapses with size — fixed.** Recall@10 was 1.00 at 5,000 × 768 but
+   0.22 at 20,000 × 768, and raising `efSearch` did not help while latency fell: search
+   visited fewer nodes as the index grew. Causes in `crates/atlantis-vector/src/hnsw.rs`:
+   edges were stored undirected and pruning removed both directions, so nodes lost all
+   links; neighbours were chosen without the diversity heuristic, which cut links
+   between clusters; the insert-time descent compared neighbours with the current node
+   instead of the new one, so it never moved; and search did not traverse deleted
+   nodes, so a deleted entry point could return nothing. The fix (directed edges,
+   heuristic selection with kept pruned connections, a correct descent, tombstones as
+   waypoints) is pinned by `crates/atlantis-vector/tests/recall.rs` (clustered data:
+   recall, reachability of every node, recall after 30% deletes). After the fix, the
+   same run gives **recall@10 1.000** at p50 1.53 ms / p99 2.56 ms, and filtered recall
+   0.09, the ceiling for filtering after a 10× over-fetch at 1% selectivity
+   (`benches/results/2026-11-16-small-mem-hnsw-fix.*`). The early exit had made the old
+   search look fast; latency and build time (now 177 s) are the next F2 work.
 2. **Index build is about 4 ms per vector** at 768 dimensions, with cosine norms
    recomputed on every distance call.
 3. **No concurrency.** Eight threads give 2–3x one thread, and a writer at 2,000/s
