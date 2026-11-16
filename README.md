@@ -2,119 +2,92 @@
 
 # Atlantis DB
 
-**The embedded Cypher database for agent memory and GraphRAG, built in Rust.**
+### The embedded Cypher database for agent memory and GraphRAG
 
-Filtered vector search, full-text ranking and graph expansion in one query, on one ACID snapshot, in your process.
+Filtered vector search, full-text ranking and graph expansion in **one query**,
+on **one ACID snapshot**, **inside your process**. Built in Rust.
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
+[![Status: pre-release](https://img.shields.io/badge/status-pre--release-yellow.svg)](docs/25-implementation-roadmap.md)
+[![Collaborators wanted](https://img.shields.io/badge/collaborators-wanted-brightgreen.svg)](#join-us)
+
+[Why Atlantis](#why-atlantis-db) · [Quick start](#quick-start) · [Benchmarks](#benchmarks) ·
+[Roadmap](#roadmap) · [Architecture](docs/02-architecture.md) · [**Join us**](#join-us)
 
 </div>
 
 ---
 
-Atlantis DB is being built as a multi-model database: graph, vector, document,
-relational, key-value, time-series, full-text and geospatial data in one engine, with
-live queries and events on top. Every model is stored as records in tables over one
-transactional key-value layer, and every model is queried with **Atlantis Cypher**:
-Cypher (following Neo4j 5 / openCypher / GQL syntax) plus extensions where Cypher has
-none. The same engine is designed to run embedded in an application, as a standalone
-server and as a distributed cluster.
+```cypher
+BEGIN;
+// An agent stores a memory...
+CREATE (:Memory {user: $user, text: $text, embedding: $vec});
 
-> **Project status:** pre-release. The code today is an embedded engine in seven crates
-> with one transactional record store (documents, graph nodes and edges in namespaced
-> tables) on an in-memory MVCC key-value layer made durable by a write-ahead log. Cypher
-> and the Rust record API read and write the same records. Everything not marked as
-> implemented below is target design, marked with the phase that delivers it. See the
-> [Implementation Roadmap](docs/25-implementation-roadmap.md).
+// ...and in the same transaction retrieves what matters for this user:
+// semantic + keyword search, filtered inside the index, then graph context.
+CALL db.search.hybrid({text: 'memory_text', vector: 'memory_vec'}, $q, $qvec, 10)
+  YIELD node, score
+  WHERE node.user = $user
+MATCH (node)-[:ABOUT]->(:Entity)-[:RELATED*1..2]->(ctx)
+RETURN node.text, score, collect(DISTINCT ctx.name) AS context;
+COMMIT;
+```
 
-Inspired by the best ideas from:
+Today that takes a vector store, a search engine, a graph database, sync jobs between
+them and three permission models. **Atlantis DB makes it one query, one transaction,
+one library.** The query above is the target design; [what runs today](#status) is
+listed below.
 
-- **Neo4j** — the property graph model and Cypher
-- **FalkorDB** — in-memory graph performance and simplicity
-- **ClickHouse** — analytical throughput and columnar efficiency
-- **SurrealDB** — the scope of a single multi-model, multi-deployment database
+## Why Atlantis DB
 
-## Why Atlantis DB?
-
-AI applications need relationships, embeddings, documents, text search and fresh data
-at the same time. Stitching a graph database, a vector store, a document store and a
-search engine together means sync jobs, duplicated permissions and several query
-languages. Atlantis DB keeps all of it in one transactional store with one query
-language, so a single query can find semantically similar chunks, rank them with
-full-text relevance, follow graph relationships and filter on document fields.
-
-### The focus: transactional hybrid retrieval
-
-Agents write and read memory in tight loops, under per-user filters, and need the graph
-context around what they find. Atlantis DB is built to answer that one query better
-than anything else:
-
-1. **Filtered vector search** where the filter (user, tenant, ACL, time) is applied
-   *during* the HNSW search, so recall holds even when 1% of the data matches.
-2. **BM25 full-text search**, fused with the vector hits by reciprocal rank fusion.
-3. **Graph expansion** of one to three hops from the fused hits.
-4. **One MVCC snapshot with read-your-writes**: a memory written in a transaction can be
-   retrieved in that same transaction.
-
-Unfiltered vector search and graph expansion work today; filtering inside the search,
-BM25, fusion and read-your-writes search are the focus track. All of it runs embedded,
-from Rust and, through a planned package, from Python. See the
-[roadmap priorities](docs/25-implementation-roadmap.md#priorities).
+| | |
+|---|---|
+| **One query, three retrieval modes** | Vector similarity, BM25 keyword ranking and multi-hop graph traversal compose in standard Cypher. No glue code, no second query language. |
+| **Filters that keep recall** | Per-user, per-tenant and ACL filters are applied *during* the HNSW search, so recall holds when only 1% of the data matches, the normal case for agent memory and B2B catalogs. |
+| **Search that obeys transactions** | Every index answers at the reader's MVCC snapshot and sees the transaction's own writes. An agent can read back what it just wrote, and never acts on a result the database would not commit. |
+| **Embedded first** | A Rust library today, a Python package next: no server, no network hop, no cluster to run. The same engine is designed to scale out to a server and a cluster later. |
+| **Open core, Apache-2.0** | The whole engine, including the hybrid retrieval path, is open source and stays that way. |
 
 ### How it compares
 
 | | Atlantis DB | SurrealDB | LadybugDB (Kuzu fork) | HelixDB | FalkorDB | Neo4j |
 |---|---|---|---|---|---|---|
-| Embedded library | Yes | Yes | Yes | No | No | No |
-| Standard Cypher | Yes | No (SurrealQL; GQL experimental) | Yes | No (HelixQL) | Yes | Yes |
+| Embedded library | **Yes** | Yes | Yes | No | No | No |
+| Standard Cypher | **Yes** | No (SurrealQL) | Yes | No (HelixQL) | Yes | Yes |
 | Vector + full-text + graph in one query | Target | Yes | Via extensions | — | Yes | Yes |
-| Search visible in the writing transaction | Target | — | — | — | — | — |
+| Search sees the writing transaction | **Target** | — | — | — | — | — |
 
-"—" means not verified yet; the benchmark harness checks each one. The full landscape,
-scope decisions and the benchmark are in
-[Positioning & Performance Targets](docs/26-positioning-and-targets.md).
+"—" means not verified yet. Every claim is checked in our public benchmark harness
+before it is made. See [Positioning & Performance Targets](docs/26-positioning-and-targets.md).
 
-### First vertical: commerce for humans and agents
+## Status
 
-Every commerce interaction asks one question: *what is the right thing for this buyer,
-under their constraints, and is it truly available at this price now?* Shoppers ask it
-through search; agents ask it through tool calls. Atlantis answers it in one
-transaction: semantic and part-number search, filtered to the buyer's contract and
-region, expanded through compatibility and substitution graphs, priced from the
-contract, with stock reserved on the same snapshot the answer came from.
+**Pre-release.** The foundations are real and tested. The headline features are being
+built in the open, and this is the best time to shape them.
 
-- **B2B first**, where per-account entitlements, exact part numbers and contract
-  pricing make filtered, transactional retrieval essential, and where procurement
-  agents are arriving.
-- **B2C next** on the same engine: visual search, buyer memory, the same agent gateway.
-- **Agents** connect through an MCP tool gateway, with ACP and UCP adapters on top.
-  An agent never quotes a price or stock level the database would not commit.
-
-Atlantis sits beside the platform of record (Shopify, commercetools, SAP, an ERP); it
-does not replace it. See [Commerce](docs/27-commerce.md).
-
-## Capabilities
-
-| Capability | Status |
+| Works today | In progress (focus track) |
 |---|---|
-| Embedded Rust library (`atlantis-db`) | Implemented (in-memory or a directory; one engine per directory) |
-| Cypher on the record store: `MATCH` (multi-hop, any direction, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation | Implemented |
-| Transactional KV layer (`atlantis-kv`), MVCC, snapshot and serializable isolation, write-ahead log with sync modes `every` / `never` | Implemented (in-memory `mem` backend) |
-| Transactions: Rust closures (`engine.transaction`, `read`, retry on conflict) with Cypher inside, and `BEGIN` / `COMMIT` scripts | Implemented |
-| Record model: namespaces, databases, tables, `RecordId`, nested documents, record links, edge tables, label index, extended value types | Implemented (`Decimal`, `Range` Phase 2) |
-| HNSW vector index: `CREATE VECTOR INDEX`, `db.vector.search` | Implemented (derived from records; filtering and quantization Phase 3) |
-| **Hybrid retrieval:** filtered HNSW, BM25 full-text, `db.search.hybrid`, snapshot-consistent and read-your-writes search, persisted indexes, embedded Python package | **Focus track** (Phases 1–3) |
-| **Commerce engine features:** `Decimal`, bitmap facets, escrow stock reservations, multi-vector fusion, unique SKU constraints, MCP tool gateway | Commerce stages C1–C2 |
-| RocksDB backend, connection URLs, commit sequencer with group commit, query timeouts | Phase 1 |
-| Schema DDL, secondary indexes, constraints, cost-based optimizer | Phase 2 |
-| Shortest paths, graph algorithms | Phase 3 |
-| Change feeds, events, live queries | Phase 4 |
-| `atlantis` server, HTTP, WebSocket RPC, users, roles, permissions | Phase 5 |
-| Remote SDKs (Rust, Python, JavaScript/TypeScript + WASM) | Phase 6 |
-| Geospatial indexes, key-value API, time-series tables, Go and Java SDKs, Bolt, distributed cluster over TiKV | Deferred (designed, unscheduled) |
+| Embedded engine, in memory or on disk with a write-ahead log and crash recovery | Filtered HNSW (filter inside the search) |
+| MVCC transactions: snapshot and serializable isolation, retry on conflict | BM25 full-text and `db.search.hybrid` with rank fusion |
+| Cypher: `MATCH` (multi-hop, variable length, paths), `OPTIONAL MATCH`, `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE`, `WITH`, `UNWIND`, `UNION`, aggregation, `BEGIN`/`COMMIT` | Snapshot-consistent, read-your-writes search |
+| Record model: namespaces, tables, documents, record links, edge tables | Fast vector core: SIMD, contiguous storage, quantization, persisted indexes |
+| HNSW vector index with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package |
+| Retrieval Bench harness with exact ground truth | Competitor adapters for the benchmark |
 
-## Quick Start (Embedded)
+The full plan is in the [Implementation Roadmap](docs/25-implementation-roadmap.md).
 
-Atlantis DB is not on crates.io yet. It needs Rust 1.89 or newer (the workspace's
-`rust-version`). Depend on the facade crate from a checkout:
+## Quick start
+
+Atlantis DB is not on crates.io yet. You need Rust 1.89 or newer.
+
+```bash
+git clone https://github.com/tristanseltec/atlantis-db
+cd atlantis-db
+cargo test --workspace
+```
+
+Use it from your project:
 
 ```toml
 [dependencies]
@@ -126,198 +99,165 @@ tokio = { version = "1", features = ["full"] }
 use atlantis_db::{Engine, Value};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::open("./my_atlantis_db").await?;
-
-    engine.execute("CREATE (p:Person {name: 'Alice', age: 34})", &[]).await?;
-
-    let result = engine.execute(
-        "MATCH (p:Person) WHERE p.name = $name RETURN p.age AS age",
-        &[("name", Value::from("Alice"))],
-    ).await?;
-
-    for row in result.rows() {
-        println!("age: {}", row.get_int("age").unwrap_or(0));
-    }
-
-    engine.shutdown().await?;
-    Ok(())
-}
-```
-
-The [Getting Started](docs/01-getting-started.md) guide lists what works today.
-
-### Records and transactions
-
-The Rust record API works on the same records as Cypher.
-
-```rust
-use atlantis_db::{Direction, Engine, Object, Value};
-
-#[tokio::main]
 async fn main() -> Result<(), atlantis_db::Error> {
     let engine = Engine::open("./my_atlantis_db").await?;
 
-    // One ACID transaction: commits on Ok, writes nothing on Err.
+    engine.execute(
+        "CREATE VECTOR INDEX doc_vec FOR (d:Doc) ON (d.embedding)
+         OPTIONS {dimension: 3, metric: 'cosine'}",
+        &[],
+    ).await?;
+    engine.execute(
+        "CREATE (:Doc {title: 'Graphs', embedding: $v})-[:CITES]->(:Doc {title: 'Vectors'})",
+        &[("v", Value::Vector(vec![0.9, 0.1, 0.0]))],
+    ).await?;
+
+    // Vector search, then follow the graph.
+    let rs = engine.execute(
+        "CALL db.vector.search('doc_vec', $q, 5) YIELD node, score
+         MATCH (node)-[:CITES]->(cited)
+         RETURN node.title AS doc, cited.title AS cites, score",
+        &[("q", Value::Vector(vec![1.0, 0.0, 0.0]))],
+    ).await?;
+    for row in rs.rows() {
+        println!("{:?} cites {:?}", row.get_string("doc"), row.get_string("cites"));
+    }
+
+    // The Rust record API and Cypher share one ACID store.
     engine.transaction(|tx| {
-        let mut alice = Object::new();
-        alice.insert("id".into(), Value::from("alice"));          // key: Person:alice
-        alice.insert("name".into(), Value::from("Alice"));
-        let alice = tx.create_node(&["Person"], alice)?;
-        let acme = tx.create("Company", None, vec![], Object::new())?; // ULID key
-        tx.relate(&alice.id, "WORKS_AT", &acme.id, Object::new())?;
+        let rs = tx.execute("MATCH (d:Doc) RETURN count(d) AS n", &[])?;
+        assert_eq!(rs.rows().next().and_then(|r| r.get_int("n")), Some(2));
         Ok(())
     }).await?;
 
-    let employers = engine.read(|tx| {
-        tx.neighbors(&"Person:alice".parse()?, Direction::Outgoing, Some("WORKS_AT"))
-    }).await?;
-    println!("{employers:?}");
-
-    // The same data through Cypher.
-    let rs = engine.execute("MATCH (:Person {id: 'alice'})-[:WORKS_AT]->(c) RETURN c", &[]).await?;
-    assert_eq!(rs.row_count(), 1);
-
-    engine.shutdown().await?; // optional: commits are already durable in records.wal
+    engine.shutdown().await?; // optional: commits are already durable
     Ok(())
 }
 ```
 
-See [API Reference](docs/21-api-reference.md) for the record API and
-[Transactions & Consistency](docs/05-transactions-consistency.md) for isolation,
-conflicts and durability.
+More in [Getting Started](docs/01-getting-started.md), the
+[API Reference](docs/21-api-reference.md) and the [Query Cookbook](docs/23-query-cookbook.md).
 
-## A Taste of Atlantis Cypher
+## Benchmarks
 
-```cypher
-// Implemented — documents, record links, traversal, vector search
-CREATE (o:Order {customer: rid('Customer', 'c-17'), address: {city: 'Hue'}});
-MATCH (o:Order) WHERE o.address.city = 'Hue' RETURN o.customer.name;
-MATCH (a:Person {id: 'alice'})-[:KNOWS*1..3]->(b) RETURN DISTINCT b.name;
-CREATE VECTOR INDEX chunk_embedding FOR (c:Chunk) ON (c.embedding)
-  OPTIONS {dimension: 1536, metric: 'cosine'};
-CALL db.vector.search('chunk_embedding', $vec, 10) YIELD node, score
-RETURN node.text, score;
-
-// Phase 2 — schema
-CREATE TABLE Person SCHEMAFULL;
-CREATE FIELD email ON Person TYPE string ASSERT value =~ '.+@.+';
-
-// Focus track — write a memory, then retrieve it in the same transaction:
-// filtered hybrid search (filter pushed into the search), then graph context
-BEGIN;
-CREATE (:Memory {user: $user, text: $text, embedding: $vec});
-CALL db.search.hybrid({text: 'memory_text', vector: 'memory_vec'}, $q, $qvec, 10)
-  YIELD node, score
-  WHERE node.user = $user
-MATCH (node)-[:ABOUT]->(e:Entity)-[:RELATED*1..2]->(ctx)
-RETURN node.text, score, collect(DISTINCT ctx.name) AS context;
-COMMIT;
-
-// Phase 4 — live query
-LIVE MATCH (o:Order) WHERE o.status = 'open' RETURN o;
-```
+We publish the harness, not just the numbers. The
+[**Atlantis Retrieval Bench**](benches/retrieval/README.md) generates a deterministic
+corpus, computes exact ground truth, and measures recall, latency, concurrency,
+mixed read/write load and read-your-writes. Each system declares what it does natively,
+so nothing is compared silently.
 
 ```bash
-# Phase 5 — standalone server on the default port 7700
-atlantis start --bind 0.0.0.0:7700 --user root --pass "$ATLANTIS_PASS" rocksdb://data
+cargo run --release -p atlantis-retrieval-bench -- --scale small --out benches/results
 ```
 
-## Architecture
+It has already earned its keep. The first run found HNSW recall@10 of **0.22** at
+20,000 × 768. The cause was a graph-connectivity bug, now fixed and pinned by
+regression tests: **recall@10 is 1.00**.
 
-```
- Clients: Rust embedded | Python embedded (planned) | SDKs | CLI | HTTP | WebSocket RPC
-                         │
- atlantis-server (planned)      protocols, sessions, auth
- atlantis-engine                transactions, permissions, execution, live queries
- atlantis-cypher                parser; planner and cost-based optimizer (planned)
- index layer                    atlantis-index · atlantis-vector · atlantis-text · atlantis-geo
- atlantis-storage               records, edges, adjacency cache (planned)
- atlantis-kv                    transactional ordered KV: mem (today) | rocksdb | tikv
- atlantis-core                  Value, RecordId, errors, config
-```
-
-Today the workspace contains `atlantis-core`, `atlantis-kv`, `atlantis-storage`,
-`atlantis-vector`, `atlantis-cypher`, `atlantis-engine` and `atlantis-db`. The full crate map, deployment
-modes and request flow are in [Architecture](docs/02-architecture.md).
-
-## Performance Targets
-
-Targets are measured by the planned **Atlantis Retrieval Bench**: 1M chunks with
-768-dimension embeddings, a 2M-edge graph, a per-user filter with 1% selectivity, and
-queries on 8 threads while 2,000 memories per second are written. Competitors run in the
-same harness on the same machine before any comparison is claimed.
-
-| Metric | Target |
+| Target (1M chunks × 768, 1% filter, 8 threads under write load) | Goal |
 |---|---|
-| Hybrid query (filtered vector + BM25 + 2-hop expansion), p50 / p99 | ≤ 3 ms / ≤ 8 ms, and p99 at least 2x better than the best embedded competitor |
+| Hybrid query: filtered vector + BM25 + 2-hop expansion | p50 ≤ 3 ms, p99 ≤ 8 ms |
 | Filtered recall@10 at 1% selectivity | ≥ 0.95 |
 | Write → searchable | Same transaction |
-| Unfiltered vector top-10, 1M × 768 | ≤ 2 ms p50, recall@10 ≥ 0.95 |
-| Durable ingest (record + embedding + edges) | ≥ 50,000 records/s |
+| Unfiltered vector top-10 | ≤ 2 ms p50 at recall ≥ 0.95 |
+| Durable ingest | ≥ 50,000 records/s |
 | Open a 1M-vector database | < 1 s |
 
-Baseline today (in-memory engine, 12-core Linux machine, short Criterion runs):
+Current numbers and the gaps between them and the targets are tracked in
+[docs/26](docs/26-positioning-and-targets.md#retrieval-bench-baseline-2026-11-16).
 
-| Benchmark | Mean |
-|---|---|
-| Record lookup by id | 1.5 µs |
-| Outgoing neighbours | 3.8 µs |
-| Cypher match by id | 9.3 µs |
-| Cypher two-hop traversal | 23.8 µs |
-| Cypher scan + filter + aggregate, 10k rows | 39.8 ms |
-| Vector top-10, 5k × 128 | 562 µs |
+## Roadmap
 
-The first [Retrieval Bench](benches/retrieval/README.md) run (20,000 chunks × 768)
-found HNSW recall@10 of 0.22 from a graph-connectivity bug; with the fix it is 1.00 at
-1.5 ms p50. Filtered recall (0.09, filtering after the search), index build time and
-write throughput under concurrent search are the next gaps. Single-record paths are ready; vector search and
-scans are the gaps the focus track closes. Criterion benchmarks live in `benches/` and run with `cargo bench`. Details are
-in [Positioning & Performance Targets](docs/26-positioning-and-targets.md).
+| Step | What | Status |
+|---|---|---|
+| **F1** | Retrieval Bench: corpus, ground truth, workloads, report | Done for Atlantis; competitor adapters open |
+| **F2** | Vector core: HNSW correctness, SIMD, contiguous storage, per-index locks, SQ8 | Correctness done; speed in progress |
+| **F3** | Filtered search inside HNSW, with predicate pushdown from Cypher | Next |
+| **F4** | Versioned index entries, transaction overlay, persisted index images | Designed |
+| **F5** | BM25 (`atlantis-text`) and `db.search.hybrid` | Designed |
+| **F6** | Group commit | Designed |
+| **F7** | Embedded Python package (PyO3) | Designed |
+| **F8** | Publish benchmark results against competitors | — |
 
-## Documentation
+After the focus track: RocksDB backend, schema and secondary indexes, a cost-based
+planner, change feeds and live queries, the server, and SDKs. The first vertical is
+[commerce for humans and agents](docs/27-commerce.md).
 
-Start at the [documentation index](docs/README.md). Useful entry points:
+## Join us
 
-- [Getting Started](docs/01-getting-started.md)
-- [Architecture](docs/02-architecture.md)
-- [Data Model](docs/03-data-model.md)
-- [Query Language](docs/06-query-language.md)
-- [Implementation Roadmap](docs/25-implementation-roadmap.md)
-- [Positioning & Performance Targets](docs/26-positioning-and-targets.md)
-- [Commerce](docs/27-commerce.md)
+**Atlantis DB is looking for collaborators.** The architecture is designed, the
+foundations are tested, and the benchmark tells us exactly where we stand. What's left
+is some of the most interesting work in databases right now, at a stage where your
+contributions shape the core.
+
+### Where you can make a difference
+
+| Area | Good first steps | You'll enjoy this if you like |
+|---|---|---|
+| **Vector search** (`atlantis-vector`) | Precompute norms, SIMD distance kernels, contiguous vector arena, SQ8 quantization with re-ranking | Performance engineering, ANN algorithms |
+| **Filtered search** (F3) | Allow-set bitmaps; exact, filtered-traversal and post-filter strategies chosen per query | Algorithms, research papers made real |
+| **Full-text** (`atlantis-text`, new crate) | Analyzers, inverted index, BM25, rank fusion | Information retrieval |
+| **Query engine** (`atlantis-cypher`, `atlantis-engine`) | Predicate pushdown, a first planner, batched execution, `EXPLAIN` | Compilers, query optimization |
+| **Storage** (`atlantis-kv`) | RocksDB backend, group commit, versioned index entries | Transactions, durability, MVCC |
+| **Python** (`atlantis-py`, new crate) | PyO3 bindings, NumPy buffers, a LangChain / LlamaIndex integration | Developer experience, the AI ecosystem |
+| **Benchmarks** (`benches/retrieval`) | Adapters for SurrealDB, LadybugDB, FalkorDB, Neo4j, Qdrant + Neo4j | Fair, reproducible measurement |
+| **Commerce** ([docs/27](docs/27-commerce.md)) | Reference schema, dataset generator, MCP tool gateway | Product building, agentic commerce |
+| **Docs and examples** | RAG and agent-memory examples, tutorials, cookbook recipes | Teaching, writing |
+
+Design partners are welcome too: if you run RAG, agent memory or B2B catalog search
+and want a say in what gets built, open an issue and tell us about your workload.
+
+### How to start
+
+1. Read [Architecture](docs/02-architecture.md) and the
+   [roadmap priorities](docs/25-implementation-roadmap.md#priorities).
+2. Build and test: `cargo test --workspace`. Run the bench at `--scale tiny`.
+3. [Open an issue](https://github.com/tristanseltec/atlantis-db/issues) saying what you'd
+   like to take on, or ask a question. We'll help you find a first task that fits.
+4. Send a pull request. Small and focused is best; benchmark numbers are a plus for
+   performance work.
+
+### Conventions
+
+- `cargo fmt` and `cargo clippy --all-targets -- -D warnings` must be clean.
+- Public items have rustdoc comments; new behaviour comes with tests.
+- Performance changes report before/after numbers from `cargo bench` or the Retrieval Bench.
+- No `unsafe` without a `// SAFETY:` comment explaining why it holds.
+- Docs describe what the code does today and mark planned work with its phase.
+
+## Architecture at a glance
+
+```
+ Rust embedded · Python embedded (planned) · server and SDKs (planned)
+                              │
+ atlantis-engine    transactions, execution, derived indexes
+ atlantis-cypher    hand-written parser; planner (planned)
+ index layer        atlantis-vector (HNSW) · atlantis-text (BM25, planned)
+ atlantis-storage   records, edges, adjacency
+ atlantis-kv        ordered transactional KV, MVCC, write-ahead log
+ atlantis-core      values, record ids, errors, config
+```
+
+The design (hybrid retrieval path, commerce layer, editions) is in
+[Architecture](docs/02-architecture.md). All documentation starts at the
+[docs index](docs/README.md).
 
 ## Editions
 
 Atlantis DB is open core. **Everything in this repository is Apache-2.0 and stays that
-way**, including filtered hybrid search with read-your-writes and every engine feature
-the commerce product relies on.
-
-| | Community (this repository) | Enterprise and Commerce (planned, commercial) |
-|---|---|---|
-| Engine | Embedded Rust and Python, Cypher, transactions, vector, full-text, hybrid search, graph, single-node server | Replication and high availability, larger-than-memory vector indexes, tiered storage |
-| Security and data safety | Users and roles, write-ahead log, manual backup | SSO, SCIM, audit export, customer-managed keys, point-in-time recovery |
-| AI and operations | `EXPLAIN`, metrics endpoint | Managed embedding pipelines, relevance evaluation lab, agent memory service, query profiler, console |
-| Commerce | Reference schema, example queries | `commerce.*` procedures, platform connectors, ACP/UCP adapters, merchandising, analytics, agent audit trail |
-| Support | Community | SLAs, services, training |
-
-Paid features plug into open extension traits from a separate repository, so the core
-never carries licence checks, and data moves between editions without migration. See
-[Architecture § Editions](docs/02-architecture.md#editions-and-extension-points-planned).
-
-## Contributing
-
-Contributions are welcome. This project follows standard Rust conventions:
-
-- Run `cargo fmt` before committing
-- Run `cargo clippy -- -D warnings` and fix all warnings
-- All public API items must have rustdoc comments
-- Add tests for new features; benchmarks for performance-sensitive code
-- Avoid `unsafe` unless absolutely necessary and documented with a `// SAFETY:` comment
-
-Please open an issue to discuss significant changes before submitting a pull request.
+way**, including every engine feature on the hybrid retrieval path. A future
+commercial edition will add operational features: replication and high availability,
+SSO and audit, point-in-time recovery, larger-than-memory indexes, and a commerce
+product. These plug into open extension traits, so the core never carries licence
+checks and your data moves between editions without migration.
+[Details](docs/02-architecture.md#editions-and-extension-points-planned).
 
 ## License
 
-Licensed under the Apache License, Version 2.0, as declared in the workspace
-`Cargo.toml`.
+Apache License, Version 2.0. Contributions are accepted under the same license.
+
+<div align="center">
+
+**If agent memory, GraphRAG or the database internals behind them excite you, [come build Atlantis with us](#join-us).**
+
+</div>
