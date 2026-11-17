@@ -5,6 +5,8 @@
 //!
 //! - [`encoding`] turns values, record keys and strings into byte strings
 //!   that sort in logical order;
+//! - [`index_encoding`] is the canonical value encoding of secondary index
+//!   keys, where `1` and `1.0` share a key;
 //! - [`keys`] defines the key layout (catalog, records, adjacency, labels);
 //! - [`kv`] defines the [`KvStore`] / [`KvTransaction`] traits with
 //!   snapshot-isolated MVCC transactions;
@@ -15,6 +17,7 @@
 //! - [`wal`] defines the write-ahead log format and [`SyncMode`].
 
 pub mod encoding;
+pub mod index_encoding;
 pub mod keys;
 pub mod kv;
 pub mod mem;

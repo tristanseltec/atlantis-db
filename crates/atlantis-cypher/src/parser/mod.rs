@@ -6,6 +6,7 @@
 pub mod ast;
 mod clause;
 mod cursor;
+mod ddl;
 mod expression;
 mod pattern;
 mod statement;

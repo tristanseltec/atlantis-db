@@ -1,6 +1,6 @@
 # 04 — Storage Engine
 
-> **Status:** Partially implemented — `atlantis-kv` with the `mem` backend, write-ahead log, checkpoints, key encoding and the record store (used by Cypher and the Rust record API) are implemented; `rocksdb`, the `interval` sync mode and the adjacency cache Planned — Phase 1, secondary indexes Phase 2, `tikv` Phase 7
+> **Status:** Partially implemented — `atlantis-kv` with the `mem` backend, write-ahead log, checkpoints, key encoding and the record store (used by Cypher and the Rust record API) are implemented; `rocksdb`, the `interval` sync mode and the adjacency cache Planned — Phase 1, property indexes and constraints implemented, typed fields Phase 2, `tikv` Phase 7
 > **Crates:** `atlantis-storage`, `atlantis-kv`, `atlantis-core`
 
 This chapter covers how Atlantis DB stores data: the `atlantis-kv` ordered key-value
@@ -27,7 +27,7 @@ The target storage stack separates **what** is stored (records, edges, indexes) 
 
 Every model (graph, document, relational, key-value, time-series, vector, full-text, geospatial) is stored as ordered keys in one keyspace. Indexes, change feeds, and the catalog live in the same keyspace and are written in the same transaction as the data they describe.
 
-Implemented today: `atlantis-kv` with the `mem` backend and its write-ahead log, the record, catalog, adjacency and label keys, and the record store. Planned: the `rocksdb` and `tikv` backends, the adjacency cache, and the secondary-index `ix/`, `ft/`, `vx/`, `cf/` and `kv/` keys.
+Implemented today: `atlantis-kv` with the `mem` backend and its write-ahead log, the record, catalog, adjacency and label keys, and the record store. Property index and constraint keys (`px/`, `ux/`) are implemented. Planned: the `rocksdb` and `tikv` backends, the adjacency cache, and the `ft/`, `vx/`, `cf/` and `kv/` keys.
 
 ### `atlantis-kv` (Implemented — `mem` backend only)
 
@@ -57,11 +57,14 @@ In the table, `/ns`, `/r` and similar are literal markers, and `{…}` is an enc
 | `/sys/ns/{ns}` | Namespace definition | Implemented |
 | `/sys/ns/{ns}/db/{db}` | Database definition | Implemented |
 | `/sys/ns/{ns}/db/{db}/tb/{tb}` | Table definition (`TableDef`) | Implemented |
-| `/sys/ns/{ns}/db/{db}/ix/{name}` | Index definition (today: `VectorIndexDef`) | Implemented |
+| `/sys/ns/{ns}/db/{db}/ix/{name}` | Vector index definition (`VectorIndexDef`) | Implemented |
+| `/sys/ns/{ns}/db/{db}/sc/{name}` | Property index or constraint definition (`SchemaDef`) | Implemented |
+| `/sys/ns/{ns}/db/{db}/sv` | Schema version: a new value on every schema change, watched by every writing transaction | Implemented |
 | `/ns/{ns}/db/{db}/tb/{tb}/r/{key}` | A record (node, edge, document, row, time-series point) | Implemented |
 | `.../tb/{tb}/g/{nodeKey}/{dir}/{edgeTable}{edgeKey}` | An adjacency entry under the node's table; `dir` is `o` (outgoing) or `i` (incoming) | Implemented |
 | `/ns/{ns}/db/{db}/lb/{label}/{table}{key}` | A secondary label index entry | Implemented |
-| `.../tb/{tb}/ix/{index}/{encodedValues}/{key}` | A secondary index entry | Phase 2 |
+| `/ns/{ns}/db/{db}/px/{index}/{encodedValues}{table}{key}` | A property index entry | Implemented |
+| `/ns/{ns}/db/{db}/ux/{constraint}/{encodedValues}` | A unique constraint entry; the value is the owning record id | Implemented |
 | `.../tb/{tb}/ft/{index}/...` | Full-text postings and statistics | Phase 3 |
 | `.../tb/{tb}/vx/{index}/...` | HNSW graph layers and vectors | Phase 3 |
 | `.../cf/{tb}/{versionstamp}` | A change-feed entry | Phase 4 |
@@ -95,7 +98,19 @@ Record keys are built from a `RecordId` (`table` + `key`); see [03 — Data Mode
 - **Vector index definitions.** `define_vector_index`, `vector_index(es)` and `drop_index` keep `VectorIndexDef` entries in the catalog. The HNSW graph itself is derived data held in memory by the engine ([10 — Vector Index](10-vector-index.md)).
 - **Commit info.** `RecordTx::commit` returns a `CommitInfo` with the commit's `Versionstamp` and the ids of every record and edge the transaction wrote or deleted. The engine uses it to keep vector indexes current.
 
-Cypher runs on this layout today. Generalising it to typed fields and secondary indexes is Phase 2 ([07 — Schema & DDL](07-schema-ddl.md), [08 — Document & Relational](08-document-relational.md)).
+Index values use a canonical encoding (`atlantis_kv::index_encoding`): integers and
+floats that compare equal share a key (`1` and `1.0`, `0` and `-0.0`), and the order of
+the bytes is the order of the values within each type, so equality and range lookups
+are prefix and range scans. `null`, NaN, objects, vectors and geometries are never
+index keys.
+
+Schema changes and writes cannot miss each other. Every schema change writes a new
+schema version, and every transaction that writes a record *watches* that key: the
+commit fails with a conflict if the key changed after the transaction's snapshot, at
+every isolation level (`KvTransaction::watch`). An index build in turn watches the
+records it read. Whichever commits second gets `TxConflict` and retries.
+
+Cypher runs on this layout today. Generalising it to typed fields is Phase 2 ([07 — Schema & DDL](07-schema-ddl.md), [08 — Document & Relational](08-document-relational.md)).
 
 ### Backends
 

@@ -15,7 +15,9 @@ mod aggregate;
 mod clauses;
 mod ddl;
 pub(crate) mod eval;
+mod explain;
 mod pattern;
+mod plan;
 mod procedures;
 mod projection;
 mod pushdown;
@@ -53,6 +55,8 @@ pub(crate) struct Exec<'a> {
     pub(crate) index_changes: Vec<String>,
     /// Compiled `=~` patterns, reused across rows.
     pub(crate) regexes: HashMap<String, regex::Regex>,
+    /// Index-usable `WHERE` conditions of the `MATCH` being executed.
+    pub(crate) hints: plan::Hints,
 }
 
 impl<'a> Exec<'a> {
@@ -67,6 +71,21 @@ impl<'a> Exec<'a> {
                 self.drop_index(name, *if_exists)?;
                 Ok(QueryResult::default())
             }
+            Statement::CreateIndex(def) => {
+                self.create_index(def)?;
+                Ok(QueryResult::default())
+            }
+            Statement::CreateConstraint(def) => {
+                self.create_constraint(def)?;
+                Ok(QueryResult::default())
+            }
+            Statement::DropConstraint { name, if_exists } => {
+                self.drop_constraint(name, *if_exists)?;
+                Ok(QueryResult::default())
+            }
+            Statement::ShowIndexes => self.show_indexes(),
+            Statement::ShowConstraints => self.show_constraints(),
+            Statement::Explain(union) => self.explain(union),
             Statement::Begin | Statement::Commit | Statement::Rollback => Err(invalid(
                 "transaction control statements are handled by the session",
             )),

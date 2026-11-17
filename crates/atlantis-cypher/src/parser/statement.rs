@@ -1,5 +1,5 @@
-//! Top-level statements: queries with `UNION`, index DDL and transaction
-//! control.
+//! Top-level statements: queries with `UNION`, `EXPLAIN`, vector index DDL
+//! and transaction control. Property index and constraint DDL is in `ddl`.
 
 use super::ast::{CreateVectorIndex, QueryUnion, Statement};
 use super::cursor::{PResult, Parser};
@@ -10,8 +10,17 @@ impl Parser<'_> {
         if self.at_kw("CREATE") && self.peek_nth(1).is_keyword("VECTOR") {
             return self.create_vector_index().map(Statement::CreateVectorIndex);
         }
+        if self.at_kw("CREATE") && self.is_schema_create() {
+            return self.create_schema();
+        }
         if self.eat_kw("DROP") {
-            return self.drop_index();
+            return self.drop_schema();
+        }
+        if self.eat_kw("SHOW") {
+            return self.show();
+        }
+        if self.eat_kw("EXPLAIN") {
+            return Ok(Statement::Explain(self.query_union()?));
         }
         for (kw, stmt) in [
             ("BEGIN", Statement::Begin),
@@ -25,7 +34,7 @@ impl Parser<'_> {
         self.query_union().map(Statement::Query)
     }
 
-    fn query_union(&mut self) -> PResult<QueryUnion> {
+    pub(super) fn query_union(&mut self) -> PResult<QueryUnion> {
         let first = self.query()?;
         let mut rest = Vec::new();
         while self.eat_kw("UNION") {
@@ -81,16 +90,5 @@ impl Parser<'_> {
             property,
             options,
         })
-    }
-
-    /// After `DROP`: `INDEX name [IF EXISTS]`.
-    fn drop_index(&mut self) -> PResult<Statement> {
-        self.expect_kw("INDEX")?;
-        let name = self.name("an index name")?;
-        let if_exists = self.eat_kw("IF");
-        if if_exists {
-            self.expect_kw("EXISTS")?;
-        }
-        Ok(Statement::DropIndex { name, if_exists })
     }
 }

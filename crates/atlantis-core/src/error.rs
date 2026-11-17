@@ -55,6 +55,11 @@ pub enum AtlantisError {
     #[error("schema violation: {0}")]
     SchemaViolation(String),
 
+    /// A write breaks a `UNIQUE`, `NOT NULL` or `NODE KEY` constraint, or a
+    /// constraint cannot be created because existing data breaks it.
+    #[error("constraint violation: {0}")]
+    ConstraintViolation(String),
+
     /// The transaction conflicted with a concurrent commit. Safe to retry.
     #[error("transaction conflict: {0}")]
     TxConflict(String),

@@ -3,7 +3,7 @@
 use atlantis_core::{AtlantisError, Value};
 use atlantis_cypher::ast::{Expression, Pattern, Projection};
 
-use crate::exec::{pattern::pattern_variables, Exec, Row};
+use crate::exec::{pattern::pattern_variables, plan::pattern_hints, Exec, Row};
 
 impl Exec<'_> {
     /// `[OPTIONAL] MATCH pattern [WHERE expr]`. An optional match keeps a
@@ -16,6 +16,26 @@ impl Exec<'_> {
         where_clause: Option<&Expression>,
     ) -> Result<Vec<Row>, AtlantisError> {
         let new_vars: Vec<String> = pattern_variables(pattern);
+        // Conditions an index can answer, available to the start-node
+        // lookups below; restored afterwards so they never leak into
+        // another clause.
+        let hints = where_clause
+            .map(|w| pattern_hints(w, pattern, |_| false))
+            .unwrap_or_default();
+        let saved = std::mem::replace(&mut self.hints, hints);
+        let result = self.match_rows(rows, optional, pattern, where_clause, &new_vars);
+        self.hints = saved;
+        result
+    }
+
+    fn match_rows(
+        &mut self,
+        rows: Vec<Row>,
+        optional: bool,
+        pattern: &Pattern,
+        where_clause: Option<&Expression>,
+        new_vars: &[String],
+    ) -> Result<Vec<Row>, AtlantisError> {
         let mut out = Vec::new();
         for row in rows {
             let before = out.len();
@@ -26,7 +46,7 @@ impl Exec<'_> {
             }
             if optional && out.len() == before {
                 let mut r = row;
-                for v in &new_vars {
+                for v in new_vars {
                     r.entry(v.clone()).or_insert(Value::Null);
                 }
                 out.push(r);

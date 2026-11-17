@@ -44,6 +44,7 @@ impl MemStore {
             writes: BTreeMap::new(),
             reads: HashSet::new(),
             scans: Vec::new(),
+            watched: Vec::new(),
             idempotent: HashSet::new(),
             finished: false,
         })
@@ -62,6 +63,8 @@ pub(super) struct MemTransaction {
     reads: HashSet<Vec<u8>>,
     /// Ranges scanned (tracked only for serializable transactions).
     scans: Vec<KeyRange>,
+    /// Ranges validated at commit at every isolation level.
+    watched: Vec<KeyRange>,
     /// Keys written with `set_idempotent`.
     idempotent: HashSet<Vec<u8>>,
     finished: bool,
@@ -99,6 +102,7 @@ impl MemTransaction {
             self.writes.clear();
             self.reads.clear();
             self.scans.clear();
+            self.watched.clear();
             self.idempotent.clear();
         }
     }
@@ -188,6 +192,9 @@ impl MemTransaction {
         if let Some(key) = self.writes.keys().find(|k| changed(k)) {
             return Some(format!("write-write conflict on key {}", escape(key)));
         }
+        if self.watched.iter().any(|r| self.range_changed(inner, r)) {
+            return Some("a schema change ran concurrently; retry the transaction".into());
+        }
         if self.isolation == Isolation::Serializable {
             if let Some(key) = self.reads.iter().find(|k| changed(k)) {
                 return Some(format!(
@@ -195,26 +202,25 @@ impl MemTransaction {
                     escape(key)
                 ));
             }
-            for range in &self.scans {
-                let bounds = (
-                    Bound::Included(range.start.clone()),
-                    Bound::Excluded(range.end.clone()),
-                );
-                if inner
-                    .data
-                    .range::<Vec<u8>, _>(bounds.clone())
-                    .any(|(_, versions)| versions.last().is_some_and(|(v, _)| *v > self.snapshot))
-                    || inner
-                        .pending_keys
-                        .range::<Vec<u8>, _>(bounds)
-                        .next()
-                        .is_some()
-                {
-                    return Some("a range scanned by this transaction changed".into());
-                }
+            if self.scans.iter().any(|r| self.range_changed(inner, r)) {
+                return Some("a range scanned by this transaction changed".into());
             }
         }
         None
+    }
+
+    /// `true` if a commit newer than the snapshot (visible or staged)
+    /// changed a key in `range`.
+    fn range_changed(&self, inner: &Inner, range: &KeyRange) -> bool {
+        let bounds = (
+            Bound::Included(range.start.as_slice()),
+            Bound::Excluded(range.end.as_slice()),
+        );
+        inner
+            .data
+            .range::<[u8], _>(bounds)
+            .any(|(_, versions)| versions.last().is_some_and(|(v, _)| *v > self.snapshot))
+            || inner.pending_keys.range::<[u8], _>(bounds).next().is_some()
     }
 }
 
@@ -249,6 +255,14 @@ impl KvTransaction for MemTransaction {
         self.check_writable()?;
         self.idempotent.insert(key.clone());
         self.writes.insert(key, Some(value));
+        Ok(())
+    }
+
+    fn watch(&mut self, range: KeyRange) -> Result<(), AtlantisError> {
+        self.check_open()?;
+        if range.start < range.end {
+            self.watched.push(range);
+        }
         Ok(())
     }
 

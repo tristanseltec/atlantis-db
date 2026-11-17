@@ -7,4 +7,8 @@
 
 pub mod records;
 
-pub use records::{CommitInfo, RecordStore, RecordTx, TableDef, TableKind, VectorIndexDef};
+pub use records::{
+    display_path, field_at, CommitInfo, ConstraintDef, ConstraintKind, FieldPath, IndexInfo,
+    IndexLookup, PropertyIndexDef, RecordStore, RecordTx, SchemaDef, TableDef, TableKind,
+    VectorIndexDef,
+};

@@ -61,6 +61,13 @@ pub trait KvTransaction: Send {
         self.set(key, value)
     }
 
+    /// Makes the commit fail with a conflict if any key in `range` was
+    /// changed by a commit newer than this transaction's snapshot, at every
+    /// isolation level (for snapshot isolation this is the one read that is
+    /// validated). Used for schema changes: a writer watches the schema
+    /// version, and an index build watches the records it indexed.
+    fn watch(&mut self, range: KeyRange) -> Result<(), AtlantisError>;
+
     /// Deletes a key. Deleting a missing key is not an error.
     fn delete(&mut self, key: &[u8]) -> Result<(), AtlantisError>;
 

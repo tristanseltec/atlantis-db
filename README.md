@@ -80,6 +80,7 @@ built in the open, and this is the best time to shape them.
 | HNSW vector index (SIMD kernels, parallel build, per-index locks) with `CREATE VECTOR INDEX` and `db.vector.search` | Embedded Python package (F7) |
 | Filtered vector search: `YIELD ... WHERE node.field = $x` runs inside the index, recall@10 1.00 at 1% selectivity | Faster vector core: SQ8 quantization, AVX-512 and NEON |
 | Retrieval Bench harness with exact ground truth | Competitor adapters for the benchmark |
+| Property indexes (range, nested, multikey, composite) and `UNIQUE` / `NOT NULL` / `NODE KEY` constraints, with index seeks, index joins and `EXPLAIN` |  |
 
 The full plan is in the [Implementation Roadmap](docs/25-implementation-roadmap.md).
 

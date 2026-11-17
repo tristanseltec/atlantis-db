@@ -17,7 +17,7 @@ docs refers to a phase defined here.
 |---|---|
 | Phase 0 — graph + vector core | Essentially complete. Cypher runs on the record store; every parser and executor gap listed for Phase 0 is fixed and pinned by integration tests; vector indexes are populated and derived from records. Not done, and moved: `shortestPath`/`allShortestPaths` and `algo.*` stay in Phase 3; HNSW persistence is replaced by rebuilding indexes from records (persistence in `vx/` keys stays open, below); the Criterion baseline is not recorded. |
 | Phase 1 — transactional storage | Mostly done. Done: the `atlantis-kv` crate, memcomparable keys, MVCC with snapshot and serializable isolation, the `mem` backend with a write-ahead log (`SyncMode::Every`/`Never`), crash recovery and periodic checkpoints, one engine per directory (`LOCK`), record transactions on `Engine`, Cypher on KV (the legacy graph store is deleted), multi-statement scripts with `BEGIN`/`COMMIT`/`ROLLBACK`, and Cypher inside Rust transactions. Also done: group commit, the `interval` sync mode and `transaction.isolation`. Open: the `rocksdb` backend and backend features, the per-database commit sequencer, the adjacency cache, HNSW in `vx/` keys, `Engine::connect`, config keys, query workers off the async executor and `query.timeout`. The importer from legacy checkpoints is dropped: opening a legacy `checkpoint.db` fails with an error. |
-| Phase 2 — unified record model | Partial. Done: `RecordId`/`RecordKey`, `Record`, `Edge`, the extended `Value` types except `Decimal` and `Range`, namespaces and databases (`DatabaseRef`, `use_db` for Cypher and records), the table catalog with implicit schemaless tables, edge tables with endpoint restrictions, `_default`, the secondary label index, nested document access and updates, map literals as `Object`, record links that dereference, `id(n)`/`rid()`, explicit keys through Cypher `{id: ...}`. Open: schema DDL, fields and assertions, `atlantis-index` B-tree indexes and constraints, `CREATE NAMESPACE`/`CREATE DATABASE`/`USE`, the planner and cost-based optimizer, `EXPLAIN`, and engine-level record helpers. |
+| Phase 2 — unified record model | Partial. Done: `RecordId`/`RecordKey`, `Record`, `Edge`, the extended `Value` types except `Decimal` and `Range`, namespaces and databases (`DatabaseRef`, `use_db` for Cypher and records), the table catalog with implicit schemaless tables, edge tables with endpoint restrictions, `_default`, the secondary label index, nested document access and updates, map literals as `Object`, record links that dereference, `id(n)`/`rid()`, explicit keys through Cypher `{id: ...}`. Also done: property indexes (range, nested, multikey, composite), `UNIQUE`/`NOT NULL`/`NODE KEY` constraints, rule-based index selection with index nested loop joins, `EXPLAIN`, `SHOW INDEXES`/`SHOW CONSTRAINTS`. Open: schema DDL for tables and fields, assertions, relationship indexes, statistics and the cost-based optimizer, index-backed `ORDER BY`, `CREATE NAMESPACE`/`CREATE DATABASE`/`USE`, and engine-level record helpers. |
 | Phase 3 — search | Partial. Done: `CREATE VECTOR INDEX` / `DROP INDEX` with per-index options, `db.vector.search(indexName, ...)` with threshold and `efSearch`, filtered vector search with `WHERE` push-down (F3), `point()` and `point.distance`. Open: everything else in Phase 3. |
 
 **One store.** `Engine::execute` (Cypher), `Transaction::execute` and the record API
@@ -270,12 +270,18 @@ are open.
   label index.
 - Schema DDL (`SCHEMAFULL`, fields, types, `ASSERT`, `DEFAULT`, `COMPUTED`) with
   `Error::SchemaViolation`.
-- The new crate `atlantis-index`: B-tree, unique and composite indexes, background builds
-  (`index.workers`), and the Neo4j 5 `CREATE INDEX` / `CREATE CONSTRAINT` forms.
+- *Done:* B-tree (range), nested, multikey, composite and unique indexes with the
+  Neo4j 5 `CREATE INDEX` / `CREATE CONSTRAINT` / `DROP` / `SHOW` forms, and `UNIQUE`,
+  `NOT NULL` and `NODE KEY` constraints. They live in `atlantis-storage`
+  (`records::schema`), because entries are written in the record's transaction; builds
+  are synchronous. Open: background builds (`index.workers`) and relationship indexes,
+  which may justify a separate `atlantis-index` crate.
 - *Done:* nested document access and updates, map literals as `Object` values, and
   stored record links that dereference on access. Open: the typed `record<T>` field.
-- A planner and cost-based optimizer with the physical operators `IndexSeek`, `IndexRangeScan` and
-  `KeyRangeScan`, plus join operators.
+- *Done:* rule-based index selection for path start nodes (`NodeIndexSeek`,
+  `NodeUniqueIndexSeek`, `NodeIndexSeekByRange`, index nested loop joins) and
+  `EXPLAIN`. Open: statistics, a cost-based optimizer, `KeyRangeScan`, hash joins and
+  index-backed `ORDER BY`.
 - Record helpers (`select`, `create`, `update`, `merge`, `delete`, `relate`),
   `use_ns` and `set_var`/`unset_var`. `Transaction` already offers transaction-level
   record operations and Cypher, and `use_db(ns, db)` exists.
