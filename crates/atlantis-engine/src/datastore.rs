@@ -292,6 +292,7 @@ impl Transaction {
             vector_defaults: &inner.config.vector,
             index_changes: Vec::new(),
             regexes: HashMap::new(),
+            hints: HashMap::new(),
         };
         let result = exec.run(statement);
         self.index_changes.append(&mut exec.index_changes);

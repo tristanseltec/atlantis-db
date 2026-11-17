@@ -262,30 +262,62 @@ RETURN customer.name, spent;
 Time bucketing for time-series grouping uses `ts.bucket` and is described in
 [13 — Key-Value & Time-Series](13-key-value-time-series.md).
 
-## Secondary Indexes (Planned — Phase 2)
+## Secondary Indexes
 
-Without an index, a property filter scans every record of the table. `atlantis-index`
-adds three kinds of secondary index, declared with the Neo4j 5 forms in
-[07 — Schema & DDL](07-schema-ddl.md):
+Without an index, a property filter scans every node with the label. Indexes are
+declared with the Neo4j 5 forms in [07 — Schema & DDL](07-schema-ddl.md):
 
 | Kind | DDL | Serves |
 |---|---|---|
-| Range | `CREATE INDEX person_email FOR (p:Person) ON (p.email);` | Equality, ranges (`<`, `>=`), `STARTS WITH`, `IN`, `ORDER BY` on the indexed field |
+| Range | `CREATE INDEX person_email FOR (p:Person) ON (p.email);` | `=`, `IN` lists, ranges (`<`, `>=`, …), `STARTS WITH` |
+| Nested | `CREATE INDEX person_city FOR (p:Person) ON (p.address.city);` | The same, on a nested field |
+| Composite | `CREATE INDEX person_name FOR (p:Person) ON (p.last, p.first);` | Equality on leading fields, when every field has a condition |
 | Unique | `CREATE CONSTRAINT person_email_unique FOR (p:Person) REQUIRE p.email IS UNIQUE;` | Same as range, and rejects duplicates |
-| Composite | `CREATE INDEX person_name FOR (p:Person) ON (p.last, p.first);` | Equality on a prefix of the fields, then a range on the next field |
+| Node key | `CREATE CONSTRAINT book_key FOR (b:Book) REQUIRE (b.isbn, b.edition) IS NODE KEY;` | Equality on any leading fields; requires and uniquely identifies |
+
+The planner picks an index for the start node of each path, from conditions in the
+node's inline properties and in the `MATCH`'s `WHERE` that compare a property of that
+node with a value known before the node is matched: a parameter, a literal, a value
+from an earlier clause, or a value from an earlier path of the same `MATCH`. `EXPLAIN`
+shows the choice ([15 — Query Planner & Executor](15-query-planner-executor.md)).
+
+```cypher
+MATCH (p:Person) WHERE p.email = $email RETURN p;                  // NodeIndexSeek
+MATCH (p:Person) WHERE p.age >= 18 AND p.age < 30 RETURN p;        // NodeIndexSeekByRange
+MATCH (p:Person) WHERE 'vip' IN p.tags RETURN p;                   // multikey seek
+MATCH (o:Order), (c:Customer) WHERE c.email = o.customerEmail      // index nested loop join
+RETURN o, c;
+```
 
 Behaviour of indexes:
 
-- Index entries are ordered, memcomparable keys under `.../ix/{index}/...`, written in
-  the same transaction as the record, so an index is never stale for a committed
-  read ([04 — Storage Engine](04-storage-engine.md)).
-- Nested paths can be indexed: `ON (p.address.city)`. Indexing an array field adds one
-  entry per element, so `$tag IN p.tags` can use the index.
-- `null` and missing values are not indexed. `IS NULL` filters cannot use an index.
-- A composite index on `(last, first)` serves `last = $l AND first = $f` and
-  `last = $l AND first STARTS WITH $p`, but not a filter on `first` alone.
-- The planner picks indexes on its own. Use `EXPLAIN` to see whether a query used
-  `IndexSeek` or `IndexRangeScan` ([15 — Query Planner & Executor](15-query-planner-executor.md)).
+- **An index never changes an answer.** The index returns candidates; labels, inline
+  properties and the whole `WHERE` are still checked on each one. When a lookup cannot
+  be answered exactly (an integer beyond ±2^53, a vector, an object), the query scans
+  the label instead. The one visible difference: `WHERE` runs only on candidates, so a
+  type error that a scan would hit on some other node (`'x' IN p.tags` where one node's
+  `tags` is a string) may not be raised.
+- **Entries are written with the record**, in the same transaction, so an index is
+  never stale for any snapshot, and a transaction's own writes are visible to its index
+  lookups.
+- **Numbers compare by value.** `1` and `1.0` share an entry, as do `0` and `-0.0`.
+- **`null` and missing values are not indexed.** `IS NULL` filters cannot use an index.
+  Neither can objects, vectors, geometries or NaN, which are never index keys.
+- **Single-field indexes are multikey.** An array value adds one entry per distinct
+  element, so `$tag IN p.tags` uses the index on `tags`. Whole arrays are not entries:
+  `p.tags = ['a', 'b']` scans.
+- **Composite indexes store whole values** and have an entry only for nodes where every
+  field is non-null. A composite index is therefore used only when the query has a
+  condition on every field (`p.last = $l AND p.first STARTS WITH $f`); `p.last = $l`
+  alone scans, unless the index belongs to a `NODE KEY`, which guarantees every node
+  has an entry.
+- **Range scans stay within one type.** `p.age > 30` reads numbers only, as Cypher
+  comparisons across types are `null`.
+
+Not yet: index-backed `ORDER BY` (sorting still runs after the match), relationship
+property indexes, choosing which end of a path to start from, and statistics. An index
+on a label is chosen by a fixed preference (unique full match, then full equality,
+then equality prefix, then `IN`, then multikey membership, then prefix, then range).
 
 ## Pagination
 

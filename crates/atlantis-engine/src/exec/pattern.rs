@@ -9,6 +9,7 @@ use atlantis_core::{AtlantisError, Direction, Edge, Object, RecordId, RecordKey,
 use atlantis_cypher::ast::{NodePattern, PathPattern, Pattern, RelPattern};
 
 use super::eval::invalid;
+use super::plan::{choose, Access, Operand, Pred};
 use super::{Exec, Row};
 
 /// Path value: `{nodes: [...], relationships: [...]}`.
@@ -81,14 +82,27 @@ impl Exec<'_> {
         }))
     }
 
-    /// Candidate nodes for a node pattern that is not yet bound.
+    /// Candidate nodes for a node pattern that is not yet bound: by id when
+    /// the pattern or `WHERE` pins it, else through the best index, else by
+    /// scanning the first label (or every node table).
     fn node_candidates(
         &mut self,
         np: &NodePattern,
         props: &[(String, Value)],
+        row: &Row,
     ) -> Result<Vec<RecordId>, AtlantisError> {
-        // Direct lookup by id when the pattern pins it.
-        if let Some((_, v)) = props.iter().find(|(k, _)| k == "id") {
+        // `WHERE n.id = v` pins the id like `{id: v}` does.
+        let where_id = if props.iter().any(|(k, _)| k == "id") {
+            None
+        } else {
+            self.where_id(np, row)
+        };
+        let pinned = props
+            .iter()
+            .find(|(k, _)| k == "id")
+            .map(|(_, v)| v.clone())
+            .or(where_id);
+        if let Some(v) = &pinned {
             // Candidate ids: the id itself, or the key in each pattern label
             // that names a node table (a label may also be secondary).
             let ids: Option<Vec<RecordId>> = match v {
@@ -115,6 +129,21 @@ impl Exec<'_> {
                     }
                 }
                 return Ok(out);
+            }
+        }
+        let conds = self.node_conditions(np, props);
+        if !conds.is_empty() && !np.labels.is_empty() {
+            let indexes = self.label_indexes(&np.labels)?;
+            if let Access::Index { index, seek } = choose(&np.labels, &conds, &indexes) {
+                if let Some(ids) = self.index_candidates(&index, &seek, row)? {
+                    let mut out = Vec::new();
+                    for id in ids {
+                        if self.node_fits(&id, np, props)? {
+                            out.push(id);
+                        }
+                    }
+                    return Ok(out);
+                }
             }
         }
         let records = match np.labels.first() {
@@ -149,6 +178,16 @@ impl Exec<'_> {
         Ok(out)
     }
 
+    /// The value of a `WHERE n.id = v` condition on this node, if any.
+    fn where_id(&mut self, np: &NodePattern, row: &Row) -> Option<Value> {
+        let var = np.variable.as_ref()?;
+        let op = self.hints.get(var)?.iter().find_map(|c| match &c.pred {
+            Pred::Eq(Operand::Expr(e)) if c.path == ["id"] => Some(e.clone()),
+            _ => None,
+        })?;
+        self.eval(&op, row).ok()
+    }
+
     /// Nodes matching `np` given the current row (bound or scanned).
     fn match_node(&mut self, np: &NodePattern, row: &Row) -> Result<Vec<RecordId>, AtlantisError> {
         let props = self.eval_props(&np.properties, row)?;
@@ -168,7 +207,7 @@ impl Exec<'_> {
                 };
             }
         }
-        self.node_candidates(np, &props)
+        self.node_candidates(np, &props, row)
     }
 
     /// Edges leaving `node` that fit the relationship pattern (types and

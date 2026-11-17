@@ -37,7 +37,10 @@ pub use atlantis_core::{
     Geometry, Object, Point, Record, RecordId, RecordKey, SyncMode, Ulid, Uuid, Value,
 };
 pub use atlantis_kv::{Isolation, Versionstamp};
-pub use atlantis_storage::{CommitInfo, RecordTx, TableDef, TableKind, VectorIndexDef};
+pub use atlantis_storage::{
+    CommitInfo, ConstraintDef, ConstraintKind, IndexInfo, IndexLookup, PropertyIndexDef, RecordTx,
+    SchemaDef, TableDef, TableKind, VectorIndexDef,
+};
 pub use config::Config;
 pub use engine::{Engine, Transaction};
 pub use params::Params;

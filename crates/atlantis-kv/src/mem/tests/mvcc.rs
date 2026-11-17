@@ -198,3 +198,46 @@ fn checkpoint_roundtrip() {
             == 0
     );
 }
+
+#[test]
+fn watched_ranges_are_validated_under_snapshot_isolation() {
+    use crate::keys::KeyRange;
+    let store = MemStore::new();
+    // `rw` opens snapshot-isolated transactions, which do not validate reads.
+    let mut watcher = rw(&store);
+    let mut bystander = rw(&store);
+    watcher
+        .watch(KeyRange {
+            start: b"s".to_vec(),
+            end: b"t".to_vec(),
+        })
+        .unwrap();
+    bystander.get(b"s1").unwrap();
+    watcher.set(b"own".to_vec(), b"1".to_vec()).unwrap();
+    bystander.set(b"other".to_vec(), b"1".to_vec()).unwrap();
+
+    let mut writer = rw(&store);
+    writer.set(b"s1".to_vec(), b"x".to_vec()).unwrap();
+    writer.commit().unwrap();
+
+    assert!(matches!(
+        watcher.commit(),
+        Err(AtlantisError::TxConflict(_))
+    ));
+    // An unwatched read of the same key is not validated.
+    bystander.commit().unwrap();
+
+    // A change outside the range does not conflict.
+    let mut watcher = rw(&store);
+    watcher
+        .watch(KeyRange {
+            start: b"s".to_vec(),
+            end: b"t".to_vec(),
+        })
+        .unwrap();
+    watcher.set(b"own".to_vec(), b"2".to_vec()).unwrap();
+    let mut writer = rw(&store);
+    writer.set(b"u".to_vec(), b"x".to_vec()).unwrap();
+    writer.commit().unwrap();
+    watcher.commit().unwrap();
+}

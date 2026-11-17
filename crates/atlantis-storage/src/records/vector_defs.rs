@@ -24,6 +24,12 @@ impl RecordTx {
                 def.name
             )));
         }
+        if self.schema_def(&def.name)?.is_some() {
+            return Err(AtlantisError::SchemaViolation(format!(
+                "an index or constraint named {} already exists",
+                def.name
+            )));
+        }
         self.ensure_database()?;
         self.tx
             .set(keys::index_def(&self.db, &def.name), encode(&def)?)

@@ -128,6 +128,8 @@ The `RecordTx` methods, reached through `Transaction`, are synchronous and retur
 | `neighbors(node, direction, rel_type)` | `RecordId`s of the nodes at the other end of those edges. |
 | `set_labels(id, add, remove)` | Adds and removes secondary labels. The table label cannot be removed. |
 | `define_vector_index(def)`, `vector_index(name)`, `vector_indexes()`, `drop_index(name)` | Manage `VectorIndexDef` catalog entries, as `CREATE VECTOR INDEX` / `DROP INDEX` do. |
+| `define_property_index(PropertyIndexDef)`, `define_constraint(ConstraintDef)`, `drop_schema(name)`, `schema()`, `schema_def(name)` | Manage property indexes and constraints (`SchemaDef`), as `CREATE INDEX` / `CREATE CONSTRAINT` / `DROP` do. Defining builds the entries from existing records, or fails with `ConstraintViolation` if a record breaks the constraint. Every record write in the transaction then maintains the entries and checks the constraints. |
+| `indexes_for(label)`, `index_lookup(&IndexInfo, &IndexLookup)` | The indexes on a label and a lookup in one: `IndexLookup::Eq`, `Range` or `Prefix`. Returns candidate record ids (a superset of the matches, to re-check), or `None` when the index cannot answer the lookup exactly. |
 | `commit()`, `cancel()` | Used by `Engine` internally; a closure does not call them. `commit` returns a `CommitInfo` with the `Versionstamp` and the changed record ids. |
 
 ```rust
@@ -264,7 +266,8 @@ the target error type. `is_retryable()` returns `true` for `TxConflict` only.
 | `InvalidRecordId(String)` | A record id or key cannot be parsed or used. |
 | `RecordExists(String)` | A record or edge with that id already exists. |
 | `RecordNotFound(String)` | A record, or an edge endpoint, does not exist. |
-| `SchemaViolation(String)` | A write breaks a table rule: wrong table kind, disallowed edge endpoint, an edge used as an endpoint, changed id or endpoints, or a delete of a node with edges without `detach`. |
+| `SchemaViolation(String)` | A write breaks a table rule: wrong table kind, disallowed edge endpoint, an edge used as an endpoint, changed id or endpoints, or a delete of a node with edges without `detach`. Also an invalid or duplicate index or constraint definition. |
+| `ConstraintViolation(String)` | A write breaks a `UNIQUE`, `NOT NULL` or `NODE KEY` constraint, or a constraint cannot be created because existing data breaks it. The message names the constraint and the nodes involved. |
 | `TxConflict(String)` | A concurrent commit invalidated the transaction. Retryable. |
 | `TxFinished` | The transaction was already committed or cancelled. |
 | `TxReadOnly` | A write was attempted in a read-only transaction. |
@@ -484,7 +487,8 @@ Embedded engines run as root unless a session signs in.
 | Variant | Raised when | Status |
 |---|---|---|
 | `TxConflict` | A transaction lost a write-write or serializable read-set check. Retryable. | Implemented |
-| `SchemaViolation` | A write breaks a field type, `ASSERT`, or a constraint. | Implemented for table and edge rules; field checks Phase 2 |
+| `SchemaViolation` | A write breaks a field type, `ASSERT`, or a table rule. | Implemented for table and edge rules; field checks Phase 2 |
+| `ConstraintViolation` | A write breaks a `UNIQUE`, `NOT NULL` or `NODE KEY` constraint. | Implemented |
 | `ParseError` | The query does not parse (replaces `Parse`). | Phase 2 |
 | `Timeout` | A statement exceeded `query.timeout` (no per-query limits exist today). | Phase 1 |
 | `NotFound` | A referenced record, table or index does not exist (generalizes `RecordNotFound`). Records raise `RecordNotFound` today. | Phase 2 |

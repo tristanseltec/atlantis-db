@@ -38,9 +38,12 @@ projection, `pattern.rs` matching and creation, `eval.rs` expressions and functi
   earlier writes. A property holding a `RecordId` is followed the same way, so
   `o.customer.name` dereferences a stored link.
 - **Matching.** Each path pattern is matched left to right from its start node. An
-  unbound node pattern pinned by `id` is a direct key lookup in its labels' tables;
-  otherwise it scans the label index of its first label (every non-edge table when it
-  has no label) and filters by the remaining labels and inline properties. Relationship
+  unbound start node pinned by `id` (inline, or `WHERE n.id = v`) is a direct key
+  lookup in its labels' tables. Otherwise the planner looks for an index (see
+  [Index selection](#index-selection-range-composite-and-unique-implemented-search-indexes-phase-3));
+  without one, it scans the label index of its first label (every non-edge table when
+  it has no label). Either way the remaining labels and inline properties are checked
+  on every candidate, and the `WHERE` runs afterwards. Relationship
   steps read adjacency entries in the requested direction and types. Variable-length
   steps walk depth-first with per-path edge uniqueness. Within one `MATCH`, a
   relationship is used at most once.
@@ -77,8 +80,9 @@ afterwards ([10 — Vector Index § Filtering](10-vector-index.md)).
 - **No row or time limits.** Unbounded variable-length patterns and large `UNWIND`s can
   use a lot of memory and time; only `range()` is capped (10 million items).
   `query.timeout` is planned ([22 — Configuration](22-configuration.md)).
-- **No index selection.** A property filter (`WHERE n.email = $x`) scans the label;
-  only an `id` lookup is direct. Secondary indexes arrive in Phase 2.
+- **Rule-based index selection only.** The start node of each path uses the best index
+  by a fixed preference; there are no statistics, no choice of which end of a path to
+  start from, and no index-backed `ORDER BY`.
 - **Synchronous execution.** Queries run on the calling task
   ([16 — Engine Runtime](16-engine-runtime.md)).
 
@@ -129,18 +133,30 @@ Logical rewrites run first:
 
 The cost-based phase then enumerates access paths and join orders, estimates cardinalities from statistics, and picks the cheapest plan. Patterns with up to a small number of joins are enumerated exhaustively; larger ones fall back to a greedy order.
 
-### Index selection (Planned — Phase 2 for B-tree, Phase 3 for search indexes)
+### Index selection (Range, composite and unique implemented; search indexes Phase 3)
 
 | Predicate or call | Index | Physical operator | Status |
 |---|---|---|---|
-| `n.email = $x`, `n.age > 30`, `IN`, prefix `STARTS WITH` | B-tree / composite (`atlantis-index`) | `IndexSeek`, `IndexRangeScan` | Phase 2 |
-| Uniqueness constraint lookup | Unique index | `IndexSeek` (at most one row) | Phase 2 |
+| `n.email = $x`, `n.age > 30`, `n.x IN list`, `v IN n.tags`, prefix `STARTS WITH` | Range / composite (stored entries, `atlantis-storage`) | `NodeIndexSeek`, `NodeIndexSeekByRange` | Implemented |
+| Uniqueness constraint lookup | Unique index | `NodeUniqueIndexSeek` (at most one row) | Implemented |
+| `MATCH (a), (b) WHERE b.x = a.y` | Index on `b.x` | Index nested loop join | Implemented |
 | `ORDER BY n.field LIMIT k` | B-tree on `field` | Ordered `IndexRangeScan`, no sort | Phase 2 |
 | Record key ranges, time windows on composite keys | Primary key order (`r/`) | `KeyRangeScan` | Phase 2 |
 | `CALL db.vector.search(...)` with a `WHERE` on the yielded node | HNSW (`atlantis-vector`) | `VectorTopK` with pre-filter or post-filter | Phase 3 |
 | `CALL db.text.search(...)` | Full-text (`atlantis-text`) | `TextSearch` (BM25) | Phase 3 |
 | `CALL db.search.hybrid(...)` | Full-text + HNSW | `TextSearch` and `VectorTopK` fused with RRF | Phase 3 |
 | `geo.within(p.location, $poly)`, `point.distance(...) < r` | Spatial (`atlantis-geo`) | `SpatialScan` over covering cells, then exact check | Phase 3 |
+
+How the implemented selection works today: conditions on a start node come from its
+inline properties and from `WHERE` conjuncts `n.path op value` whose value is
+deterministic and mentions no variable of that path or a later one (values from earlier
+paths and earlier clauses are allowed). Among the indexes on the node's labels the
+planner prefers, in order: a unique index with every field equal, an index with every
+field equal, an equality prefix, `IN` on the first field, membership in a multikey
+field, `STARTS WITH`, then a range. Composite indexes are skipped unless every field
+has a condition (or the index belongs to a `NODE KEY`). Values are evaluated per input
+row; a value an index cannot answer exactly falls back to a label scan for that row.
+There are no statistics yet, so the choice ignores selectivity.
 
 For filtered vector search, the optimizer chooses between **pre-filtering** (traverse HNSW and skip candidates that fail the filter, used when the filter is selective and indexable) and **post-filtering** (over-fetch top-k, then filter, used when the filter keeps most candidates). See [10 — Vector Index](10-vector-index.md), [11 — Full-Text Search](11-full-text-search.md), and [12 — Geospatial](12-geospatial.md).
 
@@ -164,16 +180,29 @@ RETURN c.name, sum(o.total) AS spend
 
 With an index on `Customer.email`, the plan is a filtered scan of `Order` feeding an index nested loop join into `Customer`, then hash aggregation. Without the index, it is a hash join with `Customer` as the build side.
 
-### EXPLAIN (Planned — Phase 2)
+### EXPLAIN (Implemented; estimates Phase 2)
 
-Prefixing any query with `EXPLAIN` returns its physical plan without executing it. Each row
-is one operator with its estimated rows and chosen index, so you can check that a filter was
-pushed down or an index was picked:
+Prefixing a query with `EXPLAIN` returns its plan without executing it: one row per
+operator, in execution order, with columns `operator` and `details`. It shows the
+access path chosen for every start node, so you can check that an index was picked:
 
 ```cypher
 EXPLAIN MATCH (p:Person) WHERE p.email = $email RETURN p.name
-// ProduceResults ← Project ← IndexSeek(person_email, p.email = $email) est. rows: 1
 ```
+
+| operator | details |
+|---|---|
+| `NodeIndexSeek` | `p:Person WHERE p.email = $email (index person_email)` |
+| `Filter` | `p.email = $email` |
+| `Projection` | `p.name` |
+
+Operators: `NodeByIdSeek`, `NodeUniqueIndexSeek`, `NodeIndexSeek`,
+`NodeIndexSeekByRange`, `NodeByLabelScan`, `AllNodesScan`, `Argument` (already bound),
+`Expand(All)`, `VarLengthExpand(All)`, `Optional`, `Filter`, `Create`, `Merge`,
+`SetProperties`, `Remove`, `Delete`, `DetachDelete`, `Unwind`, `ProcedureCall`,
+`Projection`, `EagerAggregation`, `Distinct`, `Sort`, `Skip`, `Limit`, `Union`,
+`UnionAll`. A range seek's bounds are shown inclusive; the `Filter` row holds the exact
+predicate. Estimated row counts arrive with statistics.
 
 `EXPLAIN` needs the same `read` permissions as running the query, and the plan shows
 any injected permission predicates as ordinary filters.

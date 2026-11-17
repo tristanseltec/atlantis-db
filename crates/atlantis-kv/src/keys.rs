@@ -10,10 +10,17 @@
 //! | `/sys/ns {ns}` | namespace definition |
 //! | `/sys/ns {ns} /db {db}` | database definition |
 //! | `/sys/ns {ns} /db {db} /tb {tb}` | table definition |
-//! | `/sys/ns {ns} /db {db} /ix {name}` | index definition |
+//! | `/sys/ns {ns} /db {db} /ix {name}` | vector index definition |
+//! | `/sys/ns {ns} /db {db} /sc {name}` | property index or constraint definition |
+//! | `/sys/ns {ns} /db {db} /sv` | schema version, watched by every writing transaction |
 //! | `/ns {ns} /db {db} /tb {tb} /r {key}` | record or edge |
 //! | `/ns {ns} /db {db} /tb {tb} /g {key} {dir} {edgeTable} {edgeKey}` | adjacency entry |
 //! | `/ns {ns} /db {db} /lb {label} {table} {key}` | secondary label index entry |
+//! | `/ns {ns} /db {db} /px {index} {values} {table} {key}` | property index entry |
+//! | `/ns {ns} /db {db} /ux {constraint} {values}` | unique constraint entry (value: the record id) |
+//!
+//! `{values}` is the concatenated canonical encoding of the indexed values
+//! ([`index_encoding`](crate::index_encoding)).
 //!
 //! `{dir}` is `o` for an outgoing edge and `i` for an incoming one.
 
@@ -29,6 +36,10 @@ const REC: &[u8] = b"/r";
 const GRAPH: &[u8] = b"/g";
 const LABEL: &[u8] = b"/lb";
 const IX: &[u8] = b"/ix";
+const SCHEMA: &[u8] = b"/sc";
+const SCHEMA_VERSION: &[u8] = b"/sv";
+const PROP_INDEX: &[u8] = b"/px";
+const UNIQUE: &[u8] = b"/ux";
 
 /// Direction of an adjacency entry, relative to the node that owns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +134,67 @@ pub fn index_def(db: &DatabaseRef, name: &str) -> Vec<u8> {
 pub fn index_defs(db: &DatabaseRef) -> KeyRange {
     let mut w = KeyWriter::from_prefix(&database_def(db));
     KeyRange::prefix(w.raw(IX).finish())
+}
+
+/// Catalog key of a property index or constraint definition.
+pub fn schema_def(db: &DatabaseRef, name: &str) -> Vec<u8> {
+    let mut w = KeyWriter::from_prefix(&database_def(db));
+    w.raw(SCHEMA).str(name).finish()
+}
+
+/// All property index and constraint definitions in a database.
+pub fn schema_defs(db: &DatabaseRef) -> KeyRange {
+    let mut w = KeyWriter::from_prefix(&database_def(db));
+    KeyRange::prefix(w.raw(SCHEMA).finish())
+}
+
+/// The schema version of a database: a fresh value on every schema
+/// change. Every transaction that writes a record watches it
+/// ([`KvTransaction::watch`](crate::KvTransaction::watch)), so a writer
+/// whose snapshot predates a committed schema change fails to commit
+/// instead of missing an index.
+pub fn schema_version(db: &DatabaseRef) -> Vec<u8> {
+    let mut w = KeyWriter::from_prefix(&database_def(db));
+    w.raw(SCHEMA_VERSION).finish()
+}
+
+/// The range holding exactly `key`.
+pub fn single_key(key: Vec<u8>) -> KeyRange {
+    let mut end = key.clone();
+    end.push(0);
+    KeyRange { start: key, end }
+}
+
+/// The common prefix of every entry of property index `index`. Entries
+/// append the encoded values, then the record id.
+pub fn index_entries(db: &DatabaseRef, index: &str) -> Vec<u8> {
+    let mut w = db_prefix(db);
+    w.raw(PROP_INDEX).str(index).finish()
+}
+
+/// Property index entry for `record` with the encoded `values`.
+pub fn index_entry(
+    db: &DatabaseRef,
+    index: &str,
+    values: &[u8],
+    record: &RecordId,
+) -> Result<Vec<u8>, AtlantisError> {
+    let mut w = KeyWriter::from_prefix(&index_entries(db, index));
+    w.raw(values).record_id(record)?;
+    Ok(w.finish())
+}
+
+/// The common prefix of every entry of unique constraint `constraint`.
+/// Entries append the encoded values; the stored value is the record id.
+pub fn unique_entries(db: &DatabaseRef, constraint: &str) -> Vec<u8> {
+    let mut w = db_prefix(db);
+    w.raw(UNIQUE).str(constraint).finish()
+}
+
+/// Unique constraint entry for the encoded `values`.
+pub fn unique_entry(db: &DatabaseRef, constraint: &str, values: &[u8]) -> Vec<u8> {
+    let mut w = KeyWriter::from_prefix(&unique_entries(db, constraint));
+    w.raw(values).finish()
 }
 
 /// Key of a record (or edge record).

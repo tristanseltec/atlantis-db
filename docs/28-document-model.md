@@ -128,10 +128,10 @@ JSON import where `id` is a business field silently changes the key, and an obje
 
 ### P2 — Indexes and speed
 
-**No secondary indexes on fields.** The key layout (`crates/atlantis-kv/src/keys.rs`)
+**No secondary indexes on fields.** *(Resolved 2026-11-17: see [08 § Secondary Indexes](08-document-relational.md#secondary-indexes); the original finding follows.)* The key layout (`crates/atlantis-kv/src/keys.rs`)
 holds records, adjacency and labels only. Every `WHERE p.x = …` loads the whole table
 and filters it. *Fix:* `atlantis-index` as designed in
-[08 § Secondary Indexes](08-document-relational.md#secondary-indexes-planned--phase-2),
+[08 § Secondary Indexes](08-document-relational.md#secondary-indexes),
 plus multikey and partial indexes, and nested-path push-down for filtered vector search
 (today only top-level `node.field`).
 
@@ -177,7 +177,7 @@ In dependency order. Sizes are relative: S is days, M about a week, L several we
 | 2 | **Core document semantics.** Insertion-ordered `Object` with a decode-compatibility test; `Path` type and field-name rules; one total order across types used by `ORDER BY`, `min`/`max` and the key encoder; NaN rule and `Eq` fix; `Value ⇄ JSON` | M | core, kv, engine | A JSON corpus round-trips exactly, and sorting mixed-type values matches index order |
 | 3 | **Update operators.** `RecordTx::patch`; Cypher `SET p.phones[0].n = …` and nested `SET p.address += {…}` | M | storage, cypher, engine | The "Planned" row in [08 § Writing nested values](08-document-relational.md#writing-nested-values) is implemented |
 | 4 | **Record cache and streaming scans.** One decode per record per statement; iterator scans with limit push-down | M | storage, engine | A benchmark shows one decode per record and `LIMIT 10` stops early |
-| 5 | **Field indexes.** `atlantis-index` under `/ix {name}` with the existing encoder; single-field, compound, multikey, nested-path, unique, partial; `CREATE INDEX` / `CREATE CONSTRAINT`; planner seek and range scan; `EXPLAIN` | L | `atlantis-index` (new), kv, cypher, engine | `EXPLAIN` shows an index seek for equality and range filters on nested and array fields |
+| 5 | **Field indexes.** *Mostly done:* single-field, nested, multikey, composite and unique indexes; `UNIQUE`, `NOT NULL` and `NODE KEY` constraints; `CREATE INDEX` / `CREATE CONSTRAINT` / `SHOW`; planner seeks, index nested loop joins and `EXPLAIN` ([08 § Secondary Indexes](08-document-relational.md#secondary-indexes)). Open: partial indexes, index-backed `ORDER BY`, nested-path push-down for filtered vector search | L | storage, kv, cypher, engine | `EXPLAIN` shows an index seek for equality and range filters on nested and array fields (met) |
 | 6 | **Document API.** `Filter` evaluator with MongoDB rules (`$exists`, `$elemMatch`, `$in`, ranges, array matching); insert, find with sort/limit/skip/projection, update, delete, count; shares transactions with Cypher | L | engine, `atlantis-db`, Python package | A conformance suite of filter cases from MongoDB's documented behaviour passes |
 
 ## Open Questions

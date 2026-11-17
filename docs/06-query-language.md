@@ -65,6 +65,8 @@ and a script that ends inside an open `BEGIN` is rolled back with an error.
 | `UNION`, `UNION ALL` | Implemented | All parts must return the same columns. |
 | `CALL proc(args) [YIELD col [AS alias], ...] [WHERE ...]` | Implemented | Procedures below. A query ending in `CALL` returns the yielded columns. |
 | `CREATE VECTOR INDEX`, `DROP INDEX` | Implemented | See [10 — Vector Index](10-vector-index.md). |
+| `CREATE [RANGE] INDEX`, `CREATE CONSTRAINT`, `DROP CONSTRAINT`, `SHOW INDEXES`, `SHOW CONSTRAINTS` | Implemented | Node indexes and constraints in the Neo4j 5 forms; see [07 — Schema & DDL](07-schema-ddl.md). A write that breaks a constraint fails with `ConstraintViolation`. |
+| `EXPLAIN query` | Implemented | The plan without running the query; see [15 — Query Planner & Executor](15-query-planner-executor.md#explain-implemented-estimates-phase-2). |
 | `BEGIN`, `COMMIT`, `ROLLBACK` | Implemented | Script-level; see above. |
 | `shortestPath`, `allShortestPaths` | Phase 3 | See [09 — Graph Model](09-graph-model.md). |
 | Map projection `n {.*, .name}`, `EXISTS { ... }` and `CALL { ... }` subqueries, `FOREACH`, `LOAD CSV` | Not implemented | Parse errors today; not scheduled in a phase yet. |

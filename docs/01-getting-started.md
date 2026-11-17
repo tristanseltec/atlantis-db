@@ -25,8 +25,9 @@ The authoritative list of working behaviour is the integration test suite in
 | Rust record transactions (`engine.transaction`, `read`, retry on conflict), with Cypher inside them | Implemented |
 | Nested documents and record links that dereference on property access | Implemented |
 | `CREATE VECTOR INDEX`, `DROP INDEX`, `db.vector.search` | Implemented |
+| `CREATE INDEX` (range, nested, multikey, composite), `CREATE CONSTRAINT` (`UNIQUE`, `NOT NULL`, `NODE KEY`), `SHOW INDEXES`, `SHOW CONSTRAINTS`, `EXPLAIN` | Implemented |
 | RocksDB backend, connection URLs | Phase 1 |
-| Schema DDL, secondary indexes, constraints, `USE` | Phase 2 |
+| Schema DDL for tables and fields, relationship indexes, `USE` | Phase 2 |
 | `shortestPath`, graph algorithms, full-text, geospatial indexes, key-value API, time series | Phase 3 |
 | Live queries and events | Phase 4 |
 | Server, HTTP, WebSocket RPC, auth | Phase 5 |

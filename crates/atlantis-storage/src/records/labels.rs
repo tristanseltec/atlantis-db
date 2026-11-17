@@ -46,6 +46,11 @@ impl RecordTx {
                 id.table
             )));
         }
+        let old = if self.has_schema()? {
+            Some(record.clone())
+        } else {
+            None
+        };
         // The old label list is replaced below, so take it instead of cloning.
         let before = std::mem::take(&mut record.labels);
         let mut labels: Vec<String> = before
@@ -55,6 +60,9 @@ impl RecordTx {
             .collect();
         labels.extend(add.iter().cloned());
         record = Record::new(record.id, labels, record.data)?;
+        if let Some(old) = &old {
+            self.maintain(id, Some(old), Some(&record))?;
+        }
         for gone in before.iter().filter(|l| !record.labels.contains(l)) {
             self.tx.delete(&keys::label_entry(&self.db, gone, id)?)?;
         }

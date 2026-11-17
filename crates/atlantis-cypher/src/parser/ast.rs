@@ -14,8 +14,22 @@ pub enum Statement {
     /// `CREATE VECTOR INDEX name [IF NOT EXISTS] FOR (n:Label) ON (n.prop)
     /// [OPTIONS {dimension: 3, metric: 'cosine', m: 16, efConstruction: 200}]`
     CreateVectorIndex(CreateVectorIndex),
+    /// `CREATE [RANGE] INDEX [name] [IF NOT EXISTS] FOR (n:Label)
+    /// ON (n.prop, n.nested.prop, ...)`
+    CreateIndex(CreateIndex),
+    /// `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label)
+    /// REQUIRE n.prop IS [NODE] UNIQUE | IS NOT NULL | IS [NODE] KEY`
+    CreateConstraint(CreateConstraint),
     /// `DROP INDEX name [IF EXISTS]`
     DropIndex { name: String, if_exists: bool },
+    /// `DROP CONSTRAINT name [IF EXISTS]`
+    DropConstraint { name: String, if_exists: bool },
+    /// `SHOW [ALL] INDEXES`
+    ShowIndexes,
+    /// `SHOW [ALL] CONSTRAINTS`
+    ShowConstraints,
+    /// `EXPLAIN query` — the plan, without running the query.
+    Explain(QueryUnion),
     /// `BEGIN` — starts an explicit transaction in a script.
     Begin,
     /// `COMMIT` — commits the explicit transaction.
@@ -337,4 +351,37 @@ pub struct CreateVectorIndex {
     pub label: String,
     pub property: String,
     pub options: Vec<(String, Expression)>,
+}
+
+/// Parameters of `CREATE INDEX` (a property index).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    /// `None` when the statement omits the name; one is generated.
+    pub name: Option<String>,
+    pub if_not_exists: bool,
+    pub label: String,
+    /// Property paths, e.g. `[["email"], ["address", "city"]]`.
+    pub properties: Vec<Vec<String>>,
+}
+
+/// What a constraint requires of its properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintRequirement {
+    /// `IS [NODE] UNIQUE`
+    Unique,
+    /// `IS NOT NULL`
+    NotNull,
+    /// `IS [NODE] KEY`
+    NodeKey,
+}
+
+/// Parameters of `CREATE CONSTRAINT`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateConstraint {
+    /// `None` when the statement omits the name; one is generated.
+    pub name: Option<String>,
+    pub if_not_exists: bool,
+    pub label: String,
+    pub properties: Vec<Vec<String>>,
+    pub requirement: ConstraintRequirement,
 }

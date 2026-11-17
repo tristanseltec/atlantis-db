@@ -10,14 +10,14 @@
 //! The implementation of [`RecordTx`] is split by concern:
 //! `catalog` (namespace, database and table definitions), `crud` (records),
 //! `edges` (relationships and adjacency), `labels` (secondary labels),
-//! `vector_defs` (vector index definitions) and `codec` (the stored value
-//! format).
+//! `schema` (property indexes and constraints), `vector_defs` (vector index
+//! definitions) and `codec` (the stored value format).
 //!
 //! [`Record`]: atlantis_core::Record
 //! [`Edge`]: atlantis_core::Edge
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use atlantis_core::{AtlantisError, DatabaseRef, DistanceMetricKind, RecordId};
 use atlantis_kv::keys;
@@ -31,7 +31,13 @@ mod codec;
 mod crud;
 mod edges;
 mod labels;
+mod schema;
 mod vector_defs;
+
+pub use schema::{
+    display_path, field_at, ConstraintDef, ConstraintKind, FieldPath, IndexInfo, IndexLookup,
+    PropertyIndexDef, SchemaDef,
+};
 
 #[cfg(test)]
 mod tests;
@@ -81,15 +87,25 @@ pub struct CommitInfo {
     pub changed: Vec<RecordId>,
 }
 
+/// Schema definitions per database, keyed by the schema version they were
+/// read at. A version is a fresh value on every schema change, so a cached
+/// entry with the current version is exactly the current schema.
+pub(crate) type SchemaCache =
+    Arc<Mutex<HashMap<DatabaseRef, (Vec<u8>, Arc<Vec<schema::SchemaDef>>)>>>;
+
 /// Opens record transactions against a key-value backend.
 #[derive(Clone)]
 pub struct RecordStore {
     kv: Arc<dyn KvStore>,
+    schemas: SchemaCache,
 }
 
 impl RecordStore {
     pub fn new(kv: Arc<dyn KvStore>) -> Self {
-        RecordStore { kv }
+        RecordStore {
+            kv,
+            schemas: Arc::default(),
+        }
     }
 
     /// Starts a transaction scoped to one database.
@@ -104,6 +120,10 @@ impl RecordStore {
             db,
             catalog_checked: false,
             changed: HashMap::new(),
+            schema: None,
+            schema_watched: false,
+            schema_version_key: None,
+            schemas: self.schemas.clone(),
         })
     }
 }
@@ -118,6 +138,14 @@ pub struct RecordTx {
     catalog_checked: bool,
     /// Changed records, keyed by their encoded storage key.
     changed: HashMap<Vec<u8>, RecordId>,
+    /// Property index and constraint definitions, read once per transaction.
+    schema: Option<Arc<Vec<schema::SchemaDef>>>,
+    /// Whether this transaction watches the schema version.
+    schema_watched: bool,
+    /// The key of the schema version, once built.
+    schema_version_key: Option<Vec<u8>>,
+    /// The store's schema cache.
+    schemas: SchemaCache,
 }
 
 impl RecordTx {

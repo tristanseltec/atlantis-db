@@ -66,7 +66,7 @@ engine and that layer.
 | `atlantis-core` | Types: `Value`, `RecordId`, `Geometry`, `Datetime`, `Duration`, errors, config | Partial (record types implemented; `Decimal`, `Range` Phase 2) |
 | `atlantis-kv` | `KvStore` / `KvTransaction` traits, key encoding, MVCC; features `kv-mem`, `kv-rocksdb`, `kv-tikv` | Partial (traits, encoding, MVCC and the `mem` backend with a write-ahead log implemented; `rocksdb` and backend features Phase 1, `tikv` Phase 7) |
 | `atlantis-storage` | Record and edge stores on top of `atlantis-kv`; optional adjacency and record caches | Partial (record store implemented and used by Cypher; caches later) |
-| `atlantis-index` (planned) | Secondary B-tree, unique and composite indexes; index manager and background index builds | Phase 2 |
+| `atlantis-index` (planned) | Background index builds and index statistics. Secondary B-tree, unique and composite indexes themselves are implemented in `atlantis-storage` (`records::schema`) | Phase 2 |
 | `atlantis-vector` | HNSW with filtered search, versioned entries for snapshot visibility, SIMD distances, SQ8 quantization, a checkpointed index image | Partial (in-memory HNSW rebuilt from records; the rest is the focus track) |
 | `atlantis-text` (planned) | Analyzers, inverted index, BM25 | Phase 3 (focus track) |
 | `atlantis-geo` (planned) | Geometry operations, spatial index (geohash / S2-style cells over KV) | Deferred |

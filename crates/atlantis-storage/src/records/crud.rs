@@ -49,6 +49,7 @@ impl RecordTx {
         if self.tx.get(&rkey)?.is_some() {
             return Err(AtlantisError::RecordExists(record.id.to_string()));
         }
+        self.maintain(&record.id, None, Some(&record))?;
         for label in &record.labels {
             self.tx
                 .set(keys::label_entry(&self.db, label, &record.id)?, Vec::new())?;
@@ -115,7 +116,15 @@ impl RecordTx {
     {
         match self.get_stored(id)?.ok_or_else(|| Self::not_found(id))? {
             Stored::Record(mut r) => {
+                let old = if self.has_schema()? {
+                    Some(r.clone())
+                } else {
+                    None
+                };
                 change(&mut r.data)?;
+                if let Some(old) = &old {
+                    self.maintain(id, Some(old), Some(&r))?;
+                }
                 self.write_back(Stored::Record(r))
             }
             Stored::Edge(mut e) => {
@@ -172,6 +181,7 @@ impl RecordTx {
                 edges.len()
             )));
         }
+        self.maintain(id, Some(&record), None)?;
         for edge in edges {
             self.delete_edge(&edge)?;
         }

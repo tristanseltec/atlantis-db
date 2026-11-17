@@ -75,7 +75,7 @@ pub(super) fn pushable_conditions<'q>(
         .collect()
 }
 
-fn split_and<'q>(e: &'q Expression, out: &mut Vec<&'q Expression>) {
+pub(super) fn split_and<'q>(e: &'q Expression, out: &mut Vec<&'q Expression>) {
     match e {
         Expression::Binary(l, BinaryOp::And, r) => {
             split_and(l, out);
@@ -87,7 +87,7 @@ fn split_and<'q>(e: &'q Expression, out: &mut Vec<&'q Expression>) {
 
 /// `true` if `e` refers to any of `names` (conservatively: any variable of
 /// that name, even one a list comprehension rebinds).
-fn mentions_any(e: &Expression, names: &[String]) -> bool {
+pub(super) fn mentions_any(e: &Expression, names: &[String]) -> bool {
     match e {
         Expression::Variable(v) => names.contains(v),
         Expression::Literal(_) | Expression::Parameter(_) | Expression::CountStar => false,
@@ -134,7 +134,7 @@ fn mentions_any(e: &Expression, names: &[String]) -> bool {
 
 /// `false` if `e` calls a function whose result changes between calls, so
 /// evaluating it once for the push-down could disagree with `WHERE`.
-fn deterministic(e: &Expression) -> bool {
+pub(super) fn deterministic(e: &Expression) -> bool {
     match e {
         Expression::Function { name, args, .. } => {
             let n = lowercase(name);
