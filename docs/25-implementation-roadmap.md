@@ -295,7 +295,7 @@ are open.
 **Crates.** `atlantis-core`, `atlantis-index` (new), `atlantis-cypher`, `atlantis-engine`,
 `atlantis-storage`, `atlantis-db`.
 
-**Docs.** 03, 06, 07, 08, 15, 21, 23, 28.
+**Docs.** 03, 06, 07, 08, 15, 21, 23, 28, 29 (the core engine design and its milestones M0–M8).
 
 **Exit criteria.** Document and relational recipes in the cookbook pass. Schemafull
 tables reject invalid writes. `EXPLAIN` shows index use for equality and range

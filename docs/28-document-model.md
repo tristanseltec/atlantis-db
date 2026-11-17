@@ -197,6 +197,7 @@ Every finding above should end up as a test.
 
 ## What's Next
 
+- **[29 — Core Engine Design](29-core-engine-design.md)** — The engine design the document surface sits on (shapes, executor, graph storage).
 - **[08 — Document & Relational](08-document-relational.md)** — Today's document behaviour.
 - **[03 — Data Model](03-data-model.md)** — Records and the value type system.
 - **[07 — Schema & DDL](07-schema-ddl.md)** — Fields, types and index DDL.
