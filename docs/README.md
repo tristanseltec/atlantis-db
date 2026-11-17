@@ -84,6 +84,7 @@ phase that delivers it.
 | 25 | [Implementation Roadmap](25-implementation-roadmap.md) | Current status per crate, the focus-track priorities and the phased plan to multi-model | — |
 | 26 | [Positioning & Performance Targets](26-positioning-and-targets.md) | The killer feature, competitors, scope decisions, the retrieval benchmark, targets and today's baseline | Strategy |
 | 27 | [Commerce](27-commerce.md) | The first vertical: B2B and B2C, humans and agents; reference model, agent protocols, engine requirements, targets, stages | Strategy (C0–C4) |
+| 29 | [Core Engine Design](29-core-engine-design.md) | Flexible like MongoDB, fast like PostgreSQL, graph-first like Neo4j: conflicts, shapes, executor, graph storage, targets, milestones | Target design (M0–M8) |
 
 ## Reading Paths
 
