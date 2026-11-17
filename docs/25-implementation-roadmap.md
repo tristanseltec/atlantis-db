@@ -280,11 +280,16 @@ are open.
   `use_ns` and `set_var`/`unset_var`. `Transaction` already offers transaction-level
   record operations and Cypher, and `use_db(ns, db)` exists.
 - *Done:* the error type `atlantis_db::Error` (an alias of `AtlantisError`).
+- MongoDB-style JSON documents: depth and size limits, insertion-ordered objects, a
+  `Path` type, one cross-type order, JSON import and export, update operators,
+  multikey indexes and a document API. Cypher keeps standard semantics; MongoDB
+  matching lives only in the document API. Plan in
+  [28 — Document Model](28-document-model.md).
 
 **Crates.** `atlantis-core`, `atlantis-index` (new), `atlantis-cypher`, `atlantis-engine`,
 `atlantis-storage`, `atlantis-db`.
 
-**Docs.** 03, 06, 07, 08, 15, 21, 23.
+**Docs.** 03, 06, 07, 08, 15, 21, 23, 28.
 
 **Exit criteria.** Document and relational recipes in the cookbook pass. Schemafull
 tables reject invalid writes. `EXPLAIN` shows index use for equality and range
