@@ -401,6 +401,7 @@ separate consistency mode.
 
 ## What's Next
 
+- **[28 — Document Model](28-document-model.md)** — MongoDB-style JSON documents: gaps, the Cypher vs document API decision, and the work plan.
 - **[07 — Schema & DDL](07-schema-ddl.md)** — Full grammar for tables, fields, indexes, and constraints.
 - **[09 — Graph Model](09-graph-model.md)** — Edges, traversal, and paths.
 - **[13 — Key-Value & Time-Series](13-key-value-time-series.md)** — Composite keys and range scans.

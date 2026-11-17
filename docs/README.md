@@ -50,6 +50,7 @@ phase that delivers it.
 | # | Chapter | What it covers | Status |
 |---|---|---|---|
 | 08 | [Document & Relational](08-document-relational.md) | Nested documents, record links, joins, aggregation, secondary indexes | Partial |
+| 28 | [Document Model](28-document-model.md) | MongoDB-style JSON documents: review, the Cypher vs document API decision, work plan | Review and target design (Phase 2) |
 | 09 | [Graph Model](09-graph-model.md) | Edges as records, traversal, paths, shortest path, graph algorithms | Partial |
 | 10 | [Vector Index](10-vector-index.md) | HNSW, vector index DDL and search today; persistence, filtering, quantization, hybrid search | Partial |
 | 11 | [Full-Text Search](11-full-text-search.md) | Analyzers, BM25, full-text index DDL, highlighting, text + vector fusion | Phase 3 |
